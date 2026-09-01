@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">Blocks</string>
+    <string name="heading">Return to useful work</string>
+    <string name="status_ready">Android foundation ready</string>
+    <string name="contract_pin">Service API contract: %1$s</string>
+    <string name="service_endpoint">Development endpoint: %1$s</string>
+</resources>

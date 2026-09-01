@@ -4,3 +4,10 @@
 .atlas/
 .atlas-method/
 ATLAS-CONTEXT.md
+
+# Android / Gradle
+.gradle/
+build/
+**/build/
+local.properties
+*.iml
