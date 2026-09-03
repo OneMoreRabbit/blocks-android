@@ -15,14 +15,20 @@ sealed interface ApiResponse {
  * remain raw until the generated OpenAPI models are added; this prevents guessed payload shapes
  * from becoming an accidental client contract.
  */
-class BlocksApiClient(private val baseUri: URI) {
-    fun exchangeSession(identityToken: String): ApiResponse =
+interface BlocksTransport {
+    fun exchangeSession(identityToken: String): ApiResponse
+    fun listProjects(identityToken: String, tenantId: String): ApiResponse
+    fun createProject(identityToken: String, tenantId: String, body: String): ApiResponse
+}
+
+class BlocksApiClient(private val baseUri: URI) : BlocksTransport {
+    override fun exchangeSession(identityToken: String): ApiResponse =
         request("POST", "/v1/session", identityToken, body = "{}")
 
-    fun listProjects(identityToken: String, tenantId: String): ApiResponse =
+    override fun listProjects(identityToken: String, tenantId: String): ApiResponse =
         request("GET", "/v1/tenants/${encodePathSegment(tenantId)}/projects", identityToken)
 
-    fun createProject(identityToken: String, tenantId: String, body: String): ApiResponse =
+    override fun createProject(identityToken: String, tenantId: String, body: String): ApiResponse =
         request("POST", "/v1/tenants/${encodePathSegment(tenantId)}/projects", identityToken, body)
 
     private fun request(method: String, path: String, token: String, body: String? = null): ApiResponse {

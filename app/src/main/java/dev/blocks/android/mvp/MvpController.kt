@@ -66,6 +66,8 @@ class MvpController(private val repository: BlocksRepository) {
         )
     }
 
+    fun reportError(message: String) = fail(message)
+
     private fun fail(message: String) {
         state = state.copy(error = message)
     }

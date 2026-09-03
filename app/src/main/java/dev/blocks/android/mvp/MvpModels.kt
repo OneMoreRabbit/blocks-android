@@ -1,6 +1,6 @@
 package dev.blocks.android.mvp
 
-data class Session(val tenantId: String)
+data class Session(val tenantId: String, val identityToken: String = "")
 data class Project(val id: String, val name: String)
 data class ParkingRecord(val location: String, val nextAction: String, val mustNotForget: String)
 
@@ -19,7 +19,7 @@ class InMemoryBlocksRepository : BlocksRepository {
 
     override fun login(identityToken: String): Session {
         require(identityToken.isNotBlank())
-        return Session("development-tenant")
+        return Session("development-tenant", identityToken)
     }
 
     override fun projects(session: Session): List<Project> = projectList.toList()
