@@ -14,7 +14,16 @@ android {
         versionName = "0.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        buildConfigField("String", "BLOCKS_API_BASE_URL", "\"https://blocks.invalid\"")
+        buildConfigField(
+            "String",
+            "BLOCKS_API_BASE_URL",
+            "\"https://api.blocks.onemorerabbit.co.uk\"",
+        )
+        buildConfigField(
+            "String",
+            "BLOCKS_GOOGLE_SERVER_CLIENT_ID",
+            "\"12259488358-ogmpp0cg1a8v1pbvkoivo9lgr94n0kb9.apps.googleusercontent.com\"",
+        )
         buildConfigField("String", "BLOCKS_SERVICE_API_VERSION", "\"0.1\"")
     }
 
