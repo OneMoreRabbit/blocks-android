@@ -3,6 +3,8 @@ package dev.blocks.android
 import android.app.Activity
 import android.graphics.Color
 import android.os.Bundle
+import android.text.Editable
+import android.text.TextWatcher
 import android.view.Gravity
 import android.view.View
 import android.widget.Button
@@ -14,6 +16,9 @@ import dev.blocks.android.api.ServiceBlocksRepository
 import dev.blocks.android.auth.GoogleIdentityClient
 import dev.blocks.android.mvp.MvpController
 import dev.blocks.android.mvp.MvpScreen
+import dev.blocks.android.mvp.ParkingDraft
+import dev.blocks.android.state.AndroidEncryptedDraftStore
+import dev.blocks.android.state.SessionContinuityStore
 import java.net.URI
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -25,9 +30,13 @@ import kotlinx.coroutines.withContext
 
 class MainActivity : Activity() {
     private val controller by lazy {
-        MvpController(ServiceBlocksRepository(BlocksApiClient(URI(BuildConfig.BLOCKS_API_BASE_URL))))
+        MvpController(
+            ServiceBlocksRepository(BlocksApiClient(URI(BuildConfig.BLOCKS_API_BASE_URL))),
+            AndroidEncryptedDraftStore(this),
+        )
     }
     private val googleIdentity by lazy { GoogleIdentityClient(BuildConfig.BLOCKS_GOOGLE_SERVER_CLIENT_ID) }
+    private val continuity by lazy { SessionContinuityStore(this) }
     private val uiScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private lateinit var content: LinearLayout
 
@@ -41,6 +50,7 @@ class MainActivity : Activity() {
         }
         setContentView(content)
         render()
+        if (continuity.shouldRestore) restoreSignIn()
     }
 
     private fun render() {
@@ -66,11 +76,14 @@ class MainActivity : Activity() {
         controller.state.projects.forEach { project ->
             content.addView(button(project.name) { controller.selectProject(project.id); render() })
         }
-        val projectName = input("New project name")
+        val projectName = input("New project name", controller.state.drafts.projectName) {
+            controller.updateProjectNameDraft(it)
+        }
         content.addView(projectName)
         content.addView(button("Create project") {
             runRepositoryAction { controller.createProject(projectName.text.toString()) }
         })
+        content.addView(button("Sign out") { signOut() })
     }
 
     private fun renderPickup() {
@@ -89,13 +102,24 @@ class MainActivity : Activity() {
         }
         content.addView(button("Park this work") { controller.beginParking(); render() })
         content.addView(button("Choose another project") { controller.chooseAnotherProject(); render() })
+        content.addView(button("Sign out") { signOut() })
     }
 
     private fun renderParking() {
         content.addView(label("Park at the boundary", 20f))
-        val location = input("Where am I?")
-        val nextAction = input("Exact next physical action")
-        val mustNotForget = input("What must I not forget?")
+        val draft = controller.state.drafts.parking
+        var locationValue = draft.location
+        var nextActionValue = draft.nextAction
+        var mustNotForgetValue = draft.mustNotForget
+        fun persist() = controller.updateParkingDraft(
+            ParkingDraft(locationValue, nextActionValue, mustNotForgetValue),
+        )
+        val location = input("Where am I?", locationValue) { locationValue = it; persist() }
+        val nextAction = input("Exact next physical action", nextActionValue) { nextActionValue = it; persist() }
+        val mustNotForget = input("What must I not forget?", mustNotForgetValue) {
+            mustNotForgetValue = it
+            persist()
+        }
         content.addView(location)
         content.addView(nextAction)
         content.addView(mustNotForget)
@@ -112,10 +136,18 @@ class MainActivity : Activity() {
         setPadding(0, 0, 0, dp(12))
     }
 
-    private fun input(hint: String) = EditText(this).apply {
+    private fun input(hint: String, initial: String = "", changed: (String) -> Unit = {}) = EditText(this).apply {
         this.hint = hint
+        setText(initial)
         isSingleLine = false
         setPadding(dp(12), dp(10), dp(12), dp(10))
+        addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(value: CharSequence?, start: Int, count: Int, after: Int) = Unit
+            override fun onTextChanged(value: CharSequence?, start: Int, before: Int, count: Int) {
+                changed(value?.toString().orEmpty())
+            }
+            override fun afterTextChanged(value: Editable?) = Unit
+        })
     }
 
     private fun button(text: String, action: (View) -> Unit) = Button(this).apply {
@@ -128,11 +160,36 @@ class MainActivity : Activity() {
             try {
                 val token = googleIdentity.signIn(this@MainActivity)
                 withContext(Dispatchers.IO) { controller.login(token) }
+                continuity.shouldRestore = true
             } catch (_: CancellationException) {
                 return@launch
             } catch (error: Exception) {
                 controller.reportError(error.message ?: "Sign-in failed. Try again.")
             }
+            render()
+        }
+    }
+
+    private fun restoreSignIn() {
+        uiScope.launch {
+            try {
+                val token = googleIdentity.restore(this@MainActivity)
+                withContext(Dispatchers.IO) { controller.login(token) }
+            } catch (_: CancellationException) {
+                return@launch
+            } catch (_: Exception) {
+                continuity.shouldRestore = false
+                controller.reportError("Please sign in again to continue.")
+            }
+            render()
+        }
+    }
+
+    private fun signOut() {
+        uiScope.launch {
+            continuity.shouldRestore = false
+            runCatching { googleIdentity.clear(this@MainActivity) }
+            controller.logout()
             render()
         }
     }
