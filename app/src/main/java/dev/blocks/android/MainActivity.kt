@@ -3,19 +3,32 @@ package dev.blocks.android
 import android.app.Activity
 import android.graphics.Color
 import android.os.Bundle
-import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
-import dev.blocks.android.mvp.InMemoryBlocksRepository
+import dev.blocks.android.api.BlocksApiClient
+import dev.blocks.android.api.ServiceBlocksRepository
+import dev.blocks.android.auth.GoogleIdentityClient
 import dev.blocks.android.mvp.MvpController
 import dev.blocks.android.mvp.MvpScreen
+import java.net.URI
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : Activity() {
-    private val controller = MvpController(InMemoryBlocksRepository())
+    private val controller by lazy {
+        MvpController(ServiceBlocksRepository(BlocksApiClient(URI(BuildConfig.BLOCKS_API_BASE_URL))))
+    }
+    private val googleIdentity by lazy { GoogleIdentityClient(BuildConfig.BLOCKS_GOOGLE_SERVER_CLIENT_ID) }
+    private val uiScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private lateinit var content: LinearLayout
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -44,12 +57,8 @@ class MainActivity : Activity() {
 
     private fun renderLogin() {
         content.addView(label("Sign in to return to your work", 18f))
-        val token = input("Development identity token").apply {
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-        }
-        content.addView(token)
-        content.addView(button("Continue") { controller.login(token.text.toString()); render() })
-        content.addView(label("The token is used for this session only and is not stored.", 12f))
+        content.addView(button("Sign in with Google") { signIn() })
+        content.addView(label("Google proves your identity; Blocks controls project access.", 12f))
     }
 
     private fun renderProjects() {
@@ -59,7 +68,9 @@ class MainActivity : Activity() {
         }
         val projectName = input("New project name")
         content.addView(projectName)
-        content.addView(button("Create project") { controller.createProject(projectName.text.toString()); render() })
+        content.addView(button("Create project") {
+            runRepositoryAction { controller.createProject(projectName.text.toString()) }
+        })
     }
 
     private fun renderPickup() {
@@ -110,6 +121,36 @@ class MainActivity : Activity() {
     private fun button(text: String, action: (View) -> Unit) = Button(this).apply {
         this.text = text
         setOnClickListener(action)
+    }
+
+    private fun signIn() {
+        uiScope.launch {
+            try {
+                val token = googleIdentity.signIn(this@MainActivity)
+                withContext(Dispatchers.IO) { controller.login(token) }
+            } catch (_: CancellationException) {
+                return@launch
+            } catch (error: Exception) {
+                controller.reportError(error.message ?: "Sign-in failed. Try again.")
+            }
+            render()
+        }
+    }
+
+    private fun runRepositoryAction(action: () -> Unit) {
+        uiScope.launch {
+            try {
+                withContext(Dispatchers.IO) { action() }
+            } catch (error: Exception) {
+                controller.reportError(error.message ?: "Blocks could not complete that request.")
+            }
+            render()
+        }
+    }
+
+    override fun onDestroy() {
+        uiScope.cancel()
+        super.onDestroy()
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
