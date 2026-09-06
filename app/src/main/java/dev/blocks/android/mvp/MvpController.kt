@@ -7,11 +7,15 @@ data class MvpState(
     val projects: List<Project> = emptyList(),
     val selectedProject: Project? = null,
     val parking: ParkingRecord? = null,
+    val drafts: FormDrafts = FormDrafts(),
     val error: String? = null,
 )
 
-class MvpController(private val repository: BlocksRepository) {
-    var state = MvpState()
+class MvpController(
+    private val repository: BlocksRepository,
+    private val draftStore: DraftStore = NoOpDraftStore,
+) {
+    var state = MvpState(drafts = draftStore.load())
         private set
     private var session: Session? = null
 
@@ -19,13 +23,20 @@ class MvpController(private val repository: BlocksRepository) {
         if (identityToken.isBlank()) return fail("Enter an identity token.")
         val activeSession = repository.login(identityToken)
         session = activeSession
-        state = MvpState(screen = MvpScreen.PROJECTS, projects = repository.projects(activeSession))
+        state = state.copy(
+            screen = MvpScreen.PROJECTS,
+            projects = repository.projects(activeSession),
+            selectedProject = null,
+            parking = null,
+            error = null,
+        )
     }
 
     fun createProject(name: String) {
         val activeSession = requireNotNull(session)
         if (name.isBlank()) return fail("Enter a project name.")
         val project = repository.createProject(activeSession, name.trim())
+        updateProjectNameDraft("")
         state = state.copy(projects = repository.projects(activeSession), error = null)
         selectProject(project.id)
     }
@@ -47,6 +58,7 @@ class MvpController(private val repository: BlocksRepository) {
     }
 
     fun park(location: String, nextAction: String, mustNotForget: String) {
+        updateParkingDraft(ParkingDraft(location, nextAction, mustNotForget))
         if (location.isBlank() || nextAction.isBlank() || mustNotForget.isBlank()) {
             return fail("Complete all three parking lines.")
         }
@@ -54,6 +66,7 @@ class MvpController(private val repository: BlocksRepository) {
         val project = requireNotNull(state.selectedProject)
         val record = ParkingRecord(location.trim(), nextAction.trim(), mustNotForget.trim())
         repository.park(activeSession, project.id, record)
+        updateParkingDraft(ParkingDraft())
         state = state.copy(screen = MvpScreen.PICKUP, parking = record, error = null)
     }
 
@@ -67,6 +80,24 @@ class MvpController(private val repository: BlocksRepository) {
     }
 
     fun reportError(message: String) = fail(message)
+
+    fun updateProjectNameDraft(value: String) {
+        persistDrafts(state.drafts.copy(projectName = value))
+    }
+
+    fun updateParkingDraft(value: ParkingDraft) {
+        persistDrafts(state.drafts.copy(parking = value))
+    }
+
+    fun logout() {
+        session = null
+        state = MvpState(drafts = state.drafts)
+    }
+
+    private fun persistDrafts(drafts: FormDrafts) {
+        draftStore.save(drafts)
+        state = state.copy(drafts = drafts)
+    }
 
     private fun fail(message: String) {
         state = state.copy(error = message)

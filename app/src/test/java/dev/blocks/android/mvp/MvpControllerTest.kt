@@ -48,4 +48,52 @@ class MvpControllerTest {
         assertEquals(MvpScreen.LOGIN, controller.state.screen)
         assertEquals("Enter an identity token.", controller.state.error)
     }
+
+    @Test
+    fun validationFailureRetainsParkingDraftAcrossControllerRecreation() {
+        val drafts = RecordingDraftStore()
+        val first = MvpController(InMemoryBlocksRepository(), drafts)
+        first.login("token")
+        first.selectProject(first.state.projects.single().id)
+        first.beginParking()
+        first.park("At the API", "Retry the request", "")
+
+        assertEquals("At the API", first.state.drafts.parking.location)
+        assertEquals("Retry the request", first.state.drafts.parking.nextAction)
+        assertEquals("", first.state.drafts.parking.mustNotForget)
+
+        val recreated = MvpController(InMemoryBlocksRepository(), drafts)
+        assertEquals(first.state.drafts, recreated.state.drafts)
+    }
+
+    @Test
+    fun successfulSubmissionClearsOnlyTheAcknowledgedDraft() {
+        val drafts = RecordingDraftStore()
+        val controller = MvpController(InMemoryBlocksRepository(), drafts)
+        controller.login("token")
+        controller.updateProjectNameDraft("New project")
+        controller.createProject("New project")
+        assertEquals("", controller.state.drafts.projectName)
+
+        controller.beginParking()
+        controller.park("Here", "Next", "Remember")
+        assertEquals(ParkingDraft(), controller.state.drafts.parking)
+    }
+
+    @Test
+    fun logoutClearsAuthenticatedControllerContext() {
+        val controller = MvpController(InMemoryBlocksRepository())
+        controller.login("token")
+        controller.logout()
+        assertEquals(MvpScreen.LOGIN, controller.state.screen)
+        assertEquals(null, controller.state.selectedProject)
+    }
+
+    private class RecordingDraftStore : DraftStore {
+        private var value = FormDrafts()
+        override fun load(): FormDrafts = value
+        override fun save(drafts: FormDrafts) {
+            value = drafts
+        }
+    }
 }
