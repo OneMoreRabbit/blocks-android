@@ -144,6 +144,39 @@ class ServiceSessionFlowRepositoryTest {
         }
     }
 
+    @Test
+    fun mapsOpenEndedChangeEventsAndPreservesTheServiceCursor() {
+        val transport = FlowTransport().apply {
+            changesResponse = ApiResponse.Success(
+                200,
+                """{"events":[{"eventId":"42","eventType":"future.event","eventVersion":"9.1","tenantId":"$TENANT_ID","occurredAt":"2026-09-06T20:00:00Z","payload":{"future_field":"kept"}}],"next_since":"42","has_more":false}""",
+            )
+        }
+
+        val page = ServiceBlocksRepository(transport).changes(AUTH_SESSION, "41", 100)
+
+        assertEquals("42", page.nextCursor)
+        assertEquals("future.event", page.events.single().eventType)
+        assertEquals("kept", page.events.single().payload["future_field"])
+        assertEquals("41", transport.changeCursor)
+    }
+
+    @Test
+    fun rejectsAChangeEnvelopeFromAnotherTenant() {
+        val transport = FlowTransport().apply {
+            changesResponse = ApiResponse.Success(
+                200,
+                """{"events":[{"eventId":"42","eventType":"future.event","eventVersion":"9.1","tenantId":"00000000-0000-0000-0000-000000000099","occurredAt":"2026-09-06T20:00:00Z","payload":{}}],"next_since":"42","has_more":false}""",
+            )
+        }
+
+        val error = runCatching {
+            ServiceBlocksRepository(transport).changes(AUTH_SESSION, "41", 100)
+        }.exceptionOrNull()
+
+        assertTrue(error is IllegalStateException)
+    }
+
     private class FlowTransport : BlocksTransport {
         var currentResponse: ApiResponse = ApiResponse.Success(200, """{"session":null,"parking":null}""")
         var pickupResponse: ApiResponse = ApiResponse.Success(201, workSessionJson("active", 1))
@@ -156,9 +189,14 @@ class ServiceSessionFlowRepositoryTest {
             200,
             """{"id":"$WORK_SESSION_ID","state":"closed","row_version":2,"parking_record_id":null}""",
         )
+        var changesResponse: ApiResponse = ApiResponse.Success(
+            200,
+            """{"events":[],"next_since":null,"has_more":false}""",
+        )
         var body: String? = null
         var ifMatch: String? = null
         var idempotencyKey: String? = null
+        var changeCursor: String? = null
 
         override fun exchangeSession(identityToken: String): ApiResponse = error("Not used")
         override fun listProjects(identityToken: String, tenantId: String): ApiResponse = error("Not used")
@@ -212,6 +250,16 @@ class ServiceSessionFlowRepositoryTest {
             this.ifMatch = rowVersion.toString()
             this.idempotencyKey = idempotencyKey
             return closeResponse
+        }
+
+        override fun changes(
+            identityToken: String,
+            tenantId: String,
+            cursor: String?,
+            limit: Int,
+        ): ApiResponse {
+            changeCursor = cursor
+            return changesResponse
         }
     }
 

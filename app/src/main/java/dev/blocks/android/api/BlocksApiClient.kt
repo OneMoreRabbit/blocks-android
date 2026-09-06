@@ -37,6 +37,9 @@ interface BlocksTransport {
         body: String,
         idempotencyKey: String,
     ): ApiResponse
+
+    fun changes(identityToken: String, tenantId: String, cursor: String?, limit: Int): ApiResponse =
+        error("Change feed is not implemented by this transport")
 }
 
 class BlocksApiClient(
@@ -109,6 +112,24 @@ class BlocksApiClient(
         body,
         mapOf("If-Match" to rowVersion.toString(), "Idempotency-Key" to idempotencyKey),
     )
+
+    override fun changes(
+        identityToken: String,
+        tenantId: String,
+        cursor: String?,
+        limit: Int,
+    ): ApiResponse {
+        require(limit in 1..500)
+        val query = buildList {
+            cursor?.let { add("since=${encodePathSegment(it)}") }
+            add("limit=$limit")
+        }.joinToString("&")
+        return request(
+            "GET",
+            "/v1/tenants/${encodePathSegment(tenantId)}/changes?$query",
+            identityToken,
+        )
+    }
 
     private fun request(
         method: String,

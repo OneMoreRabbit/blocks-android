@@ -100,6 +100,7 @@ class MvpControllerTest {
         assertEquals(listOf("tenant-a"), drafts.clearedTenants)
         assertEquals(FormDrafts(), drafts.load("tenant-a"))
         assertTrue(controller.state.drafts.pendingMutations.isEmpty())
+        assertEquals(listOf("tenant-a"), repository.clearedLocalTenants)
     }
 
     @Test

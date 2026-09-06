@@ -40,6 +40,30 @@ class BlocksApiClientTest {
         }
     }
 
+    @Test
+    fun requestsTheOrderedChangeFeedFromThePersistedCursor() {
+        val request = AtomicReference<CapturedRequest>()
+        val server = server { captured -> request.set(captured) }
+        try {
+            val client = BlocksApiClient(URI("http://127.0.0.1:${server.address.port}"))
+            val response = client.changes(
+                identityToken = "identity-token",
+                tenantId = "00000000-0000-0000-0000-000000000002",
+                cursor = "41",
+                limit = 100,
+            )
+
+            assertTrue(response is ApiResponse.Success)
+            assertEquals(
+                "/v1/tenants/00000000-0000-0000-0000-000000000002/changes",
+                request.get().path,
+            )
+            assertEquals("since=41&limit=100", request.get().query)
+        } finally {
+            server.stop(0)
+        }
+    }
+
     private fun server(onRequest: (CapturedRequest) -> Unit): HttpServer = HttpServer.create(
         InetSocketAddress(InetAddress.getLoopbackAddress(), 0),
         0,
@@ -48,6 +72,7 @@ class BlocksApiClientTest {
             onRequest(
                 CapturedRequest(
                     path = exchange.requestURI.rawPath,
+                    query = exchange.requestURI.rawQuery,
                     authorization = exchange.requestHeaders.getFirst("Authorization"),
                     clientVersion = exchange.requestHeaders.getFirst("X-Blocks-Client-Version"),
                     ifMatch = exchange.requestHeaders.getFirst("If-Match"),
@@ -63,6 +88,7 @@ class BlocksApiClientTest {
 
     private data class CapturedRequest(
         val path: String,
+        val query: String?,
         val authorization: String?,
         val clientVersion: String?,
         val ifMatch: String?,
