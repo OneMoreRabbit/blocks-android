@@ -5,6 +5,7 @@ import dev.blocks.android.mvp.ParkingRecord
 import dev.blocks.android.mvp.PickupRequest
 import dev.blocks.android.mvp.PickupResult
 import dev.blocks.android.mvp.Session
+import dev.blocks.android.mvp.TransitionConflictException
 import dev.blocks.android.mvp.WorkSession
 import dev.blocks.android.mvp.WorkSessionState
 import org.json.JSONObject
@@ -109,6 +110,38 @@ class ServiceSessionFlowRepositoryTest {
         transport.currentResponse = ApiResponse.Success(200, """{"session":null,"parking":null}""")
         repository.closeWithOutcome(AUTH_SESSION, active, OutcomeTier.CORE, "outcome-key")
         assertEquals("core", JSONObject(transport.body!!).getString("outcome_tier"))
+    }
+
+    @Test
+    fun mapsEveryTransitionConflictToAnAuthoritativeReconciliationSignal() {
+        val conflict = ApiResponse.Failure(409, ApiError(ApiErrorCode.CONFLICT, "row version changed"))
+        val transport = FlowTransport().apply {
+            parkResponse = conflict
+            resumeResponse = conflict
+            closeResponse = conflict
+        }
+        val repository = ServiceBlocksRepository(transport)
+        val active = workSession(WorkSessionState.ACTIVE, 1)
+        val parking = ParkingRecord("Here", "Continue here", "Remember this", id = PARKING_ID)
+
+        listOf<() -> Unit>(
+            { repository.park(AUTH_SESSION, active, parking, IDEMPOTENCY_KEY) },
+            { repository.resume(AUTH_SESSION, active) },
+            { repository.closeWithContinuation(AUTH_SESSION, active, parking, IDEMPOTENCY_KEY) },
+            {
+                repository.closeOnExistingContinuation(
+                    AUTH_SESSION,
+                    active,
+                    parking,
+                    IDEMPOTENCY_KEY,
+                )
+            },
+            { repository.closeWithOutcome(AUTH_SESSION, active, OutcomeTier.CORE, IDEMPOTENCY_KEY) },
+        ).forEach { transition ->
+            val error = runCatching(transition).exceptionOrNull()
+            assertTrue(error is TransitionConflictException)
+            assertEquals("row version changed", error?.message)
+        }
     }
 
     private class FlowTransport : BlocksTransport {

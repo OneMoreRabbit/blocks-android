@@ -15,6 +15,7 @@ import android.widget.TextView
 import dev.blocks.android.api.BlocksApiClient
 import dev.blocks.android.api.ServiceBlocksRepository
 import dev.blocks.android.auth.GoogleIdentityClient
+import dev.blocks.android.mvp.FormField
 import dev.blocks.android.mvp.MvpController
 import dev.blocks.android.mvp.MvpScreen
 import dev.blocks.android.mvp.OutcomeTier
@@ -62,6 +63,16 @@ class MainActivity : Activity() {
         content.removeAllViews()
         content.addView(label(getString(R.string.heading), 28f, Color.rgb(32, 48, 42)))
         controller.state.error?.let { content.addView(label(it, 14f, Color.rgb(150, 40, 40))) }
+        controller.state.reconciliation?.let { reconciliation ->
+            content.addView(
+                label(
+                    "The session changed elsewhere. The latest state is shown; your " +
+                        "${reconciliation.intent.description} request is retained for review.",
+                    14f,
+                    Color.rgb(133, 82, 16),
+                ),
+            )
+        }
         when (controller.state.screen) {
             MvpScreen.LOGIN -> renderLogin()
             MvpScreen.PROJECTS -> renderProjects()
@@ -86,6 +97,7 @@ class MainActivity : Activity() {
         val projectName = input("New project name", controller.state.drafts.projectName) {
             controller.updateProjectNameDraft(it)
         }
+        projectName.markInvalid(FormField.PROJECT_NAME)
         content.addView(projectName)
         content.addView(button("Create project") {
             runRepositoryAction { controller.createProject(projectName.text.toString()) }
@@ -123,8 +135,7 @@ class MainActivity : Activity() {
     }
 
     private fun renderPickupForm(projectId: String) {
-        val saved = controller.state.drafts.pickup.takeIf { it.projectId == projectId }
-            ?: PickupDraft(projectId = projectId)
+        val saved = controller.pickupDraft(projectId)
         var coreValue = saved.coreOutcome
         var fullValue = saved.fullOutcome
         var polishValue = saved.polishOutcome
@@ -134,6 +145,7 @@ class MainActivity : Activity() {
         val core = input("Core outcome", coreValue) { coreValue = it; persist() }
         val full = input("Full outcome (optional)", fullValue) { fullValue = it; persist() }
         val polish = input("Polish outcome (optional)", polishValue) { polishValue = it; persist() }
+        core.markInvalid(FormField.PICKUP_CORE)
         content.addView(core)
         content.addView(full)
         content.addView(polish)
@@ -200,6 +212,9 @@ class MainActivity : Activity() {
             mustNotForgetValue = it
             persist()
         }
+        location.markInvalid(FormField.PARKING_LOCATION)
+        nextAction.markInvalid(FormField.PARKING_NEXT_ACTION)
+        mustNotForget.markInvalid(FormField.PARKING_MUST_NOT_FORGET)
         content.addView(location)
         content.addView(nextAction)
         content.addView(mustNotForget)
@@ -233,6 +248,13 @@ class MainActivity : Activity() {
             }
             override fun afterTextChanged(value: Editable?) = Unit
         })
+    }
+
+    private fun EditText.markInvalid(field: FormField) {
+        if (controller.state.invalidField == field) {
+            error = "Required"
+            post { requestFocus() }
+        }
     }
 
     private fun button(text: String, action: (View) -> Unit) = Button(this).apply {

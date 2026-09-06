@@ -65,7 +65,6 @@ data class ParkingDraft(
     val location: String = "",
     val nextAction: String = "",
     val mustNotForget: String = "",
-    val idempotencyKey: String = "",
 )
 
 data class PickupDraft(
@@ -73,24 +72,35 @@ data class PickupDraft(
     val coreOutcome: String = "",
     val fullOutcome: String = "",
     val polishOutcome: String = "",
-    val idempotencyKey: String = "",
+)
+
+data class PendingMutation(
+    val operation: String,
+    val targetId: String,
+    val payloadDigest: String,
+    val idempotencyKey: String,
 )
 
 data class FormDrafts(
     val projectName: String = "",
-    val pickup: PickupDraft = PickupDraft(),
+    val pickups: Map<String, PickupDraft> = emptyMap(),
     val parking: ParkingDraft = ParkingDraft(),
+    val pendingMutations: Map<String, PendingMutation> = emptyMap(),
 )
 
 interface DraftStore {
-    fun load(): FormDrafts
-    fun save(drafts: FormDrafts)
+    fun load(tenantId: String): FormDrafts
+    fun save(tenantId: String, drafts: FormDrafts)
+    fun clear(tenantId: String)
 }
 
 object NoOpDraftStore : DraftStore {
-    override fun load() = FormDrafts()
-    override fun save(drafts: FormDrafts) = Unit
+    override fun load(tenantId: String) = FormDrafts()
+    override fun save(tenantId: String, drafts: FormDrafts) = Unit
+    override fun clear(tenantId: String) = Unit
 }
+
+class TransitionConflictException(message: String) : RuntimeException(message)
 
 interface BlocksRepository {
     fun login(identityToken: String): Session

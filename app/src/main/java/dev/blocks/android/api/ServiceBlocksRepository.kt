@@ -24,6 +24,7 @@ import dev.blocks.android.mvp.PickupResult
 import dev.blocks.android.mvp.Project
 import dev.blocks.android.mvp.Reentry
 import dev.blocks.android.mvp.Session
+import dev.blocks.android.mvp.TransitionConflictException
 import dev.blocks.android.mvp.WorkSession
 import dev.blocks.android.mvp.WorkSessionState
 import java.util.UUID
@@ -105,7 +106,7 @@ class ServiceBlocksRepository(
                 workSession.rowVersion,
                 json.toJson(record.toParkIn()),
                 idempotencyKey,
-            ).successBody(),
+            ).transitionBody(),
             ParkOut::class.java,
         )
         return Reentry(
@@ -121,7 +122,7 @@ class ServiceBlocksRepository(
                 session.tenantId,
                 workSession.id,
                 workSession.rowVersion,
-            ).successBody(),
+            ).transitionBody(),
             TransitionOut::class.java,
         )
         workSession.withTransition(transition)
@@ -199,6 +200,16 @@ class ServiceBlocksRepository(
 
     private fun ApiResponse.Failure.toException() = ServiceException(status, error)
 
+    private fun ApiResponse.transitionBody(): String = when (this) {
+        is ApiResponse.Success -> body
+        is ApiResponse.Failure -> {
+            if (status == 409 && error.code == ApiErrorCode.CONFLICT) {
+                throw TransitionConflictException(error.message)
+            }
+            throw toException()
+        }
+    }
+
     private fun close(
         session: Session,
         workSession: WorkSession,
@@ -212,7 +223,7 @@ class ServiceBlocksRepository(
             workSession.rowVersion,
             body,
             idempotencyKey,
-        ).successBody(),
+        ).transitionBody(),
         CloseOut::class.java,
     )
 
