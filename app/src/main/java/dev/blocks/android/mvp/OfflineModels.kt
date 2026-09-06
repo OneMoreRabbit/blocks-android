@@ -77,3 +77,8 @@ object NoOpSyncStateStore : SyncStateStore {
 }
 
 class QueuedOfflineException(message: String, cause: Throwable? = null) : RuntimeException(message, cause)
+
+class MembershipRevokedException(cause: Throwable) : RuntimeException(
+    "This account no longer has access to the selected Blocks tenant. Sign in again to continue.",
+    cause,
+)

@@ -1,5 +1,6 @@
 package dev.blocks.android.state
 
+import com.google.gson.Gson
 import dev.blocks.android.mvp.OfflineOperation
 import dev.blocks.android.mvp.OutcomeTier
 import dev.blocks.android.mvp.Project
@@ -11,7 +12,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-class SyncStateJsonCodecTest {
+class SyncStateStorageCodecTest {
     @Test
     fun roundTripsTheVersionedQueueCacheCursorAndRetiredKeys() {
         val state = TenantSyncState(
@@ -41,14 +42,51 @@ class SyncStateJsonCodecTest {
             retiredIdempotencyKeys = listOf("old-key"),
         )
 
-        val decoded = SyncStateJsonCodec().decode(SyncStateJsonCodec().encode(state))
+        val rows = SyncStateRowCodec().encode(state)
+        val decoded = SyncStateRowCodec().decode(rows)
 
+        assertEquals(1, rows.schemaVersion)
+        assertEquals(1, rows.projects.size)
+        assertEquals(1, rows.commands.size)
+        assertEquals(1, rows.retiredIdempotencyKeys.size)
         assertEquals(state, decoded)
     }
 
     @Test
+    fun migratesTheVersionedLegacyQueueWithoutChangingItsRetryIdentity() {
+        val command = QueuedCommand(
+            operation = OfflineOperation.CLOSE_WITH_OUTCOME,
+            targetId = "session-1",
+            projectId = "project-1",
+            idempotencyKey = "legacy-retry-key",
+            ifMatch = 7,
+            workSession = WorkSession(
+                id = "session-1",
+                projectId = "project-1",
+                state = WorkSessionState.ACTIVE,
+                coreOutcome = "Core",
+                rowVersion = 7,
+            ),
+            outcomeTier = OutcomeTier.CORE,
+        )
+        val encoded = Gson().toJson(
+            mapOf(
+                "schema_version" to 1,
+                "commands" to listOf(command),
+                "changeCursor" to "22",
+            ),
+        )
+
+        val decoded = LegacySyncStateJsonCodec().decode(encoded)
+
+        assertEquals(command, decoded.commands.single())
+        assertEquals("legacy-retry-key", decoded.commands.single().idempotencyKey)
+        assertEquals("22", decoded.changeCursor)
+    }
+
+    @Test
     fun migratesUnversionedCacheStateOnlyWhenItContainsNoReplayableCommands() {
-        val decoded = SyncStateJsonCodec().decode(
+        val decoded = LegacySyncStateJsonCodec().decode(
             """{"projects":[],"projectsLoaded":true,"reentryLoaded":true,"commands":[],"changeCursor":"17","retiredIdempotencyKeys":[]}""",
         )
 
@@ -62,7 +100,16 @@ class SyncStateJsonCodecTest {
     fun refusesAnUnversionedReplayQueueBecauseItsSemanticsAreUnknown() {
         val encoded = """{"commands":[{"operation":"PARK","targetId":"session-1","projectId":"project-1","idempotencyKey":"key"}]}"""
 
-        val error = runCatching { SyncStateJsonCodec().decode(encoded) }.exceptionOrNull()
+        val error = runCatching { LegacySyncStateJsonCodec().decode(encoded) }.exceptionOrNull()
+
+        assertTrue(error is IllegalArgumentException)
+    }
+
+    @Test
+    fun rejectsAnUnknownDatabaseRowSchemaWithoutDiscardingIt() {
+        val rows = SyncStateRowCodec().encode(TenantSyncState()).copy(schemaVersion = 2)
+
+        val error = runCatching { SyncStateRowCodec().decode(rows) }.exceptionOrNull()
 
         assertTrue(error is IllegalArgumentException)
     }

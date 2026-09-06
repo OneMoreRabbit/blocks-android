@@ -1,10 +1,14 @@
 package dev.blocks.android.sync
 
+import dev.blocks.android.api.ApiError
+import dev.blocks.android.api.ApiErrorCode
+import dev.blocks.android.api.ServiceException
 import dev.blocks.android.mvp.BlocksRepository
 import dev.blocks.android.mvp.ChangeEvent
 import dev.blocks.android.mvp.ChangePage
 import dev.blocks.android.mvp.DraftStore
 import dev.blocks.android.mvp.FormDrafts
+import dev.blocks.android.mvp.MembershipRevokedException
 import dev.blocks.android.mvp.OfflineOperation
 import dev.blocks.android.mvp.OutcomeTier
 import dev.blocks.android.mvp.ParkingDraft
@@ -395,6 +399,16 @@ class DurableBlocksRepositoryTest {
     fun directTenantSwitchInvalidatesThePreviousSessionAndReadsOnlyTheNewPartition() {
         val drafts = MemoryDraftStore()
         val sync = MemorySyncStore()
+        drafts.save(
+            TENANT_A,
+            FormDrafts(
+                parking = ParkingDraft("Tenant A", "Secret next", "Secret context"),
+                pendingMutations = mapOf(
+                    "parking" to PendingMutation("PARK", "session-a", "digest", "tenant-a-key"),
+                ),
+            ),
+        )
+        drafts.save(TENANT_B, FormDrafts(projectName = "Tenant B draft"))
         sync.saveSyncState(
             TENANT_A,
             TenantSyncState(
@@ -421,9 +435,52 @@ class DurableBlocksRepositoryTest {
         val tenantB = repository.login("tenant-b")
 
         assertTrue(runCatching { repository.projects(tenantA) }.isFailure)
+        assertEquals(TenantSyncState(), sync.loadSyncState(TENANT_A))
+        assertEquals(FormDrafts(), drafts.load(TENANT_A))
         assertEquals("b-project", repository.projects(tenantB).single().id)
+        assertEquals("Tenant B draft", drafts.load(TENANT_B).projectName)
         assertEquals(listOf("tenant-b-key"), sync.loadSyncState(TENANT_B).retiredIdempotencyKeys)
         assertEquals("12", sync.loadSyncState(TENANT_B).changeCursor)
+    }
+
+    @Test
+    fun membershipRevocationErasesDraftQueueCursorCacheAndInvalidatesTheSession() {
+        val drafts = MemoryDraftStore()
+        val sync = MemorySyncStore()
+        val active = workSession(rowVersion = 9)
+        val record = ParkingRecord("Sensitive boundary", "Sensitive next", "Sensitive context")
+        drafts.save(
+            TENANT_A,
+            FormDrafts(
+                parking = ParkingDraft(record.location, record.nextAction, record.mustNotForget),
+                pendingMutations = mapOf(
+                    "parking" to PendingMutation("PARK", active.id, "digest", "revoked-key"),
+                ),
+            ),
+        )
+        sync.saveSyncState(
+            TENANT_A,
+            TenantSyncState(
+                projects = listOf(Project(PROJECT_ID, "Sensitive project")),
+                projectsLoaded = true,
+                reentry = Reentry(active, null),
+                reentryLoaded = true,
+                changeCursor = "44",
+            ),
+        )
+        val service = RecordingService().apply { remoteReentry = Reentry(active, null) }
+        val repository = DurableBlocksRepository(service, drafts, sync)
+        val session = repository.login("tenant-a")
+        service.membershipRevoked = true
+
+        val error = runCatching {
+            repository.park(session, active, record, "revoked-key")
+        }.exceptionOrNull()
+
+        assertTrue(error is MembershipRevokedException)
+        assertEquals(TenantSyncState(), sync.loadSyncState(TENANT_A))
+        assertEquals(FormDrafts(), drafts.load(TENANT_A))
+        assertTrue(runCatching { repository.current(session) }.isFailure)
     }
 
     private class MemoryDraftStore : DraftStore {
@@ -464,6 +521,7 @@ class DurableBlocksRepositoryTest {
 
     private class RecordingService : BlocksRepository {
         var offline = false
+        var membershipRevoked = false
         var remoteReentry = Reentry(null, null)
         var parkMode = MutationMode.SUCCESS
         var closeOutcomeMode = MutationMode.SUCCESS
@@ -480,18 +538,24 @@ class DurableBlocksRepositoryTest {
         )
 
         override fun projects(session: Session): List<Project> {
+            rejectRevokedMembership()
             if (offline) throw IOException("offline")
             return listOf(Project(PROJECT_ID, "Project"))
         }
 
-        override fun createProject(session: Session, name: String) = Project(PROJECT_ID, name)
+        override fun createProject(session: Session, name: String): Project {
+            rejectRevokedMembership()
+            return Project(PROJECT_ID, name)
+        }
 
         override fun current(session: Session): Reentry {
+            rejectRevokedMembership()
             if (offline) throw IOException("offline")
             return remoteReentry
         }
 
         override fun pickup(session: Session, request: PickupRequest, idempotencyKey: String): PickupResult {
+            rejectRevokedMembership()
             sent += SentMutation(OfflineOperation.PICKUP, idempotencyKey, null)
             if (offline) throw IOException("offline")
             val started = WorkSession(
@@ -514,6 +578,7 @@ class DurableBlocksRepositoryTest {
             record: ParkingRecord,
             idempotencyKey: String,
         ): Reentry {
+            rejectRevokedMembership()
             sent += SentMutation(OfflineOperation.PARK, idempotencyKey, workSession.rowVersion)
             if (offline || parkMode == MutationMode.OFFLINE) throw IOException("offline")
             if (parkMode == MutationMode.CONFLICT) throw TransitionConflictException("row version changed")
@@ -530,6 +595,7 @@ class DurableBlocksRepositoryTest {
         }
 
         override fun resume(session: Session, workSession: WorkSession): Reentry {
+            rejectRevokedMembership()
             if (offline) throw IOException("offline")
             remoteReentry = Reentry(
                 workSession.copy(state = WorkSessionState.ACTIVE, rowVersion = workSession.rowVersion + 1),
@@ -544,6 +610,7 @@ class DurableBlocksRepositoryTest {
             record: ParkingRecord,
             idempotencyKey: String,
         ): Reentry {
+            rejectRevokedMembership()
             sent += SentMutation(OfflineOperation.PARK_AND_CLOSE, idempotencyKey, workSession.rowVersion)
             if (offline) throw IOException("offline")
             remoteReentry = Reentry(
@@ -559,6 +626,7 @@ class DurableBlocksRepositoryTest {
             parking: ParkingRecord,
             idempotencyKey: String,
         ): Reentry {
+            rejectRevokedMembership()
             sent += SentMutation(
                 OfflineOperation.CLOSE_EXISTING_CONTINUATION,
                 idempotencyKey,
@@ -578,6 +646,7 @@ class DurableBlocksRepositoryTest {
             outcomeTier: OutcomeTier,
             idempotencyKey: String,
         ): Reentry {
+            rejectRevokedMembership()
             sent += SentMutation(OfflineOperation.CLOSE_WITH_OUTCOME, idempotencyKey, workSession.rowVersion)
             if (offline || closeOutcomeMode == MutationMode.OFFLINE) throw IOException("offline")
             if (closeOutcomeMode == MutationMode.CONFLICT) throw TransitionConflictException("row version changed")
@@ -591,6 +660,7 @@ class DurableBlocksRepositoryTest {
         }
 
         override fun changes(session: Session, cursor: String?, limit: Int): ChangePage {
+            rejectRevokedMembership()
             requestedCursors += cursor
             changeCalls += 1
             failChangesFromCall?.let { if (changeCalls >= it) throw IOException("change feed interrupted") }
@@ -600,6 +670,12 @@ class DurableBlocksRepositoryTest {
             val next = available.lastOrNull()?.eventId ?: cursor
             val hasMore = events.any { BigInteger(it.eventId) > BigInteger(next ?: "0") }
             return ChangePage(available, next, hasMore)
+        }
+
+        private fun rejectRevokedMembership() {
+            if (membershipRevoked) {
+                throw ServiceException(403, ApiError(ApiErrorCode.UNAUTHORIZED, "Membership revoked"))
+            }
         }
 
         private fun addEvent(type: String, payload: Map<String, Any?>) {

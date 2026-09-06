@@ -6,6 +6,7 @@ import dev.blocks.android.mvp.ChangeEvent
 import dev.blocks.android.mvp.ChangePage
 import dev.blocks.android.mvp.DraftStore
 import dev.blocks.android.mvp.FormDrafts
+import dev.blocks.android.mvp.MembershipRevokedException
 import dev.blocks.android.mvp.OfflineOperation
 import dev.blocks.android.mvp.OutcomeTier
 import dev.blocks.android.mvp.ParkingDraft
@@ -36,8 +37,26 @@ class DurableBlocksRepository(
     private var activeTenantId: String? = null
 
     @Synchronized
-    override fun login(identityToken: String): Session = delegate.login(identityToken).also { session ->
+    override fun login(identityToken: String): Session {
+        val session = try {
+            delegate.login(identityToken)
+        } catch (error: Exception) {
+            if (error.isMembershipRevoked()) {
+                val previousTenantId = activeTenantId
+                activeTenantId = null
+                previousTenantId?.let { tenantId ->
+                    runCatching { purgeTenant(tenantId) }.exceptionOrNull()?.let(error::addSuppressed)
+                }
+                throw MembershipRevokedException(error)
+            }
+            throw error
+        }
+        activeTenantId?.takeIf { it != session.tenantId }?.let { previousTenantId ->
+            activeTenantId = null
+            purgeTenant(previousTenantId)
+        }
         activeTenantId = session.tenantId
+        return session
     }
 
     @Synchronized
@@ -49,6 +68,7 @@ class DurableBlocksRepository(
                 save(session, state.copy(projects = projects, projectsLoaded = true))
             }
         } catch (error: Exception) {
+            error.throwIfMembershipRevoked(session)
             if (error.isRetryable() && state.projectsLoaded) state.projects else throw error
         }
     }
@@ -56,7 +76,12 @@ class DurableBlocksRepository(
     @Synchronized
     override fun createProject(session: Session, name: String): Project {
         checkActive(session)
-        return delegate.createProject(session, name)
+        return try {
+            delegate.createProject(session, name)
+        } catch (error: Exception) {
+            error.throwIfMembershipRevoked(session)
+            throw error
+        }
     }
 
     @Synchronized
@@ -71,6 +96,7 @@ class DurableBlocksRepository(
                 discoveredRemotely = true,
             ).also { save(session, it) }.reentry ?: EMPTY_REENTRY
         } catch (error: Exception) {
+            error.throwIfMembershipRevoked(session)
             if (error.isRetryable() && state.reentryLoaded) state.reentry ?: EMPTY_REENTRY else throw error
         }
     }
@@ -126,6 +152,7 @@ class DurableBlocksRepository(
         return try {
             delegate.resume(session, workSession).also { cacheReentry(session, it) }
         } catch (error: Exception) {
+            error.throwIfMembershipRevoked(session)
             if (!error.isRetryable()) throw error
             val reconciled = reconcileBestEffort(session, activeState(session))
             val authoritative = reconciled.reentry
@@ -207,7 +234,12 @@ class DurableBlocksRepository(
     @Synchronized
     override fun changes(session: Session, cursor: String?, limit: Int): ChangePage {
         checkActive(session)
-        return delegate.changes(session, cursor, limit)
+        return try {
+            delegate.changes(session, cursor, limit)
+        } catch (error: Exception) {
+            error.throwIfMembershipRevoked(session)
+            throw error
+        }
     }
 
     @Synchronized
@@ -226,8 +258,8 @@ class DurableBlocksRepository(
 
     @Synchronized
     override fun clearLocalState(session: Session) {
-        syncStore.clearSyncState(session.tenantId)
         if (activeTenantId == session.tenantId) activeTenantId = null
+        purgeTenant(session.tenantId)
     }
 
     @Synchronized
@@ -307,6 +339,7 @@ class DurableBlocksRepository(
                     return state
                 }
             } catch (error: Exception) {
+                error.throwIfMembershipRevoked(session)
                 if (error.isRetryable()) {
                     state = markDeliveryUncertain(session, state, command)
                     state = reconcileBestEffort(session, state)
@@ -376,11 +409,13 @@ class DurableBlocksRepository(
             state = resolveSatisfied(session, state, discoveredRemotely = true)
             save(session, state)
         } catch (error: Exception) {
+            error.throwIfMembershipRevoked(session)
             if (!error.isRetryable()) throw error
         }
         try {
             state = synchronizeChangeFeed(session, state)
         } catch (error: Exception) {
+            error.throwIfMembershipRevoked(session)
             if (!error.isRetryable()) throw error
             state = activeState(session)
         }
@@ -575,6 +610,25 @@ class DurableBlocksRepository(
         return syncStore.loadSyncState(session.tenantId)
     }
 
+    private fun purgeTenant(tenantId: String) {
+        val syncFailure = runCatching { syncStore.clearSyncState(tenantId) }.exceptionOrNull()
+        val draftFailure = runCatching { draftStore.clear(tenantId) }.exceptionOrNull()
+        (syncFailure ?: draftFailure)?.let { failure ->
+            listOfNotNull(syncFailure, draftFailure)
+                .filterNot { it === failure }
+                .forEach(failure::addSuppressed)
+            throw IllegalStateException("Could not clear local tenant data", failure)
+        }
+    }
+
+    private fun Exception.throwIfMembershipRevoked(session: Session) {
+        if (!isMembershipRevoked()) return
+        if (activeTenantId == session.tenantId) activeTenantId = null
+        val revoked = MembershipRevokedException(this)
+        runCatching { purgeTenant(session.tenantId) }.exceptionOrNull()?.let(revoked::addSuppressed)
+        throw revoked
+    }
+
     private fun TenantSyncState.toStatus(): SyncStatus {
         val reconciliation = commands.any { it.status == QueuedCommandStatus.REQUIRES_RECONCILIATION }
         val message = notice ?: when {
@@ -691,6 +745,8 @@ class DurableBlocksRepository(
     private fun OfflineOperation.description() = name.lowercase().replace('_', ' ')
 
     private fun Exception.isRetryable() = this is IOException || this is ServiceException && status >= 500
+
+    private fun Exception.isMembershipRevoked() = this is ServiceException && status == 403
 
     private fun queuedOffline(command: QueuedCommand) = QueuedOfflineException(
         "The ${command.operation.description()} request is saved securely and will retry in order.",

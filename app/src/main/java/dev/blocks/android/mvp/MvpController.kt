@@ -53,6 +53,8 @@ class MvpController(
 
     fun login(identityToken: String) {
         if (identityToken.isBlank()) return fail("Enter an identity token.")
+        session = null
+        state = MvpState()
         val activeSession = repository.login(identityToken)
         val projects = repository.projects(activeSession)
         val sync = repository.synchronize(activeSession)
@@ -262,6 +264,16 @@ class MvpController(
     }
 
     fun reportError(message: String) = fail(message)
+
+    fun reportRepositoryError(error: Exception): Boolean {
+        if (error is MembershipRevokedException) {
+            session = null
+            state = MvpState(error = error.message)
+            return true
+        }
+        fail(error.message ?: "Blocks could not complete that request.")
+        return false
+    }
 
     fun synchronize() {
         val activeSession = requireNotNull(session)

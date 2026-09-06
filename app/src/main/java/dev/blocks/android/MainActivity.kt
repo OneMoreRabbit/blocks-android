@@ -292,7 +292,8 @@ class MainActivity : Activity() {
             } catch (_: CancellationException) {
                 return@launch
             } catch (error: Exception) {
-                controller.reportError(error.message ?: "Sign-in failed. Try again.")
+                val membershipRevoked = controller.reportRepositoryError(error)
+                if (membershipRevoked) continuity.shouldRestore = false
             }
             render()
         }
@@ -329,7 +330,8 @@ class MainActivity : Activity() {
             try {
                 withContext(Dispatchers.IO) { action() }
             } catch (error: Exception) {
-                controller.reportError(error.message ?: "Blocks could not complete that request.")
+                val membershipRevoked = controller.reportRepositoryError(error)
+                if (membershipRevoked) continuity.shouldRestore = false
             }
             render()
         }
