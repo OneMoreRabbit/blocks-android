@@ -7,6 +7,7 @@ import android.util.Base64
 import dev.blocks.android.mvp.DraftStore
 import dev.blocks.android.mvp.FormDrafts
 import dev.blocks.android.mvp.ParkingDraft
+import dev.blocks.android.mvp.PickupDraft
 import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -72,22 +73,41 @@ class AndroidEncryptedDraftStore(context: Context) : DraftStore {
     private fun encode(drafts: FormDrafts) = JSONObject()
         .put("project_name", drafts.projectName)
         .put(
+            "pickup",
+            JSONObject()
+                .put("project_id", drafts.pickup.projectId)
+                .put("core_outcome", drafts.pickup.coreOutcome)
+                .put("full_outcome", drafts.pickup.fullOutcome)
+                .put("polish_outcome", drafts.pickup.polishOutcome)
+                .put("idempotency_key", drafts.pickup.idempotencyKey),
+        )
+        .put(
             "parking",
             JSONObject()
                 .put("location", drafts.parking.location)
                 .put("next_action", drafts.parking.nextAction)
-                .put("must_not_forget", drafts.parking.mustNotForget),
+                .put("must_not_forget", drafts.parking.mustNotForget)
+                .put("idempotency_key", drafts.parking.idempotencyKey),
         ).toString()
 
     private fun decode(value: String): FormDrafts {
         val json = JSONObject(value)
-        val parking = json.getJSONObject("parking")
+        val pickup = json.optJSONObject("pickup") ?: JSONObject()
+        val parking = json.optJSONObject("parking") ?: JSONObject()
         return FormDrafts(
-            projectName = json.getString("project_name"),
+            projectName = json.optString("project_name"),
+            pickup = PickupDraft(
+                projectId = pickup.optString("project_id"),
+                coreOutcome = pickup.optString("core_outcome"),
+                fullOutcome = pickup.optString("full_outcome"),
+                polishOutcome = pickup.optString("polish_outcome"),
+                idempotencyKey = pickup.optString("idempotency_key"),
+            ),
             parking = ParkingDraft(
-                location = parking.getString("location"),
-                nextAction = parking.getString("next_action"),
-                mustNotForget = parking.getString("must_not_forget"),
+                location = parking.optString("location"),
+                nextAction = parking.optString("next_action"),
+                mustNotForget = parking.optString("must_not_forget"),
+                idempotencyKey = parking.optString("idempotency_key"),
             ),
         )
     }
