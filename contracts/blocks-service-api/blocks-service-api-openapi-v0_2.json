@@ -1,0 +1,4003 @@
+{
+  "components": {
+    "schemas": {
+      "BindIn": {
+        "properties": {
+          "project_id": {
+            "format": "uuid",
+            "title": "Project Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id"
+        ],
+        "title": "BindIn",
+        "type": "object"
+      },
+      "BindingOut": {
+        "properties": {
+          "block_id": {
+            "format": "uuid",
+            "title": "Block Id",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "project_id": {
+            "format": "uuid",
+            "title": "Project Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "block_id",
+          "project_id"
+        ],
+        "title": "BindingOut",
+        "type": "object"
+      },
+      "BlockIn": {
+        "properties": {
+          "label": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "label"
+        ],
+        "title": "BlockIn",
+        "type": "object"
+      },
+      "BlockOut": {
+        "properties": {
+          "bound_project_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bound Project Id"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "state"
+        ],
+        "title": "BlockOut",
+        "type": "object"
+      },
+      "CalibrationOut": {
+        "properties": {
+          "actual_tier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actual Tier"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "elapsed_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Elapsed Seconds"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "interruption": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Interruption"
+          },
+          "planned_tier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Planned Tier"
+          },
+          "restart_latency_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Restart Latency Seconds"
+          }
+        },
+        "required": [
+          "id",
+          "planned_tier",
+          "actual_tier",
+          "elapsed_seconds",
+          "interruption",
+          "restart_latency_seconds",
+          "created_at"
+        ],
+        "title": "CalibrationOut",
+        "type": "object"
+      },
+      "ChangesOut": {
+        "properties": {
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/EventEnvelopeOut"
+            },
+            "title": "Events",
+            "type": "array"
+          },
+          "has_more": {
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "next_since": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Pass as `since` on the next call.",
+            "title": "Next Since"
+          }
+        },
+        "required": [
+          "events",
+          "next_since",
+          "has_more"
+        ],
+        "title": "ChangesOut",
+        "type": "object"
+      },
+      "CloseOnExistingContinuation": {
+        "additionalProperties": false,
+        "description": "Close a session that was ALREADY parked, without inventing a tier.\n\nA two-form union of \"outcome\" and \"new continuation\" would silently drop this\nflow, and it is a real one: park at lunch, decide later the block is over.\nForcing such a client to re-send the continuation would duplicate the record;\nforcing an `outcome_tier` would make it claim a tier it did not reach, which\ninvariant 8 rules out as firmly as invariant 3 rules out preserving nothing.\n\nExplicit, so it cannot be produced by accident \u2014 an empty body still matches\nno member. The server verifies a continuation actually exists and refuses\nwith `409` if it does not.",
+        "properties": {
+          "interruption": {
+            "anyOf": [
+              {
+                "pattern": "^(boundary|hijacked|abandoned|unknown)$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why the block ended. `hijacked` is a normal input, not a failure (invariant 2) \u2014 the vocabulary is deliberately neutral.",
+            "title": "Interruption"
+          },
+          "preserve": {
+            "const": "existing_continuation",
+            "description": "Assert that this session already has a parking record to preserve.",
+            "title": "Preserve",
+            "type": "string"
+          }
+        },
+        "required": [
+          "preserve"
+        ],
+        "title": "CloseOnExistingContinuation",
+        "type": "object"
+      },
+      "CloseOut": {
+        "description": "What a close returns, in both forms.",
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "parking_record_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Set when the close carried a continuation: the immutable record that was appended in the same transaction.",
+            "title": "Parking Record Id"
+          },
+          "row_version": {
+            "description": "The version after closing.",
+            "title": "Row Version",
+            "type": "integer"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "state",
+          "row_version"
+        ],
+        "title": "CloseOut",
+        "type": "object"
+      },
+      "CloseWithContinuation": {
+        "additionalProperties": false,
+        "description": "Close preserving an explicit continuation, atomically.\n\nFor the offline boundary: park and close as **one** operation, under the one\n`If-Match` the client actually knows. Queuing park then close separately\ncannot work offline \u2014 the park advances the row version, and the queued close\nwas written before that version existed.",
+        "properties": {
+          "device_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Device Id"
+          },
+          "interruption": {
+            "anyOf": [
+              {
+                "pattern": "^(boundary|hijacked|abandoned|unknown)$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why the block ended. `hijacked` is a normal input, not a failure (invariant 2) \u2014 the vocabulary is deliberately neutral.",
+            "title": "Interruption"
+          },
+          "must_not_forget": {
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Must Not Forget",
+            "type": "string"
+          },
+          "next_physical_action": {
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Next Physical Action",
+            "type": "string"
+          },
+          "where_i_am": {
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Where I Am",
+            "type": "string"
+          }
+        },
+        "required": [
+          "where_i_am",
+          "next_physical_action",
+          "must_not_forget"
+        ],
+        "title": "CloseWithContinuation",
+        "type": "object"
+      },
+      "CloseWithOutcome": {
+        "additionalProperties": false,
+        "description": "Close having reached a tier.",
+        "properties": {
+          "interruption": {
+            "anyOf": [
+              {
+                "pattern": "^(boundary|hijacked|abandoned|unknown)$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why the block ended. `hijacked` is a normal input, not a failure (invariant 2) \u2014 the vocabulary is deliberately neutral.",
+            "title": "Interruption"
+          },
+          "outcome_tier": {
+            "description": "Which tier was actually reached. Evidence, never a score (invariant 8).",
+            "pattern": "^(core|full|polish)$",
+            "title": "Outcome Tier",
+            "type": "string"
+          }
+        },
+        "required": [
+          "outcome_tier"
+        ],
+        "title": "CloseWithOutcome",
+        "type": "object"
+      },
+      "DependencyIn": {
+        "properties": {
+          "predecessor_id": {
+            "format": "uuid",
+            "title": "Predecessor Id",
+            "type": "string"
+          },
+          "successor_id": {
+            "format": "uuid",
+            "title": "Successor Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "predecessor_id",
+          "successor_id"
+        ],
+        "title": "DependencyIn",
+        "type": "object"
+      },
+      "DependencyOut": {
+        "properties": {
+          "predecessor_id": {
+            "format": "uuid",
+            "title": "Predecessor Id",
+            "type": "string"
+          },
+          "successor_id": {
+            "format": "uuid",
+            "title": "Successor Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "predecessor_id",
+          "successor_id"
+        ],
+        "title": "DependencyOut",
+        "type": "object"
+      },
+      "Error": {
+        "properties": {
+          "error": {
+            "properties": {
+              "code": {
+                "description": "Stable machine-readable code. Branch on this.",
+                "enum": [
+                  "invalid_request",
+                  "unauthenticated",
+                  "unauthorized",
+                  "not_found",
+                  "conflict",
+                  "upgrade_required"
+                ],
+                "type": "string"
+              },
+              "message": {
+                "description": "Human-readable prose. May change in a PATCH; do not branch on it.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "message"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "title": "Error",
+        "type": "object"
+      },
+      "EventEnvelopeOut": {
+        "description": "The accepted 0.1 envelope, typed.\n\nPublished as fields rather than a bare object so a generated client gets the\nstable parts \u2014 everything a consumer routes and deduplicates on. `payload`\nstays open on purpose: its shape is chosen by `eventType` + `eventVersion`\nand is versioned separately in the event schemas, so freezing it here would\nmake every new event type a breaking change to this response.",
+        "properties": {
+          "eventId": {
+            "description": "Monotonic; stable across redeliveries. Deduplicate on this.",
+            "title": "Eventid",
+            "type": "string"
+          },
+          "eventType": {
+            "description": "Dotted name, e.g. `session.parked`.",
+            "title": "Eventtype",
+            "type": "string"
+          },
+          "eventVersion": {
+            "description": "MAJOR.MINOR of the payload schema, as written.",
+            "title": "Eventversion",
+            "type": "string"
+          },
+          "occurredAt": {
+            "description": "When the originating transaction committed.",
+            "format": "date-time",
+            "title": "Occurredat",
+            "type": "string"
+          },
+          "payload": {
+            "additionalProperties": true,
+            "description": "Identifiers and the minimum needed to act. Shape is given by `eventType` and `eventVersion`; tolerate unknown fields.",
+            "title": "Payload",
+            "type": "object"
+          },
+          "tenantId": {
+            "format": "uuid",
+            "title": "Tenantid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "eventId",
+          "eventType",
+          "eventVersion",
+          "tenantId",
+          "occurredAt",
+          "payload"
+        ],
+        "title": "EventEnvelopeOut",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "LookupIn": {
+        "properties": {
+          "tag_token": {
+            "minLength": 1,
+            "title": "Tag Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tag_token"
+        ],
+        "title": "LookupIn",
+        "type": "object"
+      },
+      "LookupOut": {
+        "properties": {
+          "block_id": {
+            "format": "uuid",
+            "title": "Block Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Null when the block is registered but bound to no project.",
+            "title": "Project Id"
+          }
+        },
+        "required": [
+          "block_id",
+          "label",
+          "project_id"
+        ],
+        "title": "LookupOut",
+        "type": "object"
+      },
+      "MapItemIn": {
+        "properties": {
+          "after_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Insert immediately after this item. Omit to append.",
+            "title": "After Id"
+          },
+          "title": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title"
+        ],
+        "title": "MapItemIn",
+        "type": "object"
+      },
+      "MapItemOut": {
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "row_version": {
+            "title": "Row Version",
+            "type": "integer"
+          },
+          "sort_key": {
+            "title": "Sort Key",
+            "type": "integer"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "status",
+          "sort_key",
+          "row_version"
+        ],
+        "title": "MapItemOut",
+        "type": "object"
+      },
+      "MapItemPatch": {
+        "properties": {
+          "status": {
+            "anyOf": [
+              {
+                "pattern": "^(open|in_progress|done|dropped)$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "title": "MapItemPatch",
+        "type": "object"
+      },
+      "ParkIn": {
+        "description": "The three questions. All required \u2014 two answers is not a parking record.",
+        "properties": {
+          "device_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Device Id"
+          },
+          "must_not_forget": {
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Must Not Forget",
+            "type": "string"
+          },
+          "next_physical_action": {
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Next Physical Action",
+            "type": "string"
+          },
+          "where_i_am": {
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Where I Am",
+            "type": "string"
+          }
+        },
+        "required": [
+          "where_i_am",
+          "next_physical_action",
+          "must_not_forget"
+        ],
+        "title": "ParkIn",
+        "type": "object"
+      },
+      "ParkOut": {
+        "properties": {
+          "parking": {
+            "$ref": "#/components/schemas/ParkingOut"
+          },
+          "session": {
+            "$ref": "#/components/schemas/TransitionOut"
+          }
+        },
+        "required": [
+          "session",
+          "parking"
+        ],
+        "title": "ParkOut",
+        "type": "object"
+      },
+      "ParkingOut": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "must_not_forget": {
+            "title": "Must Not Forget",
+            "type": "string"
+          },
+          "next_physical_action": {
+            "title": "Next Physical Action",
+            "type": "string"
+          },
+          "sequence": {
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "where_i_am": {
+            "title": "Where I Am",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "where_i_am",
+          "next_physical_action",
+          "must_not_forget",
+          "sequence",
+          "created_at"
+        ],
+        "title": "ParkingOut",
+        "type": "object"
+      },
+      "PickupByProject": {
+        "additionalProperties": false,
+        "description": "Pick up by naming the project directly.",
+        "properties": {
+          "boundary_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The real-world edge this march ends at.",
+            "title": "Boundary At"
+          },
+          "core_outcome": {
+            "description": "Required. Sized below the available window (invariant 3).",
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Core Outcome",
+            "type": "string"
+          },
+          "full_outcome": {
+            "anyOf": [
+              {
+                "maxLength": 500,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Full Outcome"
+          },
+          "polish_outcome": {
+            "anyOf": [
+              {
+                "maxLength": 500,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Polish Outcome"
+          },
+          "project_id": {
+            "format": "uuid",
+            "title": "Project Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "core_outcome",
+          "project_id"
+        ],
+        "title": "PickupByProject",
+        "type": "object"
+      },
+      "PickupByTag": {
+        "additionalProperties": false,
+        "description": "Pick up by tapping a block, which resolves to its bound project.",
+        "properties": {
+          "boundary_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The real-world edge this march ends at.",
+            "title": "Boundary At"
+          },
+          "core_outcome": {
+            "description": "Required. Sized below the available window (invariant 3).",
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Core Outcome",
+            "type": "string"
+          },
+          "full_outcome": {
+            "anyOf": [
+              {
+                "maxLength": 500,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Full Outcome"
+          },
+          "polish_outcome": {
+            "anyOf": [
+              {
+                "maxLength": 500,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Polish Outcome"
+          },
+          "tag_token": {
+            "title": "Tag Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "core_outcome",
+          "tag_token"
+        ],
+        "title": "PickupByTag",
+        "type": "object"
+      },
+      "ProjectIn": {
+        "properties": {
+          "name": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "ProjectIn",
+        "type": "object"
+      },
+      "ProjectOut": {
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "tenant_id",
+          "name"
+        ],
+        "title": "ProjectOut",
+        "type": "object"
+      },
+      "ReentryOut": {
+        "description": "Both fields are **required and nullable**, deliberately.\n\nNo-result is `{\"session\": null, \"parking\": null}`, never `{}` and never an\nomitted key. A generated client then has one shape to handle rather than\nthree, and \"absent\" cannot be confused with \"not sent\".",
+        "properties": {
+          "parking": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ParkingOut"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The newest non-superseded record. The pickup view. Null when the session has no continuation, or when there is no session."
+          },
+          "session": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkSessionOut"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "May be `closed` \u2014 an atomic park-and-close preserves a continuation on a closed session, and `state` is how a client tells that apart from a session it can resume. Null when there is nothing to re-enter."
+          }
+        },
+        "required": [
+          "session",
+          "parking"
+        ],
+        "title": "ReentryOut",
+        "type": "object"
+      },
+      "RegisteredBlockOut": {
+        "properties": {
+          "bound_project_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bound Project Id"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "tag_token": {
+            "description": "The token to write to the NFC tag. Returned ONCE, at registration; the service stores only its hash and cannot show it again.",
+            "title": "Tag Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "state",
+          "tag_token"
+        ],
+        "title": "RegisteredBlockOut",
+        "type": "object"
+      },
+      "SessionOut": {
+        "properties": {
+          "email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Email"
+          },
+          "personal_tenant_id": {
+            "description": "The user's one personal tenant, created on first login.",
+            "format": "uuid",
+            "title": "Personal Tenant Id",
+            "type": "string"
+          },
+          "tenants": {
+            "items": {
+              "$ref": "#/components/schemas/TenantOut"
+            },
+            "title": "Tenants",
+            "type": "array"
+          },
+          "user_id": {
+            "format": "uuid",
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "email",
+          "personal_tenant_id",
+          "tenants"
+        ],
+        "title": "SessionOut",
+        "type": "object"
+      },
+      "TenantOut": {
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "description": "`personal` or `organization`.",
+            "title": "Kind",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "name"
+        ],
+        "title": "TenantOut",
+        "type": "object"
+      },
+      "TransitionOut": {
+        "description": "What every state transition returns: enough to make the next call.",
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "row_version": {
+            "title": "Row Version",
+            "type": "integer"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "state",
+          "row_version"
+        ],
+        "title": "TransitionOut",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      },
+      "WorkSessionOut": {
+        "description": "Named `WorkSessionOut`, not `SessionOut`.\n\n`SessionOut` is already the bootstrap response in the **accepted 0.1**\ncontract. Reusing the name collided, and FastAPI disambiguates a collision by\nmangling BOTH into module-qualified names \u2014 which would have silently renamed\nan accepted schema out from under a client generating against 0.2.",
+        "properties": {
+          "boundary_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Null when no real-world boundary was declared.",
+            "title": "Boundary At"
+          },
+          "core_outcome": {
+            "title": "Core Outcome",
+            "type": "string"
+          },
+          "full_outcome": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Full Outcome"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "physical_block_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Null when the session was picked up by project.",
+            "title": "Physical Block Id"
+          },
+          "polish_outcome": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Polish Outcome"
+          },
+          "project_id": {
+            "format": "uuid",
+            "title": "Project Id",
+            "type": "string"
+          },
+          "row_version": {
+            "description": "Send this back as `If-Match` on the next transition.",
+            "title": "Row Version",
+            "type": "integer"
+          },
+          "state": {
+            "description": "`active`, `parked`, `closed`, or `cancelled`.",
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "state",
+          "core_outcome",
+          "row_version"
+        ],
+        "title": "WorkSessionOut",
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "bearerFormat": "JWT",
+        "description": "An identity token from the configured OIDC issuer. Verified for signature, expiry, issuer and audience; never issued by this service.",
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "summary": "Authoritative domain, tenancy, and device-coordination API for Blocks.",
+    "title": "Blocks Service API",
+    "version": "0.2.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/health/live": {
+      "get": {
+        "operationId": "live_health_live_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Live Health Live Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [],
+        "summary": "Liveness probe",
+        "tags": [
+          "health"
+        ]
+      }
+    },
+    "/health/ready": {
+      "get": {
+        "operationId": "ready_health_ready_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Ready Health Ready Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [],
+        "summary": "Readiness probe",
+        "tags": [
+          "health"
+        ]
+      }
+    },
+    "/v1/session": {
+      "post": {
+        "description": "Idempotent. First call for a subject creates the user, their personal tenant, and the owner membership; later calls return the same ids.",
+        "operationId": "bootstrap_v1_session_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Absent, malformed, expired or untrusted token; or unknown subject"
+          }
+        },
+        "summary": "Exchange a verified identity token for a session",
+        "tags": [
+          "session"
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/blocks": {
+      "get": {
+        "operationId": "list_blocks_v1_tenants__tenant_id__blocks_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+            "in": "header",
+            "name": "X-Blocks-Client-Version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+              "title": "X-Blocks-Client-Version"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/BlockOut"
+                  },
+                  "title": "Response List Blocks V1 Tenants  Tenant Id  Blocks Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Absent, malformed, expired or untrusted token; or unknown subject"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not a member of this tenant \u2014 or no such tenant"
+          },
+          "426": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Client below the minimum supported version"
+          }
+        },
+        "summary": "List the tenant's blocks",
+        "tags": [
+          "blocks"
+        ]
+      },
+      "post": {
+        "operationId": "register_v1_tenants__tenant_id__blocks_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+            "in": "header",
+            "name": "X-Blocks-Client-Version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+              "title": "X-Blocks-Client-Version"
+            }
+          },
+          {
+            "description": "Send one per distinct operation your offline queue may retry. The outcome is stored and replayed verbatim, with `Idempotent-Replay: true` on the repeat. Reusing a key with a different body is `409`.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Send one per distinct operation your offline queue may retry. The outcome is stored and replayed verbatim, with `Idempotent-Replay: true` on the repeat. Reusing a key with a different body is `409`.",
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BlockIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RegisteredBlockOut"
+                }
+              }
+            },
+            "description": "Successful Response",
+            "headers": {
+              "Idempotent-Replay": {
+                "description": "`true` when this response was replayed from a previously stored outcome rather than executed.",
+                "schema": {
+                  "enum": [
+                    "true"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Absent, malformed, expired or untrusted token; or unknown subject"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not a member of this tenant \u2014 or no such tenant"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Idempotency, optimistic-concurrency, or state-machine conflict"
+          },
+          "426": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Client below the minimum supported version"
+          }
+        },
+        "summary": "Register a physical block",
+        "tags": [
+          "blocks"
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/blocks/lookup": {
+      "post": {
+        "description": "A POST because the token belongs in a body, not in a URL that gets logged.",
+        "operationId": "lookup_v1_tenants__tenant_id__blocks_lookup_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+            "in": "header",
+            "name": "X-Blocks-Client-Version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+              "title": "X-Blocks-Client-Version"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LookupIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LookupOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Absent, malformed, expired or untrusted token; or unknown subject"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not a member of this tenant \u2014 or no such tenant"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Resource absent within a tenant the caller can see"
+          },
+          "426": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Client below the minimum supported version"
+          }
+        },
+        "summary": "Resolve an NFC tag token to its block and binding",
+        "tags": [
+          "blocks"
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/blocks/{block_id}/binding": {
+      "delete": {
+        "description": "Ends the current association and opens none. The block stays registered and its tag keeps resolving \u2014 to a block with no project \u2014 so a physical block can be taken out of service without being destroyed or silently re-pointed. Past work sessions are untouched.",
+        "operationId": "unbind_v1_tenants__tenant_id__blocks__block_id__binding_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "block_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Block Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+            "in": "header",
+            "name": "X-Blocks-Client-Version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+              "title": "X-Blocks-Client-Version"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Absent, malformed, expired or untrusted token; or unknown subject"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not a member of this tenant \u2014 or no such tenant"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Resource absent within a tenant the caller can see"
+          },
+          "426": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Client below the minimum supported version"
+          }
+        },
+        "summary": "Unbind a block from its current project",
+        "tags": [
+          "blocks"
+        ]
+      },
+      "post": {
+        "description": "A block has **at most one current association**. Binding a block that is already bound ends the previous association and opens a new one \u2014 reassociation is this same call, not a separate operation. History is never rewritten: work sessions that ran under the previous association keep pointing at it. A project may hold many blocks.",
+        "operationId": "bind_v1_tenants__tenant_id__blocks__block_id__binding_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "block_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Block Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+            "in": "header",
+            "name": "X-Blocks-Client-Version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+              "title": "X-Blocks-Client-Version"
+            }
+          },
+          {
+            "description": "Send one per distinct operation your offline queue may retry. The outcome is stored and replayed verbatim, with `Idempotent-Replay: true` on the repeat. Reusing a key with a different body is `409`.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Send one per distinct operation your offline queue may retry. The outcome is stored and replayed verbatim, with `Idempotent-Replay: true` on the repeat. Reusing a key with a different body is `409`.",
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BindIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BindingOut"
+                }
+              }
+            },
+            "description": "Successful Response",
+            "headers": {
+              "Idempotent-Replay": {
+                "description": "`true` when this response was replayed from a previously stored outcome rather than executed.",
+                "schema": {
+                  "enum": [
+                    "true"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Absent, malformed, expired or untrusted token; or unknown subject"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not a member of this tenant \u2014 or no such tenant"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Resource absent within a tenant the caller can see"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Idempotency, optimistic-concurrency, or state-machine conflict"
+          },
+          "426": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Client below the minimum supported version"
+          }
+        },
+        "summary": "Bind a block to a project, or move it to another",
+        "tags": [
+          "blocks"
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/changes": {
+      "get": {
+        "operationId": "changes_v1_tenants__tenant_id__changes_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The last eventId already processed.",
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "description": "The last eventId already processed.",
+              "minimum": 0,
+              "title": "Since",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+            "in": "header",
+            "name": "X-Blocks-Client-Version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+              "title": "X-Blocks-Client-Version"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangesOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Absent, malformed, expired or untrusted token; or unknown subject"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not a member of this tenant \u2014 or no such tenant"
+          },
+          "426": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Client below the minimum supported version"
+          }
+        },
+        "summary": "Events since a cursor",
+        "tags": [
+          "sync"
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/projects": {
+      "get": {
+        "operationId": "list_projects_v1_tenants__tenant_id__projects_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+            "in": "header",
+            "name": "X-Blocks-Client-Version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+              "title": "X-Blocks-Client-Version"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ProjectOut"
+                  },
+                  "title": "Response List Projects V1 Tenants  Tenant Id  Projects Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Absent, malformed, expired or untrusted token; or unknown subject"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not a member of this tenant \u2014 or no such tenant"
+          },
+          "426": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Client below the minimum supported version"
+          }
+        },
+        "summary": "List the tenant's projects",
+        "tags": [
+          "projects"
+        ]
+      },
+      "post": {
+        "operationId": "create_project_v1_tenants__tenant_id__projects_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+            "in": "header",
+            "name": "X-Blocks-Client-Version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+              "title": "X-Blocks-Client-Version"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Absent, malformed, expired or untrusted token; or unknown subject"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not a member of this tenant \u2014 or no such tenant"
+          },
+          "426": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Client below the minimum supported version"
+          }
+        },
+        "summary": "Create a project in the tenant",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/projects/{project_id}/map": {
+      "get": {
+        "operationId": "read_map_v1_tenants__tenant_id__projects__project_id__map_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+            "in": "header",
+            "name": "X-Blocks-Client-Version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+              "title": "X-Blocks-Client-Version"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/MapItemOut"
+                  },
+                  "title": "Response Read Map V1 Tenants  Tenant Id  Projects  Project Id  Map Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Absent, malformed, expired or untrusted token; or unknown subject"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not a member of this tenant \u2014 or no such tenant"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Resource absent within a tenant the caller can see"
+          },
+          "426": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Client below the minimum supported version"
+          }
+        },
+        "summary": "Read the project's map",
+        "tags": [
+          "map"
+        ]
+      },
+      "post": {
+        "operationId": "add_item_v1_tenants__tenant_id__projects__project_id__map_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+            "in": "header",
+            "name": "X-Blocks-Client-Version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+              "title": "X-Blocks-Client-Version"
+            }
+          },
+          {
+            "description": "Send one per distinct operation your offline queue may retry. The outcome is stored and replayed verbatim, with `Idempotent-Replay: true` on the repeat. Reusing a key with a different body is `409`.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Send one per distinct operation your offline queue may retry. The outcome is stored and replayed verbatim, with `Idempotent-Replay: true` on the repeat. Reusing a key with a different body is `409`.",
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MapItemIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MapItemOut"
+                }
+              }
+            },
+            "description": "Successful Response",
+            "headers": {
+              "Idempotent-Replay": {
+                "description": "`true` when this response was replayed from a previously stored outcome rather than executed.",
+                "schema": {
+                  "enum": [
+                    "true"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Absent, malformed, expired or untrusted token; or unknown subject"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not a member of this tenant \u2014 or no such tenant"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Resource absent within a tenant the caller can see"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Idempotency, optimistic-concurrency, or state-machine conflict"
+          },
+          "426": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Client below the minimum supported version"
+          }
+        },
+        "summary": "Add a milestone",
+        "tags": [
+          "map"
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/projects/{project_id}/map/dependencies": {
+      "delete": {
+        "operationId": "remove_dependency_v1_tenants__tenant_id__projects__project_id__map_dependencies_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "predecessor_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Predecessor Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "successor_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Successor Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+            "in": "header",
+            "name": "X-Blocks-Client-Version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+              "title": "X-Blocks-Client-Version"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Absent, malformed, expired or untrusted token; or unknown subject"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not a member of this tenant \u2014 or no such tenant"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Resource absent within a tenant the caller can see"
+          },
+          "426": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Client below the minimum supported version"
+          }
+        },
+        "summary": "Remove a dependency",
+        "tags": [
+          "map"
+        ]
+      },
+      "get": {
+        "operationId": "read_dependencies_v1_tenants__tenant_id__projects__project_id__map_dependencies_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+            "in": "header",
+            "name": "X-Blocks-Client-Version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+              "title": "X-Blocks-Client-Version"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/DependencyOut"
+                  },
+                  "title": "Response Read Dependencies V1 Tenants  Tenant Id  Projects  Project Id  Map Dependencies Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Absent, malformed, expired or untrusted token; or unknown subject"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not a member of this tenant \u2014 or no such tenant"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Resource absent within a tenant the caller can see"
+          },
+          "426": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Client below the minimum supported version"
+          }
+        },
+        "summary": "Read the map's dependencies",
+        "tags": [
+          "map"
+        ]
+      },
+      "post": {
+        "description": "Refuses anything that would create a cycle.\n\nNot a validation nicety: a cyclic map is one that can never be ordered, and\nbeing orderable is the whole job of a map (invariant 1).",
+        "operationId": "add_dependency_v1_tenants__tenant_id__projects__project_id__map_dependencies_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+            "in": "header",
+            "name": "X-Blocks-Client-Version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+              "title": "X-Blocks-Client-Version"
+            }
+          },
+          {
+            "description": "Send one per distinct operation your offline queue may retry. The outcome is stored and replayed verbatim, with `Idempotent-Replay: true` on the repeat. Reusing a key with a different body is `409`.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Send one per distinct operation your offline queue may retry. The outcome is stored and replayed verbatim, with `Idempotent-Replay: true` on the repeat. Reusing a key with a different body is `409`.",
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DependencyIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DependencyOut"
+                }
+              }
+            },
+            "description": "Successful Response",
+            "headers": {
+              "Idempotent-Replay": {
+                "description": "`true` when this response was replayed from a previously stored outcome rather than executed.",
+                "schema": {
+                  "enum": [
+                    "true"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Absent, malformed, expired or untrusted token; or unknown subject"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not a member of this tenant \u2014 or no such tenant"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Resource absent within a tenant the caller can see"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Idempotency, optimistic-concurrency, or state-machine conflict"
+          },
+          "426": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Client below the minimum supported version"
+          }
+        },
+        "summary": "Declare that one milestone precedes another",
+        "tags": [
+          "map"
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/projects/{project_id}/map/{item_id}": {
+      "patch": {
+        "operationId": "update_item_v1_tenants__tenant_id__projects__project_id__map__item_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "item_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Item Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+            "in": "header",
+            "name": "X-Blocks-Client-Version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+              "title": "X-Blocks-Client-Version"
+            }
+          },
+          {
+            "description": "**Required.** The `row_version` you read, as an integer. A stale value is `409`; a missing one is `400`.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "description": "**Required.** The `row_version` you read, as an integer. A stale value is `409`; a missing one is `400`.",
+              "title": "If-Match",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MapItemPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MapItemOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Absent, malformed, expired or untrusted token; or unknown subject"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not a member of this tenant \u2014 or no such tenant"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Resource absent within a tenant the caller can see"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Idempotency, optimistic-concurrency, or state-machine conflict"
+          },
+          "426": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Client below the minimum supported version"
+          }
+        },
+        "summary": "Update a milestone",
+        "tags": [
+          "map"
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/sessions": {
+      "post": {
+        "description": "Provide **exactly one** of `project_id` or `tag_token`. Returns `409` if you already have an active session \u2014 park or close it first.",
+        "operationId": "pickup_v1_tenants__tenant_id__sessions_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+            "in": "header",
+            "name": "X-Blocks-Client-Version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+              "title": "X-Blocks-Client-Version"
+            }
+          },
+          {
+            "description": "Send one per distinct operation your offline queue may retry. The outcome is stored and replayed verbatim, with `Idempotent-Replay: true` on the repeat. Reusing a key with a different body is `409`.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Send one per distinct operation your offline queue may retry. The outcome is stored and replayed verbatim, with `Idempotent-Replay: true` on the repeat. Reusing a key with a different body is `409`.",
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/PickupByProject"
+                  },
+                  {
+                    "$ref": "#/components/schemas/PickupByTag"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkSessionOut"
+                }
+              }
+            },
+            "description": "Successful Response",
+            "headers": {
+              "Idempotent-Replay": {
+                "description": "`true` when this response was replayed from a previously stored outcome rather than executed.",
+                "schema": {
+                  "enum": [
+                    "true"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Absent, malformed, expired or untrusted token; or unknown subject"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not a member of this tenant \u2014 or no such tenant"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Resource absent within a tenant the caller can see"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Idempotency, optimistic-concurrency, or state-machine conflict"
+          },
+          "426": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Client below the minimum supported version"
+          }
+        },
+        "summary": "Pick up: start a work session",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/sessions/current": {
+      "get": {
+        "description": "The authoritative re-entry surface. Returns, in order: the **active** session; otherwise the session owning the **globally newest non-superseded parking record**, whether parked or closed. State does not outrank recency \u2014 a parked session competes on the age of its own record like everything else. Constitution invariant 4 requires the newest parking record to be immediately available, so a client never reconstructs this. Both fields are required and nullable: no result is `{\"session\": null, \"parking\": null}`.",
+        "operationId": "current_v1_tenants__tenant_id__sessions_current_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+            "in": "header",
+            "name": "X-Blocks-Client-Version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+              "title": "X-Blocks-Client-Version"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReentryOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Absent, malformed, expired or untrusted token; or unknown subject"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not a member of this tenant \u2014 or no such tenant"
+          },
+          "426": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Client below the minimum supported version"
+          }
+        },
+        "summary": "Re-entry: where was I?",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/sessions/{session_id}/calibration": {
+      "get": {
+        "description": "Raw observations for one session.\n\nInvariant 8: this returns measurements and no aggregate. There is no\ncompletion rate, streak, or total here \u2014 not because they are withheld, but\nbecause none is stored. A client that wants to tune something computes from\nthese; a client that wants to score someone has nothing to work with.",
+        "operationId": "calibration_v1_tenants__tenant_id__sessions__session_id__calibration_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+            "in": "header",
+            "name": "X-Blocks-Client-Version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+              "title": "X-Blocks-Client-Version"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/CalibrationOut"
+                  },
+                  "title": "Response Calibration V1 Tenants  Tenant Id  Sessions  Session Id  Calibration Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Absent, malformed, expired or untrusted token; or unknown subject"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not a member of this tenant \u2014 or no such tenant"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Resource absent within a tenant the caller can see"
+          },
+          "426": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Client below the minimum supported version"
+          }
+        },
+        "summary": "What this session measured",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/sessions/{session_id}/close": {
+      "post": {
+        "description": "Send **exactly one** form: an `outcome_tier`; the complete three-field continuation; or `{'preserve': 'existing_continuation'}` for a session already parked. The continuation form appends the immutable parking record and closes the session in **one transaction** under the single `If-Match` you already hold \u2014 so an offline client never has to guess a row version that did not exist when it queued the intent. A stale version rolls the whole thing back and writes nothing, not even the parking record.",
+        "operationId": "close_v1_tenants__tenant_id__sessions__session_id__close_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+            "in": "header",
+            "name": "X-Blocks-Client-Version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+              "title": "X-Blocks-Client-Version"
+            }
+          },
+          {
+            "description": "**Required.** The `row_version` you read, as an integer. A stale value is `409`; a missing one is `400`.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "description": "**Required.** The `row_version` you read, as an integer. A stale value is `409`; a missing one is `400`.",
+              "title": "If-Match",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Send one per distinct operation your offline queue may retry. The outcome is stored and replayed verbatim, with `Idempotent-Replay: true` on the repeat. Reusing a key with a different body is `409`.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Send one per distinct operation your offline queue may retry. The outcome is stored and replayed verbatim, with `Idempotent-Replay: true` on the repeat. Reusing a key with a different body is `409`.",
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/CloseWithOutcome"
+                  },
+                  {
+                    "$ref": "#/components/schemas/CloseWithContinuation"
+                  },
+                  {
+                    "$ref": "#/components/schemas/CloseOnExistingContinuation"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CloseOut"
+                }
+              }
+            },
+            "description": "Successful Response",
+            "headers": {
+              "Idempotent-Replay": {
+                "description": "`true` when this response was replayed from a previously stored outcome rather than executed.",
+                "schema": {
+                  "enum": [
+                    "true"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Absent, malformed, expired or untrusted token; or unknown subject"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not a member of this tenant \u2014 or no such tenant"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Resource absent within a tenant the caller can see"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Idempotency, optimistic-concurrency, or state-machine conflict"
+          },
+          "426": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Client below the minimum supported version"
+          }
+        },
+        "summary": "Close a session",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/sessions/{session_id}/park": {
+      "post": {
+        "operationId": "park_v1_tenants__tenant_id__sessions__session_id__park_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+            "in": "header",
+            "name": "X-Blocks-Client-Version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+              "title": "X-Blocks-Client-Version"
+            }
+          },
+          {
+            "description": "**Required.** The `row_version` you read, as an integer. A stale value is `409`; a missing one is `400`.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "description": "**Required.** The `row_version` you read, as an integer. A stale value is `409`; a missing one is `400`.",
+              "title": "If-Match",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Send one per distinct operation your offline queue may retry. The outcome is stored and replayed verbatim, with `Idempotent-Replay: true` on the repeat. Reusing a key with a different body is `409`.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Send one per distinct operation your offline queue may retry. The outcome is stored and replayed verbatim, with `Idempotent-Replay: true` on the repeat. Reusing a key with a different body is `409`.",
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ParkIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ParkOut"
+                }
+              }
+            },
+            "description": "Successful Response",
+            "headers": {
+              "Idempotent-Replay": {
+                "description": "`true` when this response was replayed from a previously stored outcome rather than executed.",
+                "schema": {
+                  "enum": [
+                    "true"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Absent, malformed, expired or untrusted token; or unknown subject"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not a member of this tenant \u2014 or no such tenant"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Resource absent within a tenant the caller can see"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Idempotency, optimistic-concurrency, or state-machine conflict"
+          },
+          "426": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Client below the minimum supported version"
+          }
+        },
+        "summary": "Park: answer the three questions",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/sessions/{session_id}/parking": {
+      "get": {
+        "description": "Append-only, so this is the whole truth: corrections appear as new records.\n\nA session with no parking records returns `[]`; a session that does not exist\nreturns `404`. The distinction is the point \u2014 otherwise a stale id looks like\na session nobody has parked.",
+        "operationId": "history_v1_tenants__tenant_id__sessions__session_id__parking_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+            "in": "header",
+            "name": "X-Blocks-Client-Version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+              "title": "X-Blocks-Client-Version"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ParkingOut"
+                  },
+                  "title": "Response History V1 Tenants  Tenant Id  Sessions  Session Id  Parking Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Absent, malformed, expired or untrusted token; or unknown subject"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not a member of this tenant \u2014 or no such tenant"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Resource absent within a tenant the caller can see"
+          },
+          "426": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Client below the minimum supported version"
+          }
+        },
+        "summary": "The full parking history of a session",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/sessions/{session_id}/resume": {
+      "post": {
+        "operationId": "resume_v1_tenants__tenant_id__sessions__session_id__resume_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+            "in": "header",
+            "name": "X-Blocks-Client-Version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional dotted version. Below the declared minimum is `426`; absent is allowed; unparseable is `400`.",
+              "title": "X-Blocks-Client-Version"
+            }
+          },
+          {
+            "description": "**Required.** The `row_version` you read, as an integer. A stale value is `409`; a missing one is `400`.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "description": "**Required.** The `row_version` you read, as an integer. A stale value is `409`; a missing one is `400`.",
+              "title": "If-Match",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransitionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Absent, malformed, expired or untrusted token; or unknown subject"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not a member of this tenant \u2014 or no such tenant"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Resource absent within a tenant the caller can see"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Idempotency, optimistic-concurrency, or state-machine conflict"
+          },
+          "426": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Client below the minimum supported version"
+          }
+        },
+        "summary": "Resume a parked session",
+        "tags": [
+          "sessions"
+        ]
+      }
+    }
+  },
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ]
+}

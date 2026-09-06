@@ -1,31 +1,42 @@
 package dev.blocks.android.api
 
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
+import dev.blocks.android.api.generated.model.ProjectIn
+import dev.blocks.android.api.generated.model.ProjectOut
+import dev.blocks.android.api.generated.model.SessionOut
 import dev.blocks.android.mvp.BlocksRepository
 import dev.blocks.android.mvp.ParkingRecord
 import dev.blocks.android.mvp.Project
 import dev.blocks.android.mvp.Session
-import org.json.JSONArray
-import org.json.JSONObject
 
-class ServiceBlocksRepository(private val client: BlocksTransport) : BlocksRepository {
+class ServiceBlocksRepository(
+    private val client: BlocksTransport,
+    private val json: Gson = Gson(),
+) : BlocksRepository {
     private val parking = mutableMapOf<String, ParkingRecord>()
 
     override fun login(identityToken: String): Session {
-        val body = client.exchangeSession(identityToken).successBody()
-        val json = JSONObject(body)
+        val response = json.fromJson(client.exchangeSession(identityToken).successBody(), SessionOut::class.java)
         return Session(
-            tenantId = json.getString("personal_tenant_id"),
+            tenantId = response.personalTenantId.toString(),
             identityToken = identityToken,
         )
     }
 
     override fun projects(session: Session): List<Project> =
-        parseProjects(client.listProjects(session.identityToken, session.tenantId).successBody())
+        json.fromJson<List<ProjectOut>>(
+            client.listProjects(session.identityToken, session.tenantId).successBody(),
+            PROJECT_LIST_TYPE,
+        ).map(::toProject)
 
     override fun createProject(session: Session, name: String): Project {
-        val request = JSONObject().put("name", name).toString()
-        return parseProject(
-            JSONObject(client.createProject(session.identityToken, session.tenantId, request).successBody()),
+        val request = json.toJson(ProjectIn(name))
+        return toProject(
+            json.fromJson(
+                client.createProject(session.identityToken, session.tenantId, request).successBody(),
+                ProjectOut::class.java,
+            ),
         )
     }
 
@@ -35,19 +46,18 @@ class ServiceBlocksRepository(private val client: BlocksTransport) : BlocksRepos
         parking[projectId] = record
     }
 
-    private fun parseProjects(body: String): List<Project> {
-        val array = JSONArray(body)
-        return List(array.length()) { index -> parseProject(array.getJSONObject(index)) }
-    }
-
-    private fun parseProject(json: JSONObject) = Project(
-        id = json.getString("id"),
-        name = json.getString("name"),
+    private fun toProject(project: ProjectOut) = Project(
+        id = project.id.toString(),
+        name = project.name,
     )
 
     private fun ApiResponse.successBody(): String = when (this) {
         is ApiResponse.Success -> body
         is ApiResponse.Failure -> throw ServiceException(error.message)
+    }
+
+    private companion object {
+        val PROJECT_LIST_TYPE = object : TypeToken<List<ProjectOut>>() {}.type
     }
 }
 

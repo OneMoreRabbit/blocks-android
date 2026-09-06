@@ -9,11 +9,10 @@ sealed interface ApiResponse {
 }
 
 /**
- * Thin transport for blocks-service-api 0.1.
+ * Thin authenticated transport for blocks-service-api 0.2.
  *
  * Calls are synchronous and must be dispatched away from Android's main thread. Response bodies
- * remain raw until the generated OpenAPI models are added; this prevents guessed payload shapes
- * from becoming an accidental client contract.
+ * are decoded into generated OpenAPI models by [ServiceBlocksRepository].
  */
 interface BlocksTransport {
     fun exchangeSession(identityToken: String): ApiResponse

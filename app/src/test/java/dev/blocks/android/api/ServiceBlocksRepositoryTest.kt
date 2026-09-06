@@ -10,13 +10,13 @@ class ServiceBlocksRepositoryTest {
         val repository = ServiceBlocksRepository(transport)
 
         val session = repository.login("google-id-token")
-        assertEquals("personal-tenant", session.tenantId)
+        assertEquals("00000000-0000-0000-0000-000000000002", session.tenantId)
         assertEquals("google-id-token", session.identityToken)
 
         assertEquals(listOf("Existing"), repository.projects(session).map { it.name })
         assertEquals("Created", repository.createProject(session, "Created").name)
         assertEquals("google-id-token", transport.lastToken)
-        assertEquals("personal-tenant", transport.lastTenant)
+        assertEquals("00000000-0000-0000-0000-000000000002", transport.lastTenant)
         assertEquals("Created", transport.createdName)
     }
 
@@ -31,7 +31,7 @@ class ServiceBlocksRepositoryTest {
     private class FakeTransport(
         private val sessionResponse: ApiResponse = ApiResponse.Success(
             200,
-            """{"user_id":"user","email":"pilot@example.test","personal_tenant_id":"personal-tenant","tenants":[]}""",
+            """{"user_id":"00000000-0000-0000-0000-000000000001","email":"pilot@example.test","personal_tenant_id":"00000000-0000-0000-0000-000000000002","tenants":[]}""",
         ),
     ) : BlocksTransport {
         var lastToken: String? = null
@@ -46,7 +46,10 @@ class ServiceBlocksRepositoryTest {
         override fun listProjects(identityToken: String, tenantId: String): ApiResponse {
             lastToken = identityToken
             lastTenant = tenantId
-            return ApiResponse.Success(200, """[{"id":"project-1","tenant_id":"personal-tenant","name":"Existing"}]""")
+            return ApiResponse.Success(
+                200,
+                """[{"id":"00000000-0000-0000-0000-000000000003","tenant_id":"00000000-0000-0000-0000-000000000002","name":"Existing"}]""",
+            )
         }
 
         override fun createProject(identityToken: String, tenantId: String, body: String): ApiResponse {
@@ -55,7 +58,7 @@ class ServiceBlocksRepositoryTest {
             createdName = org.json.JSONObject(body).getString("name")
             return ApiResponse.Success(
                 200,
-                """{"id":"project-2","tenant_id":"personal-tenant","name":"$createdName"}""",
+                """{"id":"00000000-0000-0000-0000-000000000004","tenant_id":"00000000-0000-0000-0000-000000000002","name":"$createdName"}""",
             )
         }
     }
