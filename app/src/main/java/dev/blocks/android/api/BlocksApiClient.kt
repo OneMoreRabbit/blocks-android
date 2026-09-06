@@ -18,11 +18,33 @@ interface BlocksTransport {
     fun exchangeSession(identityToken: String): ApiResponse
     fun listProjects(identityToken: String, tenantId: String): ApiResponse
     fun createProject(identityToken: String, tenantId: String, body: String): ApiResponse
+    fun current(identityToken: String, tenantId: String): ApiResponse
+    fun pickup(identityToken: String, tenantId: String, body: String, idempotencyKey: String): ApiResponse
+    fun park(
+        identityToken: String,
+        tenantId: String,
+        sessionId: String,
+        rowVersion: Int,
+        body: String,
+        idempotencyKey: String,
+    ): ApiResponse
+    fun resume(identityToken: String, tenantId: String, sessionId: String, rowVersion: Int): ApiResponse
+    fun close(
+        identityToken: String,
+        tenantId: String,
+        sessionId: String,
+        rowVersion: Int,
+        body: String,
+        idempotencyKey: String,
+    ): ApiResponse
 }
 
-class BlocksApiClient(private val baseUri: URI) : BlocksTransport {
+class BlocksApiClient(
+    private val baseUri: URI,
+    private val clientVersion: String = "0.2",
+) : BlocksTransport {
     override fun exchangeSession(identityToken: String): ApiResponse =
-        request("POST", "/v1/session", identityToken, body = "{}")
+        request("POST", "/v1/session", identityToken)
 
     override fun listProjects(identityToken: String, tenantId: String): ApiResponse =
         request("GET", "/v1/tenants/${encodePathSegment(tenantId)}/projects", identityToken)
@@ -30,12 +52,78 @@ class BlocksApiClient(private val baseUri: URI) : BlocksTransport {
     override fun createProject(identityToken: String, tenantId: String, body: String): ApiResponse =
         request("POST", "/v1/tenants/${encodePathSegment(tenantId)}/projects", identityToken, body)
 
-    private fun request(method: String, path: String, token: String, body: String? = null): ApiResponse {
+    override fun current(identityToken: String, tenantId: String): ApiResponse =
+        request("GET", "/v1/tenants/${encodePathSegment(tenantId)}/sessions/current", identityToken)
+
+    override fun pickup(
+        identityToken: String,
+        tenantId: String,
+        body: String,
+        idempotencyKey: String,
+    ): ApiResponse = request(
+        "POST",
+        "/v1/tenants/${encodePathSegment(tenantId)}/sessions",
+        identityToken,
+        body,
+        mapOf("Idempotency-Key" to idempotencyKey),
+    )
+
+    override fun park(
+        identityToken: String,
+        tenantId: String,
+        sessionId: String,
+        rowVersion: Int,
+        body: String,
+        idempotencyKey: String,
+    ): ApiResponse = request(
+        "POST",
+        "/v1/tenants/${encodePathSegment(tenantId)}/sessions/${encodePathSegment(sessionId)}/park",
+        identityToken,
+        body,
+        mapOf("If-Match" to rowVersion.toString(), "Idempotency-Key" to idempotencyKey),
+    )
+
+    override fun resume(
+        identityToken: String,
+        tenantId: String,
+        sessionId: String,
+        rowVersion: Int,
+    ): ApiResponse = request(
+        "POST",
+        "/v1/tenants/${encodePathSegment(tenantId)}/sessions/${encodePathSegment(sessionId)}/resume",
+        identityToken,
+        headers = mapOf("If-Match" to rowVersion.toString()),
+    )
+
+    override fun close(
+        identityToken: String,
+        tenantId: String,
+        sessionId: String,
+        rowVersion: Int,
+        body: String,
+        idempotencyKey: String,
+    ): ApiResponse = request(
+        "POST",
+        "/v1/tenants/${encodePathSegment(tenantId)}/sessions/${encodePathSegment(sessionId)}/close",
+        identityToken,
+        body,
+        mapOf("If-Match" to rowVersion.toString(), "Idempotency-Key" to idempotencyKey),
+    )
+
+    private fun request(
+        method: String,
+        path: String,
+        token: String,
+        body: String? = null,
+        headers: Map<String, String> = emptyMap(),
+    ): ApiResponse {
         val connection = baseUri.resolve(path).toURL().openConnection() as HttpURLConnection
         return try {
             connection.requestMethod = method
             connection.setRequestProperty("Authorization", "Bearer $token")
             connection.setRequestProperty("Accept", "application/json")
+            connection.setRequestProperty("X-Blocks-Client-Version", clientVersion)
+            headers.forEach(connection::setRequestProperty)
             connection.connectTimeout = 10_000
             connection.readTimeout = 10_000
 

@@ -10,13 +10,18 @@ import android.view.View
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import dev.blocks.android.api.BlocksApiClient
 import dev.blocks.android.api.ServiceBlocksRepository
 import dev.blocks.android.auth.GoogleIdentityClient
 import dev.blocks.android.mvp.MvpController
 import dev.blocks.android.mvp.MvpScreen
+import dev.blocks.android.mvp.OutcomeTier
+import dev.blocks.android.mvp.ParkingAction
 import dev.blocks.android.mvp.ParkingDraft
+import dev.blocks.android.mvp.PickupDraft
+import dev.blocks.android.mvp.WorkSessionState
 import dev.blocks.android.state.AndroidEncryptedDraftStore
 import dev.blocks.android.state.SessionContinuityStore
 import java.net.URI
@@ -44,11 +49,11 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_VERTICAL
+            gravity = Gravity.TOP
             setPadding(dp(24), dp(24), dp(24), dp(24))
             setBackgroundColor(Color.rgb(246, 243, 234))
         }
-        setContentView(content)
+        setContentView(ScrollView(this).apply { addView(content) })
         render()
         if (continuity.shouldRestore) restoreSignIn()
     }
@@ -74,7 +79,9 @@ class MainActivity : Activity() {
     private fun renderProjects() {
         content.addView(label("Choose a project", 20f))
         controller.state.projects.forEach { project ->
-            content.addView(button(project.name) { controller.selectProject(project.id); render() })
+            content.addView(button(project.name) {
+                runRepositoryAction { controller.selectProject(project.id) }
+            })
         }
         val projectName = input("New project name", controller.state.drafts.projectName) {
             controller.updateProjectNameDraft(it)
@@ -89,10 +96,7 @@ class MainActivity : Activity() {
     private fun renderPickup() {
         val project = requireNotNull(controller.state.selectedProject)
         content.addView(label(project.name, 20f))
-        val parking = controller.state.parking
-        if (parking == null) {
-            content.addView(label("Nothing is parked yet. Choose the next useful action.", 16f))
-        } else {
+        controller.state.parking?.let { parking ->
             content.addView(label("Where I am", 12f, Color.GRAY))
             content.addView(label(parking.location, 17f))
             content.addView(label("Exact next physical action", 12f, Color.GRAY))
@@ -100,13 +104,89 @@ class MainActivity : Activity() {
             content.addView(label("Must not forget", 12f, Color.GRAY))
             content.addView(label(parking.mustNotForget, 17f))
         }
-        content.addView(button("Park this work") { controller.beginParking(); render() })
+
+        when (controller.state.workSession?.state) {
+            WorkSessionState.ACTIVE -> renderActiveSession()
+            WorkSessionState.PARKED -> renderParkedSession()
+            WorkSessionState.CLOSED -> {
+                content.addView(label("That session is closed; its continuation is ready for a fresh pickup.", 14f))
+                renderPickupForm(project.id)
+            }
+            WorkSessionState.UNKNOWN -> content.addView(
+                label("This session state needs a newer version of Blocks before it can be changed.", 14f),
+            )
+            WorkSessionState.CANCELLED, null -> renderPickupForm(project.id)
+        }
+
         content.addView(button("Choose another project") { controller.chooseAnotherProject(); render() })
         content.addView(button("Sign out") { signOut() })
     }
 
+    private fun renderPickupForm(projectId: String) {
+        val saved = controller.state.drafts.pickup.takeIf { it.projectId == projectId }
+            ?: PickupDraft(projectId = projectId)
+        var coreValue = saved.coreOutcome
+        var fullValue = saved.fullOutcome
+        var polishValue = saved.polishOutcome
+        fun persist() = controller.updatePickupDraft(
+            PickupDraft(projectId, coreValue, fullValue, polishValue),
+        )
+        val core = input("Core outcome", coreValue) { coreValue = it; persist() }
+        val full = input("Full outcome (optional)", fullValue) { fullValue = it; persist() }
+        val polish = input("Polish outcome (optional)", polishValue) { polishValue = it; persist() }
+        content.addView(core)
+        content.addView(full)
+        content.addView(polish)
+        content.addView(button("Pick up this project") {
+            runRepositoryAction {
+                controller.pickup(core.text.toString(), full.text.toString(), polish.text.toString())
+            }
+        })
+    }
+
+    private fun renderActiveSession() {
+        val workSession = requireNotNull(controller.state.workSession)
+        content.addView(label("Working toward: ${workSession.coreOutcome}", 16f))
+        content.addView(button("Park this work") {
+            controller.beginParking(ParkingAction.PARK)
+            render()
+        })
+        content.addView(button("Park and close") {
+            controller.beginParking(ParkingAction.PARK_AND_CLOSE)
+            render()
+        })
+        content.addView(button("Close — core reached") {
+            runRepositoryAction { controller.closeWithOutcome(OutcomeTier.CORE) }
+        })
+        workSession.fullOutcome?.let {
+            content.addView(button("Close — full reached") {
+                runRepositoryAction { controller.closeWithOutcome(OutcomeTier.FULL) }
+            })
+        }
+        workSession.polishOutcome?.let {
+            content.addView(button("Close — polish reached") {
+                runRepositoryAction { controller.closeWithOutcome(OutcomeTier.POLISH) }
+            })
+        }
+    }
+
+    private fun renderParkedSession() {
+        content.addView(button("Resume this work") {
+            runRepositoryAction { controller.resume() }
+        })
+        content.addView(button("Close and keep this continuation") {
+            runRepositoryAction { controller.closeOnExistingContinuation() }
+        })
+    }
+
     private fun renderParking() {
-        content.addView(label("Park at the boundary", 20f))
+        val action = controller.state.parkingAction
+        content.addView(
+            label(
+                if (action == ParkingAction.PARK) "Park at the boundary" else "Park and close at the boundary",
+                20f,
+            ),
+        )
         val draft = controller.state.drafts.parking
         var locationValue = draft.location
         var nextActionValue = draft.nextAction
@@ -123,9 +203,14 @@ class MainActivity : Activity() {
         content.addView(location)
         content.addView(nextAction)
         content.addView(mustNotForget)
-        content.addView(button("Save parking record") {
-            controller.park(location.text.toString(), nextAction.text.toString(), mustNotForget.text.toString())
-            render()
+        content.addView(button(if (action == ParkingAction.PARK) "Save parking record" else "Save and close") {
+            runRepositoryAction {
+                controller.park(
+                    location.text.toString(),
+                    nextAction.text.toString(),
+                    mustNotForget.text.toString(),
+                )
+            }
         })
     }
 

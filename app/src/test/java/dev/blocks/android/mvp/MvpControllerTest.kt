@@ -16,6 +16,9 @@ class MvpControllerTest {
         assertEquals("Atlas delivery", controller.state.selectedProject?.name)
         assertNull(controller.state.parking)
 
+        controller.pickup("Generate the API client", "Wire the online loop", "Polish the UI")
+        assertEquals(WorkSessionState.ACTIVE, controller.state.workSession?.state)
+
         controller.beginParking()
         controller.park(
             "API client boundary exists",
@@ -35,6 +38,7 @@ class MvpControllerTest {
         val controller = MvpController(InMemoryBlocksRepository())
         controller.login("token")
         controller.selectProject(controller.state.projects.single().id)
+        controller.pickup("Core", "", "")
         controller.beginParking()
         controller.park("Here", "Do the next thing", "")
         assertEquals(MvpScreen.PARKING, controller.state.screen)
@@ -55,6 +59,7 @@ class MvpControllerTest {
         val first = MvpController(InMemoryBlocksRepository(), drafts)
         first.login("token")
         first.selectProject(first.state.projects.single().id)
+        first.pickup("Core", "", "")
         first.beginParking()
         first.park("At the API", "Retry the request", "")
 
@@ -75,9 +80,139 @@ class MvpControllerTest {
         controller.createProject("New project")
         assertEquals("", controller.state.drafts.projectName)
 
+        controller.pickup("Core", "", "")
+        assertEquals(PickupDraft(), controller.state.drafts.pickup)
         controller.beginParking()
         controller.park("Here", "Next", "Remember")
         assertEquals(ParkingDraft(), controller.state.drafts.parking)
+    }
+
+    @Test
+    fun restoresNewestParkingFromAClosedSessionAtLogin() {
+        val repository = InMemoryBlocksRepository().apply {
+            setReentry(
+                Reentry(
+                    WorkSession(
+                        id = "closed-session",
+                        projectId = "first-project",
+                        state = WorkSessionState.CLOSED,
+                        coreOutcome = "Core",
+                        rowVersion = 2,
+                    ),
+                    ParkingRecord("At the boundary", "Start here", "Keep context"),
+                ),
+            )
+        }
+
+        val controller = MvpController(repository)
+        controller.login("token")
+
+        assertEquals(MvpScreen.PICKUP, controller.state.screen)
+        assertEquals(WorkSessionState.CLOSED, controller.state.workSession?.state)
+        assertEquals("Start here", controller.state.parking?.nextAction)
+    }
+
+    @Test
+    fun supportsResumeAndCloseOnAnExistingContinuation() {
+        val controller = MvpController(InMemoryBlocksRepository())
+        controller.login("token")
+        controller.selectProject("first-project")
+        controller.pickup("Core", "", "")
+        controller.beginParking()
+        controller.park("Here", "Continue", "Remember")
+
+        controller.resume()
+        assertEquals(WorkSessionState.ACTIVE, controller.state.workSession?.state)
+        controller.beginParking()
+        controller.park("Later", "Restart", "New detail")
+        controller.closeOnExistingContinuation()
+
+        assertEquals(WorkSessionState.CLOSED, controller.state.workSession?.state)
+        assertEquals("Restart", controller.state.parking?.nextAction)
+    }
+
+    @Test
+    fun atomicallyParksAndClosesWithExactlyOneContinuation() {
+        val controller = MvpController(InMemoryBlocksRepository())
+        controller.login("token")
+        controller.selectProject("first-project")
+        controller.pickup("Core", "", "")
+        controller.beginParking(ParkingAction.PARK_AND_CLOSE)
+        controller.park("Here", "Continue", "Remember")
+
+        assertEquals(WorkSessionState.CLOSED, controller.state.workSession?.state)
+        assertEquals("Here", controller.state.parking?.location)
+    }
+
+    @Test
+    fun closesWithAReachedOutcomeWithoutInventingAContinuation() {
+        val controller = MvpController(InMemoryBlocksRepository())
+        controller.login("token")
+        controller.selectProject("first-project")
+        controller.pickup("Core", "Full", "")
+
+        controller.closeWithOutcome(OutcomeTier.CORE)
+
+        assertNull(controller.state.workSession)
+        assertNull(controller.state.parking)
+        assertEquals(MvpScreen.PICKUP, controller.state.screen)
+    }
+
+    @Test
+    fun oneActiveSessionConflictShowsWinnerAndRetainsPickupIntent() {
+        val controller = MvpController(InMemoryBlocksRepository())
+        controller.login("token")
+        controller.selectProject("first-project")
+        controller.pickup("Existing work", "", "")
+        controller.chooseAnotherProject()
+        controller.createProject("Second project")
+        val requestedProjectId = requireNotNull(controller.state.selectedProject).id
+
+        controller.pickup("New work", "Full", "")
+
+        assertEquals("first-project", controller.state.selectedProject?.id)
+        assertEquals("New work", controller.state.drafts.pickup.coreOutcome)
+        assertEquals(requestedProjectId, controller.state.drafts.pickup.projectId)
+        assertEquals(WorkSessionState.ACTIVE, controller.state.workSession?.state)
+    }
+
+    @Test
+    fun unchangedFailedPickupReusesItsDurableIdempotencyKeyAndEditingRotatesIt() {
+        val repository = InMemoryBlocksRepository().apply {
+            pickupFailure = IllegalStateException("offline")
+        }
+        val keys = ArrayDeque(listOf("first-key", "second-key"))
+        val controller = MvpController(repository, RecordingDraftStore()) { keys.removeFirst() }
+        controller.login("token")
+        controller.selectProject("first-project")
+
+        runCatching { controller.pickup("Core", "Full", "") }
+        runCatching { controller.pickup("Core", "Full", "") }
+        controller.updatePickupDraft(controller.state.drafts.pickup.copy(coreOutcome = "Changed core"))
+        runCatching { controller.pickup("Changed core", "Full", "") }
+
+        assertEquals(listOf("first-key", "first-key", "second-key"), repository.pickupIdempotencyKeys)
+        assertEquals("second-key", controller.state.drafts.pickup.idempotencyKey)
+    }
+
+    @Test
+    fun unchangedFailedParkingReusesItsDurableIdempotencyKeyAndEditingRotatesIt() {
+        val repository = InMemoryBlocksRepository()
+        val keys = ArrayDeque(listOf("pickup-key", "parking-key", "changed-key"))
+        val controller = MvpController(repository, RecordingDraftStore()) { keys.removeFirst() }
+        controller.login("token")
+        controller.selectProject("first-project")
+        controller.pickup("Core", "", "")
+        controller.beginParking()
+        repository.parkingFailure = IllegalStateException("offline")
+
+        runCatching { controller.park("Here", "Next", "Remember") }
+        runCatching { controller.park("Here", "Next", "Remember") }
+        controller.updateParkingDraft(controller.state.drafts.parking.copy(nextAction = "Changed next"))
+        runCatching { controller.park("Here", "Changed next", "Remember") }
+
+        assertEquals(listOf("parking-key", "parking-key", "changed-key"), repository.parkingIdempotencyKeys)
+        assertEquals("changed-key", controller.state.drafts.parking.idempotencyKey)
     }
 
     @Test
