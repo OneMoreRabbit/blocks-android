@@ -15,6 +15,12 @@ import dev.blocks.android.mvp.QueuedCommand
 import dev.blocks.android.mvp.Reentry
 import dev.blocks.android.mvp.SyncStateStore
 import dev.blocks.android.mvp.TenantSyncState
+import dev.blocks.android.project.PhysicalBlock
+import dev.blocks.android.project.ProjectCacheState
+import dev.blocks.android.project.ProjectMutation
+import dev.blocks.android.project.ProjectMutationType
+import dev.blocks.android.project.ProjectPage
+import dev.blocks.android.project.ProjectSummary
 import java.io.File
 import java.security.KeyStore
 import java.security.MessageDigest
@@ -33,6 +39,16 @@ internal data class EncodedSyncRows(
     val reentry: String?,
     val commands: List<String>,
     val retiredIdempotencyKeys: List<String>,
+    val activeProjectsLoaded: Boolean = false,
+    val archivedProjectsLoaded: Boolean = false,
+    val blocksLoaded: Boolean = false,
+    val activeProjects: List<String> = emptyList(),
+    val archivedProjects: List<String> = emptyList(),
+    val projectPages: List<String> = emptyList(),
+    val stalePageIds: List<String> = emptyList(),
+    val blocks: List<String> = emptyList(),
+    val projectCommands: List<String> = emptyList(),
+    val retiredOperationIds: List<String> = emptyList(),
 )
 
 internal class SyncStateRowCodec(private val gson: Gson = Gson()) {
@@ -43,6 +59,7 @@ internal class SyncStateRowCodec(private val gson: Gson = Gson()) {
         require(state.commands.none { it.idempotencyKey in retiredKeys }) {
             "A queued idempotency key is already retired"
         }
+        validateProjectCache(state.projectCache)
         return EncodedSyncRows(
             schemaVersion = CURRENT_SCHEMA_VERSION,
             projectsLoaded = state.projectsLoaded,
@@ -53,11 +70,21 @@ internal class SyncStateRowCodec(private val gson: Gson = Gson()) {
             reentry = state.reentry?.let(gson::toJson),
             commands = state.commands.map(gson::toJson),
             retiredIdempotencyKeys = retiredKeys,
+            activeProjectsLoaded = state.projectCache.activeProjectsLoaded,
+            archivedProjectsLoaded = state.projectCache.archivedProjectsLoaded,
+            blocksLoaded = state.projectCache.blocksLoaded,
+            activeProjects = state.projectCache.activeProjects.map(gson::toJson),
+            archivedProjects = state.projectCache.archivedProjects.map(gson::toJson),
+            projectPages = state.projectCache.pages.map(gson::toJson),
+            stalePageIds = state.projectCache.stalePageIds.distinct(),
+            blocks = state.projectCache.blocks.map(gson::toJson),
+            projectCommands = state.projectCache.commands.map(gson::toJson),
+            retiredOperationIds = state.projectCache.retiredOperationIds.distinct(),
         )
     }
 
     fun decode(rows: EncodedSyncRows): TenantSyncState {
-        require(rows.schemaVersion == CURRENT_SCHEMA_VERSION) {
+        require(rows.schemaVersion in PILOT_SCHEMA_VERSION..CURRENT_SCHEMA_VERSION) {
             "Unsupported local sync row schema ${rows.schemaVersion}"
         }
         val projects = rows.projects.map { gson.fromJson(it, Project::class.java) }
@@ -68,6 +95,22 @@ internal class SyncStateRowCodec(private val gson: Gson = Gson()) {
         require(commands.none { it.idempotencyKey in retiredKeys }) {
             "A queued idempotency key is already retired"
         }
+        val projectCache = if (rows.schemaVersion == PILOT_SCHEMA_VERSION) {
+            ProjectCacheState()
+        } else {
+            ProjectCacheState(
+                activeProjects = rows.activeProjects.map { gson.fromJson(it, ProjectSummary::class.java) },
+                activeProjectsLoaded = rows.activeProjectsLoaded,
+                archivedProjects = rows.archivedProjects.map { gson.fromJson(it, ProjectSummary::class.java) },
+                archivedProjectsLoaded = rows.archivedProjectsLoaded,
+                pages = rows.projectPages.map { gson.fromJson(it, ProjectPage::class.java) },
+                stalePageIds = rows.stalePageIds.distinct(),
+                blocks = rows.blocks.map { gson.fromJson(it, PhysicalBlock::class.java) },
+                blocksLoaded = rows.blocksLoaded,
+                commands = rows.projectCommands.map { gson.fromJson(it, ProjectMutation::class.java) },
+                retiredOperationIds = rows.retiredOperationIds.distinct(),
+            ).also(::validateProjectCache)
+        }
         return TenantSyncState(
             projects = projects,
             projectsLoaded = rows.projectsLoaded,
@@ -77,11 +120,13 @@ internal class SyncStateRowCodec(private val gson: Gson = Gson()) {
             changeCursor = rows.changeCursor,
             retiredIdempotencyKeys = retiredKeys,
             notice = rows.notice,
+            projectCache = projectCache,
         )
     }
 
     companion object {
-        const val CURRENT_SCHEMA_VERSION = 1
+        const val PILOT_SCHEMA_VERSION = 1
+        const val CURRENT_SCHEMA_VERSION = 2
     }
 }
 
@@ -167,6 +212,82 @@ private fun validateProjects(projects: List<Project>) {
     }
 }
 
+private fun validateProjectCache(cache: ProjectCacheState) {
+    require(cache.activeProjects.map { it.id }.distinct().size == cache.activeProjects.size) {
+        "Cached active project identifiers are not unique"
+    }
+    require(cache.archivedProjects.map { it.id }.distinct().size == cache.archivedProjects.size) {
+        "Cached archived project identifiers are not unique"
+    }
+    require((cache.activeProjects.map { it.id }.toSet() intersect cache.archivedProjects.map { it.id }.toSet()).isEmpty()) {
+        "A cached project cannot be both active and archived"
+    }
+    require(cache.pages.map { it.project.id }.distinct().size == cache.pages.size) {
+        "Cached project page identifiers are not unique"
+    }
+    require(cache.stalePageIds.distinct().size == cache.stalePageIds.size) {
+        "Stale project page identifiers are not unique"
+    }
+    require(cache.blocks.map { it.id }.distinct().size == cache.blocks.size) {
+        "Cached block identifiers are not unique"
+    }
+    val retired = cache.retiredOperationIds.distinct()
+    require(cache.commands.none { it.operationId in retired }) {
+        "A queued project operation is already retired"
+    }
+    require(cache.commands.map { it.operationId }.distinct().size == cache.commands.size) {
+        "Queued project operation identifiers are not unique"
+    }
+    val retryKeys = cache.commands.mapNotNull { it.idempotencyKey }
+    require(retryKeys.distinct().size == retryKeys.size) {
+        "Queued project idempotency keys are not unique"
+    }
+    cache.commands.forEach(::validateProjectMutation)
+}
+
+private fun validateProjectMutation(command: ProjectMutation) {
+    require(command.operationId.isNotBlank()) { "Queued project operation identity is missing" }
+    require(command.targetId.isNotBlank()) { "Queued project operation target is missing" }
+    when (command.type) {
+        ProjectMutationType.CREATE_PROJECT -> {
+            require(!command.projectName.isNullOrBlank()) { "Queued project name is missing" }
+            require(command.idempotencyKey == command.operationId) {
+                "Queued project creation must retain its original retry identity"
+            }
+        }
+        ProjectMutationType.RENAME_PROJECT -> {
+            require(!command.projectName.isNullOrBlank()) { "Queued project rename is missing" }
+            requireNotNull(command.ifMatch) { "Queued project rename If-Match is missing" }
+        }
+        ProjectMutationType.ARCHIVE_PROJECT,
+        ProjectMutationType.REOPEN_PROJECT,
+        -> requireNotNull(command.ifMatch) { "Queued project lifecycle If-Match is missing" }
+        ProjectMutationType.SAVE_NOTES -> {
+            require(command.notesBody != null) { "Queued project notes body is missing" }
+            requireNotNull(command.ifMatch) { "Queued project notes If-Match is missing" }
+        }
+        ProjectMutationType.ADD_PARKING -> {
+            requireNotNull(command.parking) { "Queued project parking is missing" }
+            require(command.idempotencyKey == command.operationId) {
+                "Queued project parking must retain its original retry identity"
+            }
+        }
+        ProjectMutationType.REGISTER_BLOCK -> {
+            require(!command.blockLabel.isNullOrBlank()) { "Queued block label is missing" }
+            require(command.idempotencyKey == command.operationId) {
+                "Queued block registration must retain its original retry identity"
+            }
+        }
+        ProjectMutationType.BIND_BLOCK -> {
+            require(!command.projectId.isNullOrBlank()) { "Queued block project is missing" }
+            require(command.idempotencyKey == command.operationId) {
+                "Queued block binding must retain its original retry identity"
+            }
+        }
+        ProjectMutationType.UNBIND_BLOCK -> Unit
+    }
+}
+
 /**
  * One SQLite database per tenant. Every logical value is an independently authenticated
  * ciphertext; only table structure, row order, and non-secret metadata names remain visible.
@@ -186,31 +307,15 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
         }
         val helper = TenantDatabaseHelper(applicationContext, databaseName(tenantId))
         return try {
-            val database = helper.readableDatabase
+            val database = helper.writableDatabase
             database.beginTransaction()
             try {
-                val rows = EncodedSyncRows(
-                    schemaVersion = readMetadata(database, tenantId, secretKey, META_SCHEMA_VERSION).toInt(),
-                    projectsLoaded = readMetadata(
-                        database,
-                        tenantId,
-                        secretKey,
-                        META_PROJECTS_LOADED,
-                    ).toBooleanStrict(),
-                    reentryLoaded = readMetadata(
-                        database,
-                        tenantId,
-                        secretKey,
-                        META_REENTRY_LOADED,
-                    ).toBooleanStrict(),
-                    changeCursor = readOptionalMetadata(database, tenantId, secretKey, META_CHANGE_CURSOR),
-                    notice = readOptionalMetadata(database, tenantId, secretKey, META_NOTICE),
-                    projects = readRows(database, tenantId, secretKey, TABLE_PROJECTS),
-                    reentry = readRows(database, tenantId, secretKey, TABLE_REENTRY).singleOrNull(),
-                    commands = readRows(database, tenantId, secretKey, TABLE_COMMANDS),
-                    retiredIdempotencyKeys = readRows(database, tenantId, secretKey, TABLE_RETIRED_KEYS),
-                )
-                rowCodec.decode(rows).also { database.setTransactionSuccessful() }
+                val rows = readStateRows(database, tenantId, secretKey)
+                val state = rowCodec.decode(rows)
+                if (rows.schemaVersion < SyncStateRowCodec.CURRENT_SCHEMA_VERSION) {
+                    replaceStateRows(database, tenantId, secretKey, rowCodec.encode(state))
+                }
+                state.also { database.setTransactionSuccessful() }
             } finally {
                 database.endTransaction()
             }
@@ -238,18 +343,7 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
             val database = helper.writableDatabase
             database.beginTransaction()
             try {
-                clearTables(database)
-                writeMetadata(database, tenantId, secretKey, META_SCHEMA_VERSION, rows.schemaVersion.toString())
-                writeMetadata(database, tenantId, secretKey, META_PROJECTS_LOADED, rows.projectsLoaded.toString())
-                writeMetadata(database, tenantId, secretKey, META_REENTRY_LOADED, rows.reentryLoaded.toString())
-                rows.changeCursor?.let {
-                    writeMetadata(database, tenantId, secretKey, META_CHANGE_CURSOR, it)
-                }
-                rows.notice?.let { writeMetadata(database, tenantId, secretKey, META_NOTICE, it) }
-                writeRows(database, tenantId, secretKey, TABLE_PROJECTS, rows.projects)
-                writeRows(database, tenantId, secretKey, TABLE_REENTRY, listOfNotNull(rows.reentry))
-                writeRows(database, tenantId, secretKey, TABLE_COMMANDS, rows.commands)
-                writeRows(database, tenantId, secretKey, TABLE_RETIRED_KEYS, rows.retiredIdempotencyKeys)
+                replaceStateRows(database, tenantId, secretKey, rows)
                 database.setTransactionSuccessful()
             } finally {
                 database.endTransaction()
@@ -302,6 +396,90 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
         saveSyncState(tenantId, state)
         clearLegacyState(tenantId)
         return state
+    }
+
+    private fun readStateRows(
+        database: SQLiteDatabase,
+        tenantId: String,
+        secretKey: SecretKey,
+    ): EncodedSyncRows {
+        val schemaVersion = readMetadata(database, tenantId, secretKey, META_SCHEMA_VERSION).toInt()
+        return EncodedSyncRows(
+            schemaVersion = schemaVersion,
+            projectsLoaded = readMetadata(database, tenantId, secretKey, META_PROJECTS_LOADED).toBooleanStrict(),
+            reentryLoaded = readMetadata(database, tenantId, secretKey, META_REENTRY_LOADED).toBooleanStrict(),
+            changeCursor = readOptionalMetadata(database, tenantId, secretKey, META_CHANGE_CURSOR),
+            notice = readOptionalMetadata(database, tenantId, secretKey, META_NOTICE),
+            projects = readRows(database, tenantId, secretKey, TABLE_PROJECTS),
+            reentry = readRows(database, tenantId, secretKey, TABLE_REENTRY).singleOrNull(),
+            commands = readRows(database, tenantId, secretKey, TABLE_COMMANDS),
+            retiredIdempotencyKeys = readRows(database, tenantId, secretKey, TABLE_RETIRED_KEYS),
+            activeProjectsLoaded = readOptionalMetadata(
+                database,
+                tenantId,
+                secretKey,
+                META_ACTIVE_PROJECTS_LOADED,
+            )?.toBooleanStrict() ?: false,
+            archivedProjectsLoaded = readOptionalMetadata(
+                database,
+                tenantId,
+                secretKey,
+                META_ARCHIVED_PROJECTS_LOADED,
+            )?.toBooleanStrict() ?: false,
+            blocksLoaded = readOptionalMetadata(
+                database,
+                tenantId,
+                secretKey,
+                META_BLOCKS_LOADED,
+            )?.toBooleanStrict() ?: false,
+            activeProjects = readRows(database, tenantId, secretKey, TABLE_ACTIVE_PROJECTS),
+            archivedProjects = readRows(database, tenantId, secretKey, TABLE_ARCHIVED_PROJECTS),
+            projectPages = readRows(database, tenantId, secretKey, TABLE_PROJECT_PAGES),
+            stalePageIds = readRows(database, tenantId, secretKey, TABLE_STALE_PROJECT_PAGES),
+            blocks = readRows(database, tenantId, secretKey, TABLE_BLOCKS),
+            projectCommands = readRows(database, tenantId, secretKey, TABLE_PROJECT_COMMANDS),
+            retiredOperationIds = readRows(database, tenantId, secretKey, TABLE_RETIRED_OPERATIONS),
+        )
+    }
+
+    private fun replaceStateRows(
+        database: SQLiteDatabase,
+        tenantId: String,
+        secretKey: SecretKey,
+        rows: EncodedSyncRows,
+    ) {
+        clearTables(database)
+        writeMetadata(database, tenantId, secretKey, META_SCHEMA_VERSION, rows.schemaVersion.toString())
+        writeMetadata(database, tenantId, secretKey, META_PROJECTS_LOADED, rows.projectsLoaded.toString())
+        writeMetadata(database, tenantId, secretKey, META_REENTRY_LOADED, rows.reentryLoaded.toString())
+        writeMetadata(
+            database,
+            tenantId,
+            secretKey,
+            META_ACTIVE_PROJECTS_LOADED,
+            rows.activeProjectsLoaded.toString(),
+        )
+        writeMetadata(
+            database,
+            tenantId,
+            secretKey,
+            META_ARCHIVED_PROJECTS_LOADED,
+            rows.archivedProjectsLoaded.toString(),
+        )
+        writeMetadata(database, tenantId, secretKey, META_BLOCKS_LOADED, rows.blocksLoaded.toString())
+        rows.changeCursor?.let { writeMetadata(database, tenantId, secretKey, META_CHANGE_CURSOR, it) }
+        rows.notice?.let { writeMetadata(database, tenantId, secretKey, META_NOTICE, it) }
+        writeRows(database, tenantId, secretKey, TABLE_PROJECTS, rows.projects)
+        writeRows(database, tenantId, secretKey, TABLE_REENTRY, listOfNotNull(rows.reentry))
+        writeRows(database, tenantId, secretKey, TABLE_COMMANDS, rows.commands)
+        writeRows(database, tenantId, secretKey, TABLE_RETIRED_KEYS, rows.retiredIdempotencyKeys)
+        writeRows(database, tenantId, secretKey, TABLE_ACTIVE_PROJECTS, rows.activeProjects)
+        writeRows(database, tenantId, secretKey, TABLE_ARCHIVED_PROJECTS, rows.archivedProjects)
+        writeRows(database, tenantId, secretKey, TABLE_PROJECT_PAGES, rows.projectPages)
+        writeRows(database, tenantId, secretKey, TABLE_STALE_PROJECT_PAGES, rows.stalePageIds)
+        writeRows(database, tenantId, secretKey, TABLE_BLOCKS, rows.blocks)
+        writeRows(database, tenantId, secretKey, TABLE_PROJECT_COMMANDS, rows.projectCommands)
+        writeRows(database, tenantId, secretKey, TABLE_RETIRED_OPERATIONS, rows.retiredOperationIds)
     }
 
     private fun writeMetadata(
@@ -486,26 +664,31 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
                     "$COLUMN_NAME TEXT PRIMARY KEY NOT NULL, " +
                     "$COLUMN_CIPHERTEXT BLOB NOT NULL)",
             )
-            listOf(TABLE_PROJECTS, TABLE_REENTRY, TABLE_COMMANDS, TABLE_RETIRED_KEYS).forEach { table ->
-                database.execSQL(
-                    "CREATE TABLE $table (" +
-                        "$COLUMN_POSITION INTEGER PRIMARY KEY NOT NULL, " +
-                        "$COLUMN_CIPHERTEXT BLOB NOT NULL)",
-                )
-            }
+            POSITION_TABLES.forEach { table -> createPositionTable(database, table) }
         }
 
         override fun onUpgrade(database: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-            error("No sync database migration from $oldVersion to $newVersion")
+            require(oldVersion == 1 && newVersion == 2) {
+                "No sync database migration from $oldVersion to $newVersion"
+            }
+            PROJECT_MODEL_TABLES.forEach { table -> createPositionTable(database, table) }
         }
 
         override fun onDowngrade(database: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
             error("Sync database downgrade from $oldVersion to $newVersion is not supported")
         }
+
+        private fun createPositionTable(database: SQLiteDatabase, table: String) {
+            database.execSQL(
+                "CREATE TABLE $table (" +
+                    "$COLUMN_POSITION INTEGER PRIMARY KEY NOT NULL, " +
+                    "$COLUMN_CIPHERTEXT BLOB NOT NULL)",
+            )
+        }
     }
 
     private companion object {
-        const val DATABASE_VERSION = 1
+        const val DATABASE_VERSION = 2
         const val DATABASE_PREFIX = "blocks_sync_"
         const val DATABASE_KEY_PREFIX = "blocks-sync-db-v1-"
         const val LEGACY_PREFERENCES_PREFIX = "encrypted_sync_state_v1_"
@@ -517,6 +700,13 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
         const val TABLE_REENTRY = "latest_reentry"
         const val TABLE_COMMANDS = "pending_commands"
         const val TABLE_RETIRED_KEYS = "retired_keys"
+        const val TABLE_ACTIVE_PROJECTS = "active_projects_v3"
+        const val TABLE_ARCHIVED_PROJECTS = "archived_projects_v3"
+        const val TABLE_PROJECT_PAGES = "project_pages_v3"
+        const val TABLE_STALE_PROJECT_PAGES = "stale_project_pages_v3"
+        const val TABLE_BLOCKS = "blocks_v3"
+        const val TABLE_PROJECT_COMMANDS = "pending_project_commands_v3"
+        const val TABLE_RETIRED_OPERATIONS = "retired_project_operations_v3"
         const val COLUMN_NAME = "name"
         const val COLUMN_POSITION = "position"
         const val COLUMN_CIPHERTEXT = "ciphertext"
@@ -525,12 +715,26 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
         const val META_REENTRY_LOADED = "reentry_loaded"
         const val META_CHANGE_CURSOR = "change_cursor"
         const val META_NOTICE = "notice"
-        val TABLES = listOf(
-            TABLE_METADATA,
+        const val META_ACTIVE_PROJECTS_LOADED = "active_projects_loaded_v3"
+        const val META_ARCHIVED_PROJECTS_LOADED = "archived_projects_loaded_v3"
+        const val META_BLOCKS_LOADED = "blocks_loaded_v3"
+        val PROJECT_MODEL_TABLES = listOf(
+            TABLE_ACTIVE_PROJECTS,
+            TABLE_ARCHIVED_PROJECTS,
+            TABLE_PROJECT_PAGES,
+            TABLE_STALE_PROJECT_PAGES,
+            TABLE_BLOCKS,
+            TABLE_PROJECT_COMMANDS,
+            TABLE_RETIRED_OPERATIONS,
+        )
+        val POSITION_TABLES = listOf(
             TABLE_PROJECTS,
             TABLE_REENTRY,
             TABLE_COMMANDS,
             TABLE_RETIRED_KEYS,
-        )
+        ) + PROJECT_MODEL_TABLES
+        val TABLES = listOf(
+            TABLE_METADATA,
+        ) + POSITION_TABLES
     }
 }

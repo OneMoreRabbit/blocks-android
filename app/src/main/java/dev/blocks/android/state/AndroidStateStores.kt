@@ -48,9 +48,8 @@ class AndroidEncryptedDraftStore(context: Context) : DraftStore {
                 updateAAD(tenantId.toByteArray(Charsets.UTF_8))
             }
             decode(String(cipher.doFinal(ciphertext), Charsets.UTF_8))
-        }.getOrElse {
-            clear(tenantId)
-            FormDrafts()
+        }.getOrElse { error ->
+            throw IllegalStateException("Could not read encrypted tenant draft state", error)
         }
     }
 
@@ -133,7 +132,14 @@ class AndroidEncryptedDraftStore(context: Context) : DraftStore {
                     .put("idempotency_key", mutation.idempotencyKey),
             )
         }
+        val projectNotes = JSONObject()
+        drafts.projectNotes.forEach(projectNotes::put)
+        val projectParking = JSONObject()
+        drafts.projectParking.forEach { (projectId, parking) ->
+            projectParking.put(projectId, parking.toJson())
+        }
         return JSONObject()
+            .put("schema_version", CURRENT_SCHEMA_VERSION)
             .put("project_name", drafts.projectName)
             .put("pickups", pickups)
             .put(
@@ -143,12 +149,18 @@ class AndroidEncryptedDraftStore(context: Context) : DraftStore {
                     .put("next_action", drafts.parking.nextAction)
                     .put("must_not_forget", drafts.parking.mustNotForget),
             )
+            .put("project_notes", projectNotes)
+            .put("project_parking", projectParking)
             .put("pending_mutations", mutations)
             .toString()
     }
 
     private fun decode(value: String): FormDrafts {
         val json = JSONObject(value)
+        val schemaVersion = json.optInt("schema_version", PILOT_SCHEMA_VERSION)
+        require(schemaVersion in PILOT_SCHEMA_VERSION..CURRENT_SCHEMA_VERSION) {
+            "Unsupported encrypted draft schema $schemaVersion"
+        }
         val pickupsJson = json.optJSONObject("pickups") ?: JSONObject()
         val pickups = buildMap {
             val keys = pickupsJson.keys()
@@ -183,6 +195,22 @@ class AndroidEncryptedDraftStore(context: Context) : DraftStore {
                 )
             }
         }
+        val projectNotesJson = json.optJSONObject("project_notes") ?: JSONObject()
+        val projectNotes = buildMap {
+            val keys = projectNotesJson.keys()
+            while (keys.hasNext()) {
+                val projectId = keys.next()
+                put(projectId, projectNotesJson.getString(projectId))
+            }
+        }
+        val projectParkingJson = json.optJSONObject("project_parking") ?: JSONObject()
+        val projectParking = buildMap {
+            val keys = projectParkingJson.keys()
+            while (keys.hasNext()) {
+                val projectId = keys.next()
+                put(projectId, projectParkingJson.getJSONObject(projectId).toParkingDraft())
+            }
+        }
         val parking = json.optJSONObject("parking") ?: JSONObject()
         return FormDrafts(
             projectName = json.optString("project_name"),
@@ -192,9 +220,22 @@ class AndroidEncryptedDraftStore(context: Context) : DraftStore {
                 nextAction = parking.optString("next_action"),
                 mustNotForget = parking.optString("must_not_forget"),
             ),
+            projectNotes = projectNotes,
+            projectParking = projectParking,
             pendingMutations = mutations,
         )
     }
+
+    private fun ParkingDraft.toJson() = JSONObject()
+        .put("location", location)
+        .put("next_action", nextAction)
+        .put("must_not_forget", mustNotForget)
+
+    private fun JSONObject.toParkingDraft() = ParkingDraft(
+        location = optString("location"),
+        nextAction = optString("next_action"),
+        mustNotForget = optString("must_not_forget"),
+    )
 
     private companion object {
         const val LEGACY_PREFERENCES = "encrypted_form_drafts"
@@ -202,5 +243,7 @@ class AndroidEncryptedDraftStore(context: Context) : DraftStore {
         const val KEY_ALIAS_PREFIX = "blocks-form-drafts-v2-"
         const val CIPHERTEXT = "drafts"
         const val TRANSFORMATION = "AES/GCM/NoPadding"
+        const val PILOT_SCHEMA_VERSION = 2
+        const val CURRENT_SCHEMA_VERSION = 3
     }
 }

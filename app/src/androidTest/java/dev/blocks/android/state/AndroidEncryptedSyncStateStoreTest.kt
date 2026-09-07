@@ -1,6 +1,8 @@
 package dev.blocks.android.state
 
+import android.content.ContentValues
 import android.content.Context
+import android.database.sqlite.SQLiteDatabase
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
@@ -12,6 +14,11 @@ import dev.blocks.android.mvp.PickupRequest
 import dev.blocks.android.mvp.Project
 import dev.blocks.android.mvp.QueuedCommand
 import dev.blocks.android.mvp.TenantSyncState
+import dev.blocks.android.project.ProjectCacheState
+import dev.blocks.android.project.ProjectLifecycle
+import dev.blocks.android.project.ProjectMutation
+import dev.blocks.android.project.ProjectMutationType
+import dev.blocks.android.project.ProjectSummary
 import java.security.KeyStore
 import java.security.MessageDigest
 import javax.crypto.Cipher
@@ -35,7 +42,7 @@ class AndroidEncryptedSyncStateStoreTest {
     @Before
     @After
     fun clearTestTenants() {
-        listOf(TENANT_A, TENANT_B, LEGACY_TENANT).forEach { tenantId ->
+        listOf(TENANT_A, TENANT_B, LEGACY_TENANT, PILOT_DATABASE_TENANT).forEach { tenantId ->
             store.clearSyncState(tenantId)
         }
     }
@@ -131,11 +138,160 @@ class AndroidEncryptedSyncStateStoreTest {
         assertEquals(migrated, store.loadSyncState(LEGACY_TENANT))
     }
 
-    private fun createLegacyKey(tenantId: String) =
+    @Test
+    fun upgradesTheSignedPilotDatabaseWithoutRotatingAnUnresolvedOperationIdentity() {
+        val key = createKey(databaseKeyAlias(PILOT_DATABASE_TENANT))
+        val unresolved = QueuedCommand(
+            operation = OfflineOperation.PICKUP,
+            targetId = "pilot-project",
+            projectId = "pilot-project",
+            idempotencyKey = "pilot-original-operation-key",
+            pickup = PickupRequest("pilot-project", "Pilot outcome"),
+            afterCursor = "28",
+            deliveryUncertain = true,
+        )
+        createSignedPilotDatabase(
+            tenantId = PILOT_DATABASE_TENANT,
+            key = key,
+            projects = listOf(Project("pilot-project", "Pilot project")),
+            commands = listOf(unresolved),
+            cursor = "29",
+        )
+
+        val migrated = store.loadSyncState(PILOT_DATABASE_TENANT)
+
+        assertEquals(1, migrated.commands.size)
+        assertEquals("pilot-original-operation-key", migrated.commands.single().idempotencyKey)
+        assertEquals("28", migrated.commands.single().afterCursor)
+        assertTrue(migrated.commands.single().deliveryUncertain)
+        assertEquals("29", migrated.changeCursor)
+        assertEquals(listOf(Project("pilot-project", "Pilot project")), migrated.projects)
+        assertEquals(ProjectCacheState(), migrated.projectCache)
+        assertEquals(2, databaseVersion(PILOT_DATABASE_TENANT))
+        assertFalse(databaseFile(PILOT_DATABASE_TENANT).readBytes().containsBytes("Pilot outcome".toByteArray()))
+
+        val api03Command = ProjectMutation(
+            operationId = "api-03-original-operation-key",
+            type = ProjectMutationType.CREATE_PROJECT,
+            targetId = "new-project",
+            idempotencyKey = "api-03-original-operation-key",
+            projectName = "New project",
+        )
+        val api03Project = ProjectSummary(
+            id = "new-project",
+            tenantId = PILOT_DATABASE_TENANT,
+            name = "New project",
+            lifecycle = ProjectLifecycle.ACTIVE,
+            rowVersion = 1,
+            createdAt = "2026-09-07T12:00:00Z",
+            updatedAt = "2026-09-07T12:00:00Z",
+        )
+        val evolved = migrated.copy(
+            projectCache = ProjectCacheState(
+                activeProjects = listOf(api03Project),
+                activeProjectsLoaded = true,
+                commands = listOf(api03Command),
+            ),
+        )
+
+        store.saveSyncState(PILOT_DATABASE_TENANT, evolved)
+
+        val restarted = store.loadSyncState(PILOT_DATABASE_TENANT)
+        assertEquals("pilot-original-operation-key", restarted.commands.single().idempotencyKey)
+        assertEquals("api-03-original-operation-key", restarted.projectCache.commands.single().operationId)
+        assertEquals(listOf(api03Project), restarted.projectCache.activeProjects)
+    }
+
+    private fun createSignedPilotDatabase(
+        tenantId: String,
+        key: javax.crypto.SecretKey,
+        projects: List<Project>,
+        commands: List<QueuedCommand>,
+        cursor: String,
+    ) {
+        val database = context.openOrCreateDatabase(databaseName(tenantId), Context.MODE_PRIVATE, null)
+        try {
+            database.execSQL(
+                "CREATE TABLE sync_metadata (" +
+                    "name TEXT PRIMARY KEY NOT NULL, ciphertext BLOB NOT NULL)",
+            )
+            listOf("cached_projects", "latest_reentry", "pending_commands", "retired_keys").forEach { table ->
+                database.execSQL(
+                    "CREATE TABLE $table (" +
+                        "position INTEGER PRIMARY KEY NOT NULL, ciphertext BLOB NOT NULL)",
+                )
+            }
+            database.version = 1
+            writePilotMetadata(database, tenantId, key, "schema_version", "1")
+            writePilotMetadata(database, tenantId, key, "projects_loaded", "true")
+            writePilotMetadata(database, tenantId, key, "reentry_loaded", "false")
+            writePilotMetadata(database, tenantId, key, "change_cursor", cursor)
+            projects.forEachIndexed { position, project ->
+                writePilotRow(database, tenantId, key, "cached_projects", position, Gson().toJson(project))
+            }
+            commands.forEachIndexed { position, command ->
+                writePilotRow(database, tenantId, key, "pending_commands", position, Gson().toJson(command))
+            }
+        } finally {
+            database.close()
+        }
+    }
+
+    private fun writePilotMetadata(
+        database: SQLiteDatabase,
+        tenantId: String,
+        key: javax.crypto.SecretKey,
+        name: String,
+        value: String,
+    ) {
+        val row = ContentValues().apply {
+            put("name", name)
+            put("ciphertext", encryptDatabaseRow(key, tenantId, "sync_metadata", name, value))
+        }
+        database.insertOrThrow("sync_metadata", null, row)
+    }
+
+    private fun writePilotRow(
+        database: SQLiteDatabase,
+        tenantId: String,
+        key: javax.crypto.SecretKey,
+        table: String,
+        position: Int,
+        value: String,
+    ) {
+        val row = ContentValues().apply {
+            put("position", position)
+            put("ciphertext", encryptDatabaseRow(key, tenantId, table, position.toString(), value))
+        }
+        database.insertOrThrow(table, null, row)
+    }
+
+    private fun encryptDatabaseRow(
+        key: javax.crypto.SecretKey,
+        tenantId: String,
+        table: String,
+        identity: String,
+        value: String,
+    ): ByteArray {
+        val cipher = Cipher.getInstance(TRANSFORMATION).apply {
+            init(Cipher.ENCRYPT_MODE, key)
+            updateAAD("blocks-sync-db:$tenantId:$table:$identity".toByteArray())
+        }
+        return byteArrayOf(cipher.iv.size.toByte()) + cipher.iv + cipher.doFinal(value.toByteArray())
+    }
+
+    private fun databaseVersion(tenantId: String): Int =
+        SQLiteDatabase.openDatabase(databaseFile(tenantId).path, null, SQLiteDatabase.OPEN_READONLY).use { database ->
+            database.version
+        }
+
+    private fun createLegacyKey(tenantId: String) = createKey(legacyKeyAlias(tenantId))
+
+    private fun createKey(alias: String) =
         KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore").run {
             init(
                 KeyGenParameterSpec.Builder(
-                    legacyKeyAlias(tenantId),
+                    alias,
                     KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
                 ).setBlockModes(KeyProperties.BLOCK_MODE_GCM)
                     .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
@@ -174,6 +330,7 @@ class AndroidEncryptedSyncStateStoreTest {
         const val TENANT_A = "00000000-0000-0000-0000-00000000000a"
         const val TENANT_B = "00000000-0000-0000-0000-00000000000b"
         const val LEGACY_TENANT = "00000000-0000-0000-0000-00000000000c"
+        const val PILOT_DATABASE_TENANT = "00000000-0000-0000-0000-00000000000d"
         const val TRANSFORMATION = "AES/GCM/NoPadding"
     }
 }
