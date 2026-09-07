@@ -17,6 +17,8 @@ import javax.crypto.KeyGenerator
 import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -32,7 +34,7 @@ class AndroidEncryptedDraftStoreTest {
     @Before
     @After
     fun clearFixture() {
-        store.clear(TENANT_ID)
+        listOf(TENANT_ID, OTHER_TENANT_ID).forEach(store::clear)
     }
 
     @Test
@@ -122,21 +124,43 @@ class AndroidEncryptedDraftStoreTest {
         assertTrue(keyStore().containsAlias(keyAlias()))
     }
 
-    private fun preferences() = context.getSharedPreferences(
-        "encrypted_form_drafts_v2_${tenantDigest()}",
+    @Test
+    fun clearsOnlyTheRequestedTenantDraftCiphertextAndKeystoreKey() {
+        val tenantADrafts = FormDrafts(projectName = "Tenant A draft")
+        val tenantBDrafts = FormDrafts(projectName = "Tenant B draft")
+        store.save(TENANT_ID, tenantADrafts)
+        store.save(OTHER_TENANT_ID, tenantBDrafts)
+        assertTrue(keyStore().containsAlias(keyAlias(TENANT_ID)))
+        assertTrue(keyStore().containsAlias(keyAlias(OTHER_TENANT_ID)))
+        assertTrue(preferences(TENANT_ID).contains("drafts"))
+        assertTrue(preferences(OTHER_TENANT_ID).contains("drafts"))
+
+        store.clear(TENANT_ID)
+
+        assertNull(preferences(TENANT_ID).getString("drafts", null))
+        assertFalse(keyStore().containsAlias(keyAlias(TENANT_ID)))
+        assertEquals(FormDrafts(), store.load(TENANT_ID))
+        assertEquals(tenantBDrafts, store.load(OTHER_TENANT_ID))
+        assertTrue(preferences(OTHER_TENANT_ID).contains("drafts"))
+        assertTrue(keyStore().containsAlias(keyAlias(OTHER_TENANT_ID)))
+    }
+
+    private fun preferences(tenantId: String = TENANT_ID) = context.getSharedPreferences(
+        "encrypted_form_drafts_v2_${tenantDigest(tenantId)}",
         Context.MODE_PRIVATE,
     )
 
-    private fun keyAlias() = "blocks-form-drafts-v2-${tenantDigest()}"
+    private fun keyAlias(tenantId: String = TENANT_ID) = "blocks-form-drafts-v2-${tenantDigest(tenantId)}"
 
-    private fun tenantDigest(): String = MessageDigest.getInstance("SHA-256")
-        .digest(TENANT_ID.toByteArray())
+    private fun tenantDigest(tenantId: String): String = MessageDigest.getInstance("SHA-256")
+        .digest(tenantId.toByteArray())
         .joinToString(separator = "") { "%02x".format(it.toInt() and 0xff) }
 
     private fun keyStore() = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
 
     private companion object {
         const val TENANT_ID = "00000000-0000-0000-0000-00000000000e"
+        const val OTHER_TENANT_ID = "00000000-0000-0000-0000-00000000000f"
         const val TRANSFORMATION = "AES/GCM/NoPadding"
     }
 }

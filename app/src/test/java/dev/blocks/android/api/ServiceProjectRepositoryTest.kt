@@ -3,8 +3,10 @@ package dev.blocks.android.api
 import dev.blocks.android.mvp.ParkingDraft
 import dev.blocks.android.mvp.Session
 import dev.blocks.android.project.ProjectLifecycle
+import dev.blocks.android.sync.ProjectSyncRepository
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -55,7 +57,6 @@ class ServiceProjectRepositoryTest {
                 idempotencyKey = "park-key",
             ).mustNotForget,
         )
-        assertEquals("tag-token", repository.registerBlock(SESSION, "Desk", "block-key").tagToken)
         assertEquals(PROJECT_ID, repository.bindBlock(SESSION, BLOCK_ID, PROJECT_ID, "bind-key").projectId)
         repository.unbindBlock(SESSION, BLOCK_ID)
 
@@ -71,6 +72,25 @@ class ServiceProjectRepositoryTest {
             JSONObject(transport.parkingBody).keys().asSequence().toSet(),
         )
         assertTrue(transport.unbound)
+    }
+
+    @Test
+    fun directRegistrationReturnsTheOneTimeTokenAndHasNoGenericQueueSurface() {
+        val transport = FakeProjectTransport()
+        val repository = ServiceProjectRepository(transport)
+
+        val registered = repository.registerBlock(SESSION, "Desk", "block-key")
+
+        assertEquals("tag-token", registered.tagToken)
+        assertEquals(BLOCK_ID, registered.block.id)
+        assertEquals("block-key", transport.registrationKey)
+        assertEquals("Desk", JSONObject(transport.registrationBody).getString("label"))
+        assertEquals(1, transport.registrationCalls)
+        assertFalse(
+            ProjectSyncRepository::class.java.methods.any { method ->
+                method.name == "queueRegisterBlock"
+            },
+        )
     }
 
     @Test(expected = IllegalStateException::class)
@@ -89,6 +109,9 @@ class ServiceProjectRepositoryTest {
         var notesBody: String = ""
         var parkingKey: String? = null
         var parkingBody: String = ""
+        var registrationKey: String? = null
+        var registrationBody: String = ""
+        var registrationCalls = 0
         var unbound = false
 
         override fun listProjects(identityToken: String, tenantId: String, status: String): ApiResponse {
@@ -167,9 +190,14 @@ class ServiceProjectRepositoryTest {
             tenantId: String,
             body: String,
             idempotencyKey: String,
-        ) = success(
-            """{"id":"$BLOCK_ID","label":"Desk","state":"registered","tag_token":"tag-token","bound_project_id":null}""",
-        )
+        ): ApiResponse {
+            registrationCalls += 1
+            registrationKey = idempotencyKey
+            registrationBody = body
+            return success(
+                """{"id":"$BLOCK_ID","label":"Desk","state":"registered","tag_token":"tag-token","bound_project_id":null}""",
+            )
+        }
 
         override fun bindBlock(
             identityToken: String,

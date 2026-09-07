@@ -272,12 +272,6 @@ private fun validateProjectMutation(command: ProjectMutation) {
                 "Queued project parking must retain its original retry identity"
             }
         }
-        ProjectMutationType.REGISTER_BLOCK -> {
-            require(!command.blockLabel.isNullOrBlank()) { "Queued block label is missing" }
-            require(command.idempotencyKey == command.operationId) {
-                "Queued block registration must retain its original retry identity"
-            }
-        }
         ProjectMutationType.BIND_BLOCK -> {
             require(!command.projectId.isNullOrBlank()) { "Queued block project is missing" }
             require(command.idempotencyKey == command.operationId) {

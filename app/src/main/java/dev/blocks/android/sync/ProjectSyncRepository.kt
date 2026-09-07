@@ -22,7 +22,6 @@ import dev.blocks.android.project.ProjectPage
 import dev.blocks.android.project.ProjectParking
 import dev.blocks.android.project.ProjectService
 import dev.blocks.android.project.ProjectSummary
-import dev.blocks.android.project.RegisteredBlock
 import dev.blocks.android.project.newOperationIdentity
 import java.io.IOException
 import java.math.BigInteger
@@ -232,21 +231,8 @@ class ProjectSyncRepository(
         )
     }
 
-    fun queueRegisterBlock(
-        session: Session,
-        label: String,
-        operationId: String = newOperationIdentity(),
-    ) = enqueue(
-        session,
-        ProjectMutation(
-            operationId = operationId,
-            type = ProjectMutationType.REGISTER_BLOCK,
-            targetId = operationId,
-            idempotencyKey = operationId,
-            blockLabel = label,
-        ),
-    )
-
+    // Block registration is intentionally absent: its one-time tag token requires a
+    // dedicated NFC write/ack state machine and is unsafe in this generic result queue.
     fun queueBindBlock(
         session: Session,
         blockId: String,
@@ -383,9 +369,6 @@ class ProjectSyncRepository(
                 requireNotNull(command.idempotencyKey),
             ),
         )
-        ProjectMutationType.REGISTER_BLOCK -> ProjectOutcome.Block(
-            service.registerBlock(session, requireNotNull(command.blockLabel), requireNotNull(command.idempotencyKey)),
-        )
         ProjectMutationType.BIND_BLOCK -> ProjectOutcome.Binding(
             service.bindBlock(
                 session,
@@ -495,7 +478,7 @@ class ProjectSyncRepository(
         command: ProjectMutation,
     ): TenantSyncState {
         val projectId = command.projectId ?: command.targetId
-        if (command.type == ProjectMutationType.CREATE_PROJECT || command.type == ProjectMutationType.REGISTER_BLOCK) {
+        if (command.type == ProjectMutationType.CREATE_PROJECT) {
             return state
         }
         return runCatching { state.withPage(service.projectPage(session, projectId)) }.getOrDefault(state)
@@ -507,11 +490,6 @@ class ProjectSyncRepository(
         is ProjectOutcome.Parking -> state.updatePage(outcome.value.projectId) {
             it.copy(newestParking = outcome.value)
         }
-        is ProjectOutcome.Block -> state.copy(
-            projectCache = state.projectCache.copy(
-                blocks = state.projectCache.blocks.upsert(outcome.value.block) { it.id },
-            ),
-        )
         is ProjectOutcome.Binding -> state.copy(
             projectCache = state.projectCache.copy(
                 blocks = state.projectCache.blocks.map {
@@ -671,7 +649,6 @@ class ProjectSyncRepository(
         data class Project(val value: ProjectSummary) : ProjectOutcome
         data class Notes(val value: ProjectNotes) : ProjectOutcome
         data class Parking(val value: ProjectParking) : ProjectOutcome
-        data class Block(val value: RegisteredBlock) : ProjectOutcome
         data class Binding(val value: BlockBinding) : ProjectOutcome
         data class Unbound(val blockId: String) : ProjectOutcome
     }

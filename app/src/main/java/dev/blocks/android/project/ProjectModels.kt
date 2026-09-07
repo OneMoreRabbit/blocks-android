@@ -53,6 +53,7 @@ data class PhysicalBlock(
     val boundProjectId: String? = null,
 )
 
+/** Direct registration result. [tagToken] is returned once and must never be logged. */
 data class RegisteredBlock(
     val block: PhysicalBlock,
     val tagToken: String,
@@ -77,7 +78,6 @@ enum class ProjectMutationType {
     REOPEN_PROJECT,
     SAVE_NOTES,
     ADD_PARKING,
-    REGISTER_BLOCK,
     BIND_BLOCK,
     UNBIND_BLOCK,
 }
@@ -96,7 +96,6 @@ data class ProjectMutation(
     val notesBody: String? = null,
     val parking: ParkingDraft? = null,
     val supersedesId: String? = null,
-    val blockLabel: String? = null,
     val status: ProjectMutationStatus = ProjectMutationStatus.PENDING,
     val deliveryUncertain: Boolean = false,
     val failureMessage: String? = null,
@@ -141,6 +140,10 @@ interface ProjectService {
     ): ProjectParking
     fun parking(session: Session, projectId: String): List<ProjectParking>
     fun blocks(session: Session): List<PhysicalBlock>
+    /**
+     * Direct-only foundation adapter. A later NFC state machine must custody [RegisteredBlock.tagToken]
+     * before acknowledging registration; the generic background queue deliberately cannot call this.
+     */
     fun registerBlock(session: Session, label: String, idempotencyKey: String): RegisteredBlock
     fun bindBlock(session: Session, blockId: String, projectId: String, idempotencyKey: String): BlockBinding
     fun unbindBlock(session: Session, blockId: String)

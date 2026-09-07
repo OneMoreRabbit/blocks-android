@@ -72,12 +72,21 @@ class AndroidEncryptedDraftStore(context: Context) : DraftStore {
     }
 
     override fun clear(tenantId: String) {
-        check(preferences(tenantId).edit().clear().commit()) { "Could not clear encrypted draft state" }
+        val failures = mutableListOf<Throwable>()
+        runCatching {
+            check(preferences(tenantId).edit().clear().commit()) {
+                "Could not clear encrypted draft state"
+            }
+        }.exceptionOrNull()?.let(failures::add)
         runCatching {
             KeyStore.getInstance("AndroidKeyStore").apply {
                 load(null)
                 if (containsAlias(keyAlias(tenantId))) deleteEntry(keyAlias(tenantId))
             }
+        }.exceptionOrNull()?.let(failures::add)
+        failures.firstOrNull()?.let { failure ->
+            failures.drop(1).forEach(failure::addSuppressed)
+            throw IllegalStateException("Could not clear encrypted tenant draft state", failure)
         }
     }
 
