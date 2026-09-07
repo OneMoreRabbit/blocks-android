@@ -14,14 +14,14 @@ import org.junit.Test
 import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
-class AndroidEncryptedIdentityBindingStoreTest {
+class AndroidEncryptedAcceptedTenantContinuityStoreTest {
     private val context: Context
         get() = InstrumentationRegistry.getInstrumentation().targetContext
-    private lateinit var store: AndroidEncryptedIdentityBindingStore
+    private lateinit var store: AndroidEncryptedAcceptedTenantContinuityStore
 
     @Before
     fun setUp() {
-        store = AndroidEncryptedIdentityBindingStore(context)
+        store = AndroidEncryptedAcceptedTenantContinuityStore(context)
         store.clear()
     }
 
@@ -31,30 +31,29 @@ class AndroidEncryptedIdentityBindingStoreTest {
     }
 
     @Test
-    fun bindingIsEncryptedAndSurvivesAStoreRestartWithoutPersistingTheCredential() {
-        val binding = AcceptedIdentityBinding("tenant-sensitive", "stable-fingerprint")
+    fun serviceAcceptedTenantIsEncryptedAndSurvivesRestartWithoutPersistingACredential() {
+        val continuity = AcceptedTenantContinuity("tenant-sensitive")
 
-        store.save(binding)
+        store.save(continuity)
 
-        assertEquals(binding, AndroidEncryptedIdentityBindingStore(context).load())
+        assertEquals(continuity, AndroidEncryptedAcceptedTenantContinuityStore(context).load())
         val persisted = context.getSharedPreferences(
-            AndroidEncryptedIdentityBindingStore.PREFERENCES,
+            AndroidEncryptedAcceptedTenantContinuityStore.PREFERENCES,
             Context.MODE_PRIVATE,
         ).all.values.joinToString()
-        assertFalse(persisted.contains(binding.tenantId))
-        assertFalse(persisted.contains(binding.identityFingerprint))
+        assertFalse(persisted.contains(continuity.tenantId))
         assertFalse(persisted.contains("identity-token"))
-        assertTrue(keyStore().containsAlias(AndroidEncryptedIdentityBindingStore.KEY_ALIAS))
+        assertTrue(keyStore().containsAlias(AndroidEncryptedAcceptedTenantContinuityStore.KEY_ALIAS))
     }
 
     @Test
     fun clearDeletesBothCiphertextAndItsCredentialStoreKey() {
-        store.save(AcceptedIdentityBinding("tenant", "fingerprint"))
+        store.save(AcceptedTenantContinuity("tenant"))
 
         store.clear()
 
         assertNull(store.load())
-        assertFalse(keyStore().containsAlias(AndroidEncryptedIdentityBindingStore.KEY_ALIAS))
+        assertFalse(keyStore().containsAlias(AndroidEncryptedAcceptedTenantContinuityStore.KEY_ALIAS))
     }
 
     private fun keyStore() = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }

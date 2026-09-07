@@ -14,11 +14,10 @@ import androidx.test.platform.app.InstrumentationRegistry
 import dev.blocks.android.api.ApiError
 import dev.blocks.android.api.ApiErrorCode
 import dev.blocks.android.api.ServiceException
-import dev.blocks.android.auth.AcceptedIdentityBinding
-import dev.blocks.android.auth.AndroidEncryptedIdentityBindingStore
-import dev.blocks.android.auth.IdentityBindingStore
+import dev.blocks.android.auth.AcceptedTenantContinuity
+import dev.blocks.android.auth.AcceptedTenantContinuityStore
+import dev.blocks.android.auth.AndroidEncryptedAcceptedTenantContinuityStore
 import dev.blocks.android.auth.IdentityProvider
-import dev.blocks.android.auth.IdentityProofVerifier
 import dev.blocks.android.mvp.ChangePage
 import dev.blocks.android.mvp.ParkingDraft
 import dev.blocks.android.mvp.Session
@@ -62,7 +61,7 @@ class MainActivityPresentationTest {
     private lateinit var workspace: FakeWorkspace
     private lateinit var identity: FakeIdentity
     private lateinit var continuity: MemoryContinuity
-    private lateinit var identityBinding: MemoryIdentityBindingStore
+    private lateinit var acceptedTenant: MemoryAcceptedTenantContinuityStore
     private lateinit var presentationController: ProjectPresentationController
     @Volatile
     private var sessionExchangeOffline = false
@@ -75,8 +74,8 @@ class MainActivityPresentationTest {
         workspace = FakeWorkspace()
         identity = FakeIdentity()
         continuity = MemoryContinuity(true)
-        identityBinding = MemoryIdentityBindingStore(
-            AcceptedIdentityBinding(TENANT_ID, fingerprint(identity.restoredToken)),
+        acceptedTenant = MemoryAcceptedTenantContinuityStore(
+            AcceptedTenantContinuity(TENANT_ID),
         )
         sessionExchangeOffline = false
         authenticatedTenant = TENANT_ID
@@ -95,8 +94,7 @@ class MainActivityPresentationTest {
                 controller = presentationController,
                 identity = identity,
                 continuity = continuity,
-                identityProofVerifier = IdentityProofVerifier(::fingerprint),
-                identityBindingStore = identityBinding,
+                acceptedTenantStore = acceptedTenant,
                 observeConnectivity = false,
             )
         }
@@ -107,7 +105,7 @@ class MainActivityPresentationTest {
         MainActivity.dependencyFactory = null
         AndroidEncryptedDraftStore(context).clear(TENANT_ID)
         AndroidEncryptedSyncStateStore(context).clearSyncState(TENANT_ID)
-        AndroidEncryptedIdentityBindingStore(context).clear()
+        AndroidEncryptedAcceptedTenantContinuityStore(context).clear()
     }
 
     @Test
@@ -155,7 +153,7 @@ class MainActivityPresentationTest {
     }
 
     @Test
-    fun coldOfflineRestartShowsIdentityBoundEncryptedCacheBeforeSessionExchange() {
+    fun coldOfflineRestartShowsOsSandboxContinuityBeforeSessionExchange() {
         sessionExchangeOffline = true
 
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
@@ -177,7 +175,7 @@ class MainActivityPresentationTest {
     }
 
     @Test
-    fun processStyleOfflineRestartReadsRealEncryptedDatabaseAndKeystoreBindingThenReconciles() {
+    fun processStyleOfflineRestartReadsRealEncryptedDatabaseAndKeystoreContinuityThenReconciles() {
         val syncStore = AndroidEncryptedSyncStateStore(context)
         syncStore.clearSyncState(TENANT_ID)
         syncStore.saveSyncState(
@@ -192,9 +190,9 @@ class MainActivityPresentationTest {
                 ),
             ),
         )
-        val realBinding = AndroidEncryptedIdentityBindingStore(context)
-        realBinding.clear()
-        realBinding.save(AcceptedIdentityBinding(TENANT_ID, fingerprint(identity.restoredToken)))
+        val realContinuity = AndroidEncryptedAcceptedTenantContinuityStore(context)
+        realContinuity.clear()
+        realContinuity.save(AcceptedTenantContinuity(TENANT_ID))
         val service = CacheProjectService()
         val exchangeOnline = java.util.concurrent.atomic.AtomicBoolean(false)
         val exchanges = AtomicInteger()
@@ -213,8 +211,7 @@ class MainActivityPresentationTest {
                 ),
                 identity = identity,
                 continuity = continuity,
-                identityProofVerifier = IdentityProofVerifier(::fingerprint),
-                identityBindingStore = AndroidEncryptedIdentityBindingStore(activity),
+                acceptedTenantStore = AndroidEncryptedAcceptedTenantContinuityStore(activity),
                 observeConnectivity = false,
             )
         }
@@ -240,19 +237,34 @@ class MainActivityPresentationTest {
     }
 
     @Test
-    fun restoredIdentityMismatchErasesBoundTenantAndFailsClosed() {
-        identity.restoredToken = "different-google-subject"
+    fun serviceConfirmedTenantMismatchErasesAcceptedTenantAndFailsClosed() {
+        authenticatedTenant = OTHER_TENANT_ID
 
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_LOGIN }
             waitUntil { workspace.cache.activeProjects.isEmpty() }
 
             assertFalse(continuity.shouldRestore)
-            assertTrue(identityBinding.load() == null)
+            assertTrue(acceptedTenant.load() == null)
             scenario.onActivity { activity ->
                 assertFalse(activity.hasButton("Active project"))
                 assertTrue(activity.texts().any { it.contains("does not match") })
             }
+        }
+    }
+
+    @Test
+    fun unverifiedTokenClaimsCannotSelectAnotherTenantCache() {
+        identity.restoredToken = "header.eyJ0ZW5hbnRfaWQiOiJvdGhlci10ZW5hbnQifQ.signature"
+        sessionExchangeOffline = true
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+
+            scenario.onActivity { activity -> assertTrue(activity.hasButton("Active project")) }
+            assertEquals(AcceptedTenantContinuity(TENANT_ID), acceptedTenant.load())
+            assertEquals(listOf(TENANT_ID), workspace.activatedTenants.distinct())
+            assertTrue(continuity.shouldRestore)
         }
     }
 
@@ -462,15 +474,15 @@ class MainActivityPresentationTest {
 
     private data class MemoryContinuity(override var shouldRestore: Boolean) : SessionContinuity
 
-    private class MemoryIdentityBindingStore(
-        private var binding: AcceptedIdentityBinding?,
-    ) : IdentityBindingStore {
-        override fun load() = binding
-        override fun save(binding: AcceptedIdentityBinding) {
-            this.binding = binding
+    private class MemoryAcceptedTenantContinuityStore(
+        private var continuity: AcceptedTenantContinuity?,
+    ) : AcceptedTenantContinuityStore {
+        override fun load() = continuity
+        override fun save(continuity: AcceptedTenantContinuity) {
+            this.continuity = continuity
         }
         override fun clear() {
-            binding = null
+            continuity = null
         }
     }
 
@@ -492,9 +504,12 @@ class MainActivityPresentationTest {
         var syncCalls = 0
         @Volatile
         var pageCalls = 0
+        val activatedTenants = mutableListOf<String>()
         val mutations = mutableListOf<String>()
 
-        override fun activate(session: Session) = Unit
+        override fun activate(session: Session) {
+            activatedTenants += session.tenantId
+        }
         override fun snapshot(session: Session) = result()
         override fun archivedProjects(session: Session) = cache.archivedProjects
         override fun projectPage(session: Session, projectId: String): ProjectPage {
@@ -687,6 +702,7 @@ class MainActivityPresentationTest {
     companion object {
         private val operationIds = AtomicInteger()
         private const val TENANT_ID = "00000000-0000-0000-0000-000000000011"
+        private const val OTHER_TENANT_ID = "00000000-0000-0000-0000-000000000099"
         private const val PROJECT_ID = "00000000-0000-0000-0000-000000000012"
         private const val NOW = "2026-09-07T10:00:00Z"
         private fun project() = ProjectSummary(
@@ -699,10 +715,5 @@ class MainActivityPresentationTest {
             NOW,
         )
         private fun page() = ProjectPage(project(), ProjectNotes(PROJECT_ID, "Server notes", 2, NOW), null)
-        private fun fingerprint(token: String) = if (token == "different-google-subject") {
-            "fingerprint:different-google-subject"
-        } else {
-            "fingerprint:accepted-google-subject"
-        }
     }
 }

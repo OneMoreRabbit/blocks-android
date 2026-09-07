@@ -1,7 +1,7 @@
 package dev.blocks.android.project
 
 import dev.blocks.android.api.ServiceException
-import dev.blocks.android.auth.IdentityBindingMismatchException
+import dev.blocks.android.auth.AcceptedTenantMismatchException
 import dev.blocks.android.mvp.DraftStore
 import dev.blocks.android.mvp.FormDrafts
 import dev.blocks.android.mvp.MembershipRevokedException
@@ -77,7 +77,7 @@ class ProjectPresentationController(
         return authenticated
     }
 
-    /** Opens only the cache already bound to the restored Google identity. */
+    /** Opens the Service-accepted tenant cache within the already-unlocked app sandbox. */
     @Synchronized
     fun restoreCached(tenantId: String) {
         require(tenantId.isNotBlank())
@@ -96,7 +96,7 @@ class ProjectPresentationController(
         )
     }
 
-    /** Exchanges a fresh Google credential without exposing a different tenant's cache. */
+    /** Lets the Service validate a fresh Google credential and confirm the accepted tenant. */
     @Synchronized
     fun confirmSession(identityToken: String): Session {
         require(identityToken.isNotBlank()) { "Google did not return an identity credential." }
@@ -106,7 +106,7 @@ class ProjectPresentationController(
             session = null
             state = ProjectPresentationState()
             workspace.clearLocalState(previous)
-            throw IdentityBindingMismatchException()
+            throw AcceptedTenantMismatchException()
         }
         session = authenticated
         state = state.copy(
@@ -118,7 +118,7 @@ class ProjectPresentationController(
     }
 
     @Synchronized
-    fun rejectCachedBinding(tenantId: String) {
+    fun eraseAcceptedTenantCache(tenantId: String) {
         val cached = session?.takeIf { it.tenantId == tenantId } ?: Session(tenantId)
         session = null
         state = ProjectPresentationState()

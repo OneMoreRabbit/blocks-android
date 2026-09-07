@@ -765,13 +765,9 @@ class ProjectSyncRepository(
             ProjectMutationType.SAVE_NOTES -> page?.let {
                 it.notes.rowVersion > requireNotNull(ifMatch) && it.notes.body == notesBody
             } == true
-            ProjectMutationType.ADD_PARKING -> page?.newestParking?.let {
-                deliveryUncertain &&
-                    it.location == parking?.location &&
-                    it.nextAction == parking.nextAction &&
-                    it.mustNotForget == parking.mustNotForget &&
-                    it.supersedesId == supersedesId
-            } == true
+            // Appends cannot be proven from content: two intentional records may be identical.
+            // Retry the persisted idempotency key until the Service returns its canonical result.
+            ProjectMutationType.ADD_PARKING -> false
             ProjectMutationType.BIND_BLOCK -> cache.blocks.any {
                 it.id == targetId && it.boundProjectId == projectId
             }

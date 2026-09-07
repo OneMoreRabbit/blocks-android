@@ -22,14 +22,12 @@ import dev.blocks.android.api.ProjectApiClient
 import dev.blocks.android.api.ServiceBlocksRepository
 import dev.blocks.android.api.ServiceProjectRepository
 import dev.blocks.android.api.ServiceSessionAuthenticator
-import dev.blocks.android.auth.AcceptedIdentityBinding
-import dev.blocks.android.auth.AndroidEncryptedIdentityBindingStore
+import dev.blocks.android.auth.AcceptedTenantContinuity
+import dev.blocks.android.auth.AcceptedTenantContinuityStore
+import dev.blocks.android.auth.AcceptedTenantMismatchException
+import dev.blocks.android.auth.AndroidEncryptedAcceptedTenantContinuityStore
 import dev.blocks.android.auth.GoogleIdentityClient
-import dev.blocks.android.auth.GoogleIdentityProofVerifier
-import dev.blocks.android.auth.IdentityBindingMismatchException
-import dev.blocks.android.auth.IdentityBindingStore
 import dev.blocks.android.auth.IdentityProvider
-import dev.blocks.android.auth.IdentityProofVerifier
 import dev.blocks.android.mvp.ParkingDraft
 import dev.blocks.android.project.ProjectFormField
 import dev.blocks.android.project.ProjectMutationType
@@ -56,8 +54,7 @@ internal data class ProjectAppDependencies(
     val controller: ProjectPresentationController,
     val identity: IdentityProvider,
     val continuity: SessionContinuity,
-    val identityProofVerifier: IdentityProofVerifier,
-    val identityBindingStore: IdentityBindingStore,
+    val acceptedTenantStore: AcceptedTenantContinuityStore,
     val observeConnectivity: Boolean = true,
 )
 
@@ -87,8 +84,7 @@ class MainActivity : ComponentActivity() {
     private val controller get() = dependencies.controller
     private val identity get() = dependencies.identity
     private val continuity get() = dependencies.continuity
-    private val identityProofVerifier get() = dependencies.identityProofVerifier
-    private val identityBindingStore get() = dependencies.identityBindingStore
+    private val acceptedTenantStore get() = dependencies.acceptedTenantStore
     private val uiScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private lateinit var content: LinearLayout
     private var syncJob: Job? = null
@@ -167,8 +163,7 @@ class MainActivity : ComponentActivity() {
             controller = ProjectPresentationController(sessionAuthenticator, workspace, draftStore),
             identity = GoogleIdentityClient(BuildConfig.BLOCKS_GOOGLE_SERVER_CLIENT_ID),
             continuity = SessionContinuityStore(this),
-            identityProofVerifier = GoogleIdentityProofVerifier(BuildConfig.BLOCKS_GOOGLE_SERVER_CLIENT_ID),
-            identityBindingStore = AndroidEncryptedIdentityBindingStore(this),
+            acceptedTenantStore = AndroidEncryptedAcceptedTenantContinuityStore(this),
         )
     }
 
@@ -488,29 +483,29 @@ class MainActivity : ComponentActivity() {
     private fun restoreSignIn() {
         uiScope.launch {
             try {
-                val token = identity.restore(this@MainActivity)
-                val fingerprint = identityProofVerifier.fingerprint(token)
-                val binding = withContext(Dispatchers.IO) { identityBindingStore.load() }
-                if (binding == null) {
-                    authenticate(token, fingerprint)
-                } else if (binding.identityFingerprint != fingerprint) {
-                    rejectRestoredIdentity(binding)
+                val acceptedTenant = withContext(Dispatchers.IO) { acceptedTenantStore.load() }
+                if (acceptedTenant == null) {
+                    authenticate(identity.restore(this@MainActivity))
                 } else {
                     withContext(Dispatchers.IO) {
-                        controller.restoreCached(binding.tenantId)
+                        controller.restoreCached(acceptedTenant.tenantId)
                         restoreProjectId?.let { projectId ->
                             controller.openProject(projectId)
                             restoreProjectId = null
                         }
                     }
                     render()
-                    reconcileRestoredIdentity(token, binding)
+                    reconcileAcceptedTenant(acceptedTenant)
                 }
             } catch (_: CancellationException) {
                 return@launch
-            } catch (_: Exception) {
-                continuity.shouldRestore = false
-                controller.reportError("Please sign in again to continue.")
+            } catch (error: Exception) {
+                if (controller.isAuthenticated) {
+                    handleRepositoryError(error)
+                } else {
+                    continuity.shouldRestore = false
+                    controller.reportError("Please sign in again to continue.")
+                }
                 render()
             }
         }
@@ -530,35 +525,27 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private suspend fun authenticate(
-        token: String,
-        verifiedFingerprint: String = identityProofVerifier.fingerprint(token),
-    ) {
-        val priorBinding = withContext(Dispatchers.IO) { identityBindingStore.load() }
+    private suspend fun authenticate(token: String) {
+        val acceptedTenant = withContext(Dispatchers.IO) { acceptedTenantStore.load() }
         val session = try {
             withContext(Dispatchers.IO) {
                 when {
-                    priorBinding == null -> controller.login(token)
-                    priorBinding.identityFingerprint != verifiedFingerprint -> {
-                        controller.rejectCachedBinding(priorBinding.tenantId)
-                        identityBindingStore.clear()
-                        controller.login(token)
-                    }
                     controller.isAuthenticated -> controller.confirmSession(token)
-                    else -> {
-                        controller.restoreCached(priorBinding.tenantId)
+                    acceptedTenant != null -> {
+                        controller.restoreCached(acceptedTenant.tenantId)
                         controller.confirmSession(token)
                     }
+                    else -> controller.login(token)
                 }
             }
-        } catch (error: IdentityBindingMismatchException) {
-            withContext(Dispatchers.IO) { identityBindingStore.clear() }
+        } catch (error: AcceptedTenantMismatchException) {
+            withContext(Dispatchers.IO) { acceptedTenantStore.clear() }
             continuity.shouldRestore = false
             throw error
         }
         try {
             withContext(Dispatchers.IO) {
-                identityBindingStore.save(AcceptedIdentityBinding(session.tenantId, verifiedFingerprint))
+                acceptedTenantStore.save(AcceptedTenantContinuity(session.tenantId))
             }
         } catch (error: Exception) {
             runCatching { withContext(Dispatchers.IO) { controller.logout() } }
@@ -576,14 +563,15 @@ class MainActivity : ComponentActivity() {
         synchronizeAutomatically()
     }
 
-    private suspend fun reconcileRestoredIdentity(token: String, binding: AcceptedIdentityBinding) {
+    private suspend fun reconcileAcceptedTenant(acceptedTenant: AcceptedTenantContinuity) {
         try {
+            val token = identity.restore(this@MainActivity)
             withContext(Dispatchers.IO) {
                 controller.confirmSession(token)
                 controller.synchronize()
             }
-        } catch (_: IdentityBindingMismatchException) {
-            rejectRestoredIdentity(binding)
+        } catch (_: AcceptedTenantMismatchException) {
+            rejectAcceptedTenant(acceptedTenant)
             return
         } catch (error: Exception) {
             handleRepositoryError(error)
@@ -591,12 +579,12 @@ class MainActivity : ComponentActivity() {
         render()
     }
 
-    private suspend fun rejectRestoredIdentity(binding: AcceptedIdentityBinding) {
+    private suspend fun rejectAcceptedTenant(acceptedTenant: AcceptedTenantContinuity) {
         continuity.shouldRestore = false
         val erased = runCatching {
             withContext(Dispatchers.IO) {
-                controller.rejectCachedBinding(binding.tenantId)
-                identityBindingStore.clear()
+                controller.eraseAcceptedTenantCache(acceptedTenant.tenantId)
+                acceptedTenantStore.clear()
             }
         }
         controller.reportError(
@@ -620,10 +608,10 @@ class MainActivity : ComponentActivity() {
             val cleared = runCatching {
                 withContext(Dispatchers.IO) {
                     val localFailure = runCatching { controller.logout() }.exceptionOrNull()
-                    val bindingFailure = runCatching { identityBindingStore.clear() }.exceptionOrNull()
-                    (localFailure ?: bindingFailure)?.let { failure ->
-                        if (localFailure != null && bindingFailure != null) {
-                            failure.addSuppressed(bindingFailure)
+                    val continuityFailure = runCatching { acceptedTenantStore.clear() }.exceptionOrNull()
+                    (localFailure ?: continuityFailure)?.let { failure ->
+                        if (localFailure != null && continuityFailure != null) {
+                            failure.addSuppressed(continuityFailure)
                         }
                         throw failure
                     }
@@ -700,16 +688,16 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleRepositoryError(error: Exception) {
-        if (error is IdentityBindingMismatchException) {
+        if (error is AcceptedTenantMismatchException) {
             continuity.shouldRestore = false
-            runCatching { identityBindingStore.clear() }
+            runCatching { acceptedTenantStore.clear() }
             controller.reportError("The restored Google account no longer matches this Blocks account. Sign in again.")
             return
         }
         val revoked = controller.reportRepositoryError(error)
         if (revoked) {
             continuity.shouldRestore = false
-            runCatching { identityBindingStore.clear() }
+            runCatching { acceptedTenantStore.clear() }
         }
     }
 

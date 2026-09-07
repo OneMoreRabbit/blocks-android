@@ -45,10 +45,25 @@ import org.junit.Test
 
 class ProjectSyncRepositoryTest {
     @Test
-    fun api03ParkingReplaysAfterRestartWithItsOriginalIdentityAndCreatesNoLegacyCommand() {
+    fun failedBeforeDeliveryWithIdenticalNewestParkingRetriesOriginalIdentityAndAppendsOnce() {
         val drafts = MemoryDrafts()
         val state = MemoryState()
-        state.saveSyncState(TENANT_A, loadedState())
+        val initial = loadedState()
+        state.saveSyncState(
+            TENANT_A,
+            initial.copy(
+                projectCache = initial.projectCache.copy(
+                    pages = listOf(
+                        page().copy(
+                            newestParking = projectParking(
+                                id = "existing-identical-parking",
+                                draft = ParkingDraft("Here", "Next", "Remember"),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
         val service = FakeProjectService().apply { offline = true }
         val first = repository(service, drafts, state)
         first.activate(SESSION_A)
@@ -72,6 +87,8 @@ class ProjectSyncRepositoryTest {
         val final = recreated.backgroundSync(SESSION_A)
 
         assertEquals(listOf("project-park-key", "project-park-key"), service.parkingKeys)
+        assertEquals(1, service.parkingAppendCount)
+        assertEquals("parking-1", final.cache.pages.single().newestParking?.id)
         assertEquals(0, final.pendingProjectOperations)
         assertTrue("project-park-key" in final.cache.retiredOperationIds)
         assertTrue(drafts.load(TENANT_A).projectParking.isEmpty())
@@ -88,6 +105,38 @@ class ProjectSyncRepositoryTest {
             }.exceptionOrNull() is IllegalArgumentException,
         )
         assertEquals(sendsBeforeReuse, service.parkingKeys.size)
+    }
+
+    @Test
+    fun responseLostAfterParkingSuccessRetriesSameIdentityAndDoesNotAppendTwice() {
+        val drafts = MemoryDrafts()
+        val state = MemoryState()
+        state.saveSyncState(TENANT_A, loadedState())
+        val service = FakeProjectService().apply { parkingResponseLostAfterSuccess = true }
+        val first = repository(service, drafts, state)
+        first.activate(SESSION_A)
+
+        val ambiguous = first.queueParking(
+            SESSION_A,
+            PROJECT_ID,
+            ParkingDraft("Here", "Next", "Remember"),
+            operationId = "lost-parking-response-key",
+        )
+
+        assertEquals(1, ambiguous.pendingProjectOperations)
+        assertTrue(ambiguous.cache.commands.single().deliveryUncertain)
+        assertEquals(1, service.parkingAppendCount)
+        assertEquals(listOf("lost-parking-response-key"), service.parkingKeys)
+
+        val restarted = repository(service, drafts, state)
+        restarted.activate(SESSION_A)
+        val replayed = restarted.backgroundSync(SESSION_A)
+
+        assertEquals(listOf("lost-parking-response-key", "lost-parking-response-key"), service.parkingKeys)
+        assertEquals(1, service.parkingAppendCount)
+        assertEquals("parking-1", replayed.cache.pages.single().newestParking?.id)
+        assertTrue(replayed.cache.commands.isEmpty())
+        assertTrue("lost-parking-response-key" in replayed.cache.retiredOperationIds)
     }
 
     @Test
@@ -509,10 +558,15 @@ class ProjectSyncRepositoryTest {
         var projectConflict = false
         var conflictPageUnavailable = false
         var notesAmbiguousAfterSuccess = false
+        var parkingResponseLostAfterSuccess = false
         var membershipRevoked = false
         var authenticationRequired = false
         var notesFailureAfterSuccessfulSaves: Int? = null
         val parkingKeys = mutableListOf<String>()
+        var parkingAppendCount = 0
+            private set
+        private val parkingOutcomes = mutableMapOf<String, ProjectParking>()
+        private val lostParkingResponses = mutableSetOf<String>()
         val savedNotesBodies = mutableListOf<String>()
         val savedNotesVersions = mutableListOf<Int>()
         val renamedNames = mutableListOf<String>()
@@ -578,16 +632,14 @@ class ProjectSyncRepositoryTest {
         ): ProjectParking {
             parkingKeys += idempotencyKey
             failIfNeeded()
-            return ProjectParking(
-                id = "parking-id",
-                projectId = projectId,
-                location = parking.location,
-                nextAction = parking.nextAction,
-                mustNotForget = parking.mustNotForget,
-                authoredByUserId = "user-id",
-                createdAt = NOW,
-                supersedesId = supersedesId,
-            )
+            val outcome = parkingOutcomes.getOrPut(idempotencyKey) {
+                parkingAppendCount += 1
+                projectParking(id = "parking-$parkingAppendCount", draft = parking, supersedesId = supersedesId)
+            }
+            if (parkingResponseLostAfterSuccess && lostParkingResponses.add(idempotencyKey)) {
+                throw IOException("response lost after parking acceptance")
+            }
+            return outcome
         }
 
         override fun parking(session: Session, projectId: String) = listOfNotNull(page(session.tenantId).newestParking)
@@ -678,6 +730,21 @@ class ProjectSyncRepositoryTest {
             project = project(tenantId = tenantId),
             notes = ProjectNotes(PROJECT_ID, "Server notes", 4, NOW),
             newestParking = null,
+        )
+
+        private fun projectParking(
+            id: String,
+            draft: ParkingDraft,
+            supersedesId: String? = null,
+        ) = ProjectParking(
+            id = id,
+            projectId = PROJECT_ID,
+            location = draft.location,
+            nextAction = draft.nextAction,
+            mustNotForget = draft.mustNotForget,
+            authoredByUserId = "user-id",
+            createdAt = NOW,
+            supersedesId = supersedesId,
         )
 
         private fun event(id: String, type: String, payload: Map<String, Any?>) =

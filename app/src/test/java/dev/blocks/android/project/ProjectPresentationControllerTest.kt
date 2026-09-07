@@ -3,7 +3,7 @@ package dev.blocks.android.project
 import dev.blocks.android.api.ApiError
 import dev.blocks.android.api.ApiErrorCode
 import dev.blocks.android.api.ServiceException
-import dev.blocks.android.auth.IdentityBindingMismatchException
+import dev.blocks.android.auth.AcceptedTenantMismatchException
 import dev.blocks.android.mvp.DraftStore
 import dev.blocks.android.mvp.FormDrafts
 import dev.blocks.android.mvp.ParkingDraft
@@ -29,7 +29,7 @@ class ProjectPresentationControllerTest {
     }
 
     @Test
-    fun identityBoundRestoreOpensCachedDashboardWithoutCallingOnlineAuthenticator() {
+    fun acceptedTenantContinuityOpensCachedDashboardWithoutCallingOnlineAuthenticator() {
         val drafts = MemoryDrafts()
         val workspace = FakeWorkspace().apply { draftStore = drafts }
         val controller = ProjectPresentationController(
@@ -59,7 +59,7 @@ class ProjectPresentationControllerTest {
 
         val error = runCatching { controller.confirmSession("fresh-google-token") }.exceptionOrNull()
 
-        assertTrue(error is IdentityBindingMismatchException)
+        assertTrue(error is AcceptedTenantMismatchException)
         assertEquals(listOf(TENANT_ID), workspace.clearedTenants)
         assertFalse(controller.isAuthenticated)
         assertEquals(ProjectScreen.LOGIN, controller.state.screen)
