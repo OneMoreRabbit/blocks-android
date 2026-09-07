@@ -111,12 +111,14 @@ class AndroidEncryptedDraftStoreTest {
         )
         assertTrue(migrated.projectNotes.isEmpty())
         assertTrue(migrated.projectParking.isEmpty())
+        assertTrue(migrated.projectRenames.isEmpty())
 
         val evolved = migrated.copy(
             projectNotes = mapOf("pilot-project" to "API 0.3 notes"),
             projectParking = mapOf(
                 "pilot-project" to ParkingDraft("Desk", "Review", "Adapter"),
             ),
+            projectRenames = mapOf("pilot-project" to "Renamed project"),
         )
         store.save(TENANT_ID, evolved)
 

@@ -79,6 +79,7 @@ class LegacyOperationReplayer(
                 }
             } catch (error: Exception) {
                 if (error is ServiceException && error.status == 403) throw error
+                if (error is ServiceException && error.status == 401) throw error
                 if (error.isRetryable()) {
                     state = state.copy(
                         commands = state.commands.map {

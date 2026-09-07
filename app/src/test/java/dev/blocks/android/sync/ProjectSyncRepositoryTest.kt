@@ -219,6 +219,39 @@ class ProjectSyncRepositoryTest {
     }
 
     @Test
+    fun unavailableAuthenticationRetainsQueuedWorkUntilAForegroundCredentialRefresh() {
+        val drafts = MemoryDrafts()
+        val state = MemoryState()
+        state.saveSyncState(TENANT_A, loadedState())
+        val service = FakeProjectService().apply { authenticationRequired = true }
+        val repository = repository(service, drafts, state)
+        repository.activate(SESSION_A)
+
+        val error = runCatching {
+            repository.queueSaveNotes(
+                SESSION_A,
+                PROJECT_ID,
+                rowVersion = 3,
+                body = "Keep until sign-in refresh",
+                operationId = "auth-refresh-key",
+            )
+        }.exceptionOrNull()
+
+        assertTrue(error is ServiceException && error.status == 401)
+        val deferred = repository.snapshot(SESSION_A)
+        assertEquals(listOf("auth-refresh-key"), deferred.cache.commands.map { it.operationId })
+        assertFalse(deferred.reconciliationRequired)
+        assertEquals("Keep until sign-in refresh", drafts.load(TENANT_A).projectNotes[PROJECT_ID])
+
+        service.authenticationRequired = false
+        val completed = repository.backgroundSync(SESSION_A.copy(identityToken = "fresh-token"))
+
+        assertTrue(completed.cache.commands.isEmpty())
+        assertTrue("auth-refresh-key" in completed.cache.retiredOperationIds)
+        assertTrue(drafts.load(TENANT_A).projectNotes.isEmpty())
+    }
+
+    @Test
     fun tenantSwitchAndConfirmedMembershipRevocationEraseOnlyTheDepartedPartition() {
         val drafts = MemoryDrafts()
         val state = MemoryState()
@@ -295,6 +328,7 @@ class ProjectSyncRepositoryTest {
         var offline = false
         var notesConflict = false
         var membershipRevoked = false
+        var authenticationRequired = false
         var notesFailureAfterSuccessfulSaves: Int? = null
         val parkingKeys = mutableListOf<String>()
         val savedNotesBodies = mutableListOf<String>()
@@ -378,6 +412,9 @@ class ProjectSyncRepositoryTest {
 
         private fun failIfNeeded() {
             if (membershipRevoked) throw ServiceException(403, ApiError(ApiErrorCode.UNAUTHORIZED, "Revoked"))
+            if (authenticationRequired) {
+                throw ServiceException(401, ApiError(ApiErrorCode.UNAUTHENTICATED, "Refresh required"))
+            }
             if (offline) throw IOException("offline")
         }
     }

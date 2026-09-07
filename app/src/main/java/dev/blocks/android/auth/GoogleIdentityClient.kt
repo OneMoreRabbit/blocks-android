@@ -9,13 +9,19 @@ import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
 import com.google.android.libraries.identity.googleid.GetGoogleIdOption
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
 
-class GoogleIdentityClient(private val serverClientId: String) {
-    suspend fun signIn(activity: Activity): String {
+interface IdentityProvider {
+    suspend fun signIn(activity: Activity): String
+    suspend fun restore(activity: Activity): String
+    suspend fun clear(activity: Activity)
+}
+
+class GoogleIdentityClient(private val serverClientId: String) : IdentityProvider {
+    override suspend fun signIn(activity: Activity): String {
         val option = GetSignInWithGoogleOption.Builder(serverClientId).build()
         return credential(activity, GetCredentialRequest.Builder().addCredentialOption(option).build())
     }
 
-    suspend fun restore(activity: Activity): String {
+    override suspend fun restore(activity: Activity): String {
         val option = GetGoogleIdOption.Builder()
             .setServerClientId(serverClientId)
             .setFilterByAuthorizedAccounts(true)
@@ -24,7 +30,7 @@ class GoogleIdentityClient(private val serverClientId: String) {
         return credential(activity, GetCredentialRequest.Builder().addCredentialOption(option).build())
     }
 
-    suspend fun clear(activity: Activity) {
+    override suspend fun clear(activity: Activity) {
         CredentialManager.create(activity).clearCredentialState(ClearCredentialStateRequest())
     }
 

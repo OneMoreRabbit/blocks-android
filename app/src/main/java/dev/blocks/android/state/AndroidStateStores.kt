@@ -17,10 +17,14 @@ import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 import org.json.JSONObject
 
-class SessionContinuityStore(context: Context) {
+interface SessionContinuity {
+    var shouldRestore: Boolean
+}
+
+class SessionContinuityStore(context: Context) : SessionContinuity {
     private val preferences = context.getSharedPreferences("session_continuity", Context.MODE_PRIVATE)
 
-    var shouldRestore: Boolean
+    override var shouldRestore: Boolean
         get() = preferences.getBoolean("restore_authorized_credential", false)
         set(value) = preferences.edit().putBoolean("restore_authorized_credential", value).apply()
 }
@@ -147,6 +151,8 @@ class AndroidEncryptedDraftStore(context: Context) : DraftStore {
         drafts.projectParking.forEach { (projectId, parking) ->
             projectParking.put(projectId, parking.toJson())
         }
+        val projectRenames = JSONObject()
+        drafts.projectRenames.forEach(projectRenames::put)
         return JSONObject()
             .put("schema_version", CURRENT_SCHEMA_VERSION)
             .put("project_name", drafts.projectName)
@@ -160,6 +166,7 @@ class AndroidEncryptedDraftStore(context: Context) : DraftStore {
             )
             .put("project_notes", projectNotes)
             .put("project_parking", projectParking)
+            .put("project_renames", projectRenames)
             .put("pending_mutations", mutations)
             .toString()
     }
@@ -220,6 +227,14 @@ class AndroidEncryptedDraftStore(context: Context) : DraftStore {
                 put(projectId, projectParkingJson.getJSONObject(projectId).toParkingDraft())
             }
         }
+        val projectRenamesJson = json.optJSONObject("project_renames") ?: JSONObject()
+        val projectRenames = buildMap {
+            val keys = projectRenamesJson.keys()
+            while (keys.hasNext()) {
+                val projectId = keys.next()
+                put(projectId, projectRenamesJson.getString(projectId))
+            }
+        }
         val parking = json.optJSONObject("parking") ?: JSONObject()
         return FormDrafts(
             projectName = json.optString("project_name"),
@@ -231,6 +246,7 @@ class AndroidEncryptedDraftStore(context: Context) : DraftStore {
             ),
             projectNotes = projectNotes,
             projectParking = projectParking,
+            projectRenames = projectRenames,
             pendingMutations = mutations,
         )
     }
@@ -253,6 +269,6 @@ class AndroidEncryptedDraftStore(context: Context) : DraftStore {
         const val CIPHERTEXT = "drafts"
         const val TRANSFORMATION = "AES/GCM/NoPadding"
         const val PILOT_SCHEMA_VERSION = 2
-        const val CURRENT_SCHEMA_VERSION = 3
+        const val CURRENT_SCHEMA_VERSION = 4
     }
 }

@@ -22,6 +22,7 @@ import dev.blocks.android.project.ProjectPage
 import dev.blocks.android.project.ProjectParking
 import dev.blocks.android.project.ProjectService
 import dev.blocks.android.project.ProjectSummary
+import dev.blocks.android.project.ProjectWorkspace
 import dev.blocks.android.project.newOperationIdentity
 import java.io.IOException
 import java.math.BigInteger
@@ -32,11 +33,11 @@ class ProjectSyncRepository(
     private val legacyReplayer: LegacyQueueReplay,
     private val draftStore: DraftStore,
     private val syncStore: SyncStateStore,
-) {
+) : ProjectWorkspace {
     private var activeTenantId: String? = null
 
     @Synchronized
-    fun activate(session: Session) {
+    override fun activate(session: Session) {
         activeTenantId?.takeIf { it != session.tenantId }?.let { departedTenant ->
             activeTenantId = null
             purge(departedTenant)
@@ -44,6 +45,9 @@ class ProjectSyncRepository(
         activeTenantId = session.tenantId
         syncStore.loadSyncState(session.tenantId)
     }
+
+    @Synchronized
+    override fun snapshot(session: Session): BackgroundSyncResult = activeState(session).toResult()
 
     @Synchronized
     fun activeProjects(session: Session): List<ProjectSummary> {
@@ -71,7 +75,7 @@ class ProjectSyncRepository(
     }
 
     @Synchronized
-    fun archivedProjects(session: Session): List<ProjectSummary> {
+    override fun archivedProjects(session: Session): List<ProjectSummary> {
         val state = activeState(session)
         return try {
             service.listProjects(session, ProjectLifecycle.ARCHIVED).also { projects ->
@@ -96,7 +100,7 @@ class ProjectSyncRepository(
     }
 
     @Synchronized
-    fun projectPage(session: Session, projectId: String): ProjectPage {
+    override fun projectPage(session: Session, projectId: String): ProjectPage {
         val state = activeState(session)
         return try {
             service.projectPage(session, projectId).also { page ->
@@ -126,10 +130,10 @@ class ProjectSyncRepository(
         }
     }
 
-    fun queueCreateProject(
+    override fun queueCreateProject(
         session: Session,
         name: String,
-        operationId: String = newOperationIdentity(),
+        operationId: String,
     ): BackgroundSyncResult {
         require(name.isNotBlank())
         val drafts = draftStore.load(session.tenantId)
@@ -146,49 +150,57 @@ class ProjectSyncRepository(
         )
     }
 
-    fun queueRenameProject(
+    override fun queueRenameProject(
         session: Session,
         projectId: String,
         rowVersion: Int,
         name: String,
-        operationId: String = newOperationIdentity(),
-    ) = enqueue(
-        session,
-        ProjectMutation(
-            operationId = operationId,
-            type = ProjectMutationType.RENAME_PROJECT,
-            targetId = projectId,
-            ifMatch = rowVersion,
-            projectName = name,
-        ),
-    )
+        operationId: String,
+    ): BackgroundSyncResult {
+        require(name.isNotBlank())
+        val drafts = draftStore.load(session.tenantId)
+        draftStore.save(
+            session.tenantId,
+            drafts.copy(projectRenames = drafts.projectRenames + (projectId to name)),
+        )
+        return enqueue(
+            session,
+            ProjectMutation(
+                operationId = operationId,
+                type = ProjectMutationType.RENAME_PROJECT,
+                targetId = projectId,
+                ifMatch = rowVersion,
+                projectName = name,
+            ),
+        )
+    }
 
-    fun queueArchiveProject(
+    override fun queueArchiveProject(
         session: Session,
         projectId: String,
         rowVersion: Int,
-        operationId: String = newOperationIdentity(),
+        operationId: String,
     ) = enqueue(
         session,
         ProjectMutation(operationId, ProjectMutationType.ARCHIVE_PROJECT, projectId, ifMatch = rowVersion),
     )
 
-    fun queueReopenProject(
+    override fun queueReopenProject(
         session: Session,
         projectId: String,
         rowVersion: Int,
-        operationId: String = newOperationIdentity(),
+        operationId: String,
     ) = enqueue(
         session,
         ProjectMutation(operationId, ProjectMutationType.REOPEN_PROJECT, projectId, ifMatch = rowVersion),
     )
 
-    fun queueSaveNotes(
+    override fun queueSaveNotes(
         session: Session,
         projectId: String,
         rowVersion: Int,
         body: String,
-        operationId: String = newOperationIdentity(),
+        operationId: String,
     ): BackgroundSyncResult {
         val drafts = draftStore.load(session.tenantId)
         draftStore.save(session.tenantId, drafts.copy(projectNotes = drafts.projectNotes + (projectId to body)))
@@ -204,12 +216,12 @@ class ProjectSyncRepository(
         )
     }
 
-    fun queueParking(
+    override fun queueParking(
         session: Session,
         projectId: String,
         parking: ParkingDraft,
-        supersedesId: String? = null,
-        operationId: String = newOperationIdentity(),
+        supersedesId: String?,
+        operationId: String,
     ): BackgroundSyncResult {
         require(parking.location.isNotBlank() && parking.nextAction.isNotBlank() && parking.mustNotForget.isNotBlank())
         val drafts = draftStore.load(session.tenantId)
@@ -259,7 +271,7 @@ class ProjectSyncRepository(
     )
 
     @Synchronized
-    fun backgroundSync(session: Session): BackgroundSyncResult {
+    override fun backgroundSync(session: Session): BackgroundSyncResult {
         checkActive(session)
         var state = syncStore.loadSyncState(session.tenantId)
         try {
@@ -277,7 +289,7 @@ class ProjectSyncRepository(
     }
 
     @Synchronized
-    fun clearLocalState(session: Session) {
+    override fun clearLocalState(session: Session) {
         if (activeTenantId == session.tenantId) activeTenantId = null
         purge(session.tenantId)
     }
@@ -316,6 +328,10 @@ class ProjectSyncRepository(
                 state = retireProjectCommand(session, state, command)
             } catch (error: Exception) {
                 if (error is ServiceException && error.status == 403) throw error
+                if (error is ServiceException && error.status == 401) {
+                    save(session, state)
+                    throw error
+                }
                 if (error.isRetryable()) {
                     state = state.updateCommand(command.operationId) { it.copy(deliveryUncertain = true) }
                     save(session, state)
@@ -522,6 +538,13 @@ class ProjectSyncRepository(
         val cleaned = when (command.type) {
             ProjectMutationType.CREATE_PROJECT -> drafts.copy(
                 projectName = if (drafts.projectName == command.projectName) "" else drafts.projectName,
+            )
+            ProjectMutationType.RENAME_PROJECT -> drafts.copy(
+                projectRenames = if (drafts.projectRenames[command.targetId] == command.projectName) {
+                    drafts.projectRenames - command.targetId
+                } else {
+                    drafts.projectRenames
+                },
             )
             ProjectMutationType.SAVE_NOTES -> drafts.copy(
                 projectNotes = if (drafts.projectNotes[command.targetId] == command.notesBody) {
