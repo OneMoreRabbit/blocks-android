@@ -28,6 +28,7 @@ import dev.blocks.android.project.BlockLookup
 import dev.blocks.android.project.PhysicalBlock
 import dev.blocks.android.project.ProjectCacheState
 import dev.blocks.android.project.ProjectLifecycle
+import dev.blocks.android.project.ProjectMutationType
 import dev.blocks.android.project.ProjectMutationStatus
 import dev.blocks.android.project.ProjectNotes
 import dev.blocks.android.project.ProjectPage
@@ -44,10 +45,25 @@ import org.junit.Test
 
 class ProjectSyncRepositoryTest {
     @Test
-    fun api03ParkingReplaysAfterRestartWithItsOriginalIdentityAndCreatesNoLegacyCommand() {
+    fun failedBeforeDeliveryWithIdenticalNewestParkingRetriesOriginalIdentityAndAppendsOnce() {
         val drafts = MemoryDrafts()
         val state = MemoryState()
-        state.saveSyncState(TENANT_A, loadedState())
+        val initial = loadedState()
+        state.saveSyncState(
+            TENANT_A,
+            initial.copy(
+                projectCache = initial.projectCache.copy(
+                    pages = listOf(
+                        page().copy(
+                            newestParking = projectParking(
+                                id = "existing-identical-parking",
+                                draft = ParkingDraft("Here", "Next", "Remember"),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
         val service = FakeProjectService().apply { offline = true }
         val first = repository(service, drafts, state)
         first.activate(SESSION_A)
@@ -71,6 +87,8 @@ class ProjectSyncRepositoryTest {
         val final = recreated.backgroundSync(SESSION_A)
 
         assertEquals(listOf("project-park-key", "project-park-key"), service.parkingKeys)
+        assertEquals(1, service.parkingAppendCount)
+        assertEquals("parking-1", final.cache.pages.single().newestParking?.id)
         assertEquals(0, final.pendingProjectOperations)
         assertTrue("project-park-key" in final.cache.retiredOperationIds)
         assertTrue(drafts.load(TENANT_A).projectParking.isEmpty())
@@ -87,6 +105,38 @@ class ProjectSyncRepositoryTest {
             }.exceptionOrNull() is IllegalArgumentException,
         )
         assertEquals(sendsBeforeReuse, service.parkingKeys.size)
+    }
+
+    @Test
+    fun responseLostAfterParkingSuccessRetriesSameIdentityAndDoesNotAppendTwice() {
+        val drafts = MemoryDrafts()
+        val state = MemoryState()
+        state.saveSyncState(TENANT_A, loadedState())
+        val service = FakeProjectService().apply { parkingResponseLostAfterSuccess = true }
+        val first = repository(service, drafts, state)
+        first.activate(SESSION_A)
+
+        val ambiguous = first.queueParking(
+            SESSION_A,
+            PROJECT_ID,
+            ParkingDraft("Here", "Next", "Remember"),
+            operationId = "lost-parking-response-key",
+        )
+
+        assertEquals(1, ambiguous.pendingProjectOperations)
+        assertTrue(ambiguous.cache.commands.single().deliveryUncertain)
+        assertEquals(1, service.parkingAppendCount)
+        assertEquals(listOf("lost-parking-response-key"), service.parkingKeys)
+
+        val restarted = repository(service, drafts, state)
+        restarted.activate(SESSION_A)
+        val replayed = restarted.backgroundSync(SESSION_A)
+
+        assertEquals(listOf("lost-parking-response-key", "lost-parking-response-key"), service.parkingKeys)
+        assertEquals(1, service.parkingAppendCount)
+        assertEquals("parking-1", replayed.cache.pages.single().newestParking?.id)
+        assertTrue(replayed.cache.commands.isEmpty())
+        assertTrue("lost-parking-response-key" in replayed.cache.retiredOperationIds)
     }
 
     @Test
@@ -188,6 +238,184 @@ class ProjectSyncRepositoryTest {
         assertEquals(3, command.ifMatch)
         assertEquals("Local unsent notes", drafts.load(TENANT_A).projectNotes[PROJECT_ID])
         assertEquals("Server notes", result.cache.pages.single().notes.body)
+        assertEquals("Local unsent notes", result.conflict?.localNotes)
+        assertEquals(4, result.conflict?.authoritativePage?.notes?.rowVersion)
+    }
+
+    @Test
+    fun conflictCannotRetryFromAStaleCacheUntilAuthoritativeRefreshSucceeds() {
+        val drafts = MemoryDrafts()
+        val state = MemoryState()
+        state.saveSyncState(TENANT_A, loadedState())
+        val service = FakeProjectService().apply {
+            notesConflict = true
+            conflictPageUnavailable = true
+        }
+        val repository = repository(service, drafts, state)
+        repository.activate(SESSION_A)
+
+        val unavailable = repository.queueSaveNotes(
+            SESSION_A,
+            PROJECT_ID,
+            rowVersion = 3,
+            body = "Retained local notes",
+            operationId = "notes-operation",
+        )
+
+        assertFalse(unavailable.conflict?.canRetry == true)
+        assertEquals(null, unavailable.conflict?.authoritativePage)
+        assertTrue(
+            runCatching {
+                repository.retryConflict(SESSION_A, "notes-operation", "unsafe-retry")
+            }.exceptionOrNull() is IllegalArgumentException,
+        )
+
+        service.conflictPageUnavailable = false
+        val refreshed = repository.backgroundSync(SESSION_A)
+
+        assertTrue(refreshed.conflict?.canRetry == true)
+        assertEquals(4, refreshed.conflict?.authoritativePage?.notes?.rowVersion)
+    }
+
+    @Test
+    fun conflictRetryAfterRestartUsesAuthoritativeVersionAndFreshIdentityThenAdvancesQueue() {
+        val drafts = MemoryDrafts()
+        val state = MemoryState()
+        state.saveSyncState(TENANT_A, loadedState())
+        val service = FakeProjectService().apply { notesConflict = true }
+        val first = repository(service, drafts, state)
+        first.activate(SESSION_A)
+        first.queueSaveNotes(SESSION_A, PROJECT_ID, 3, "Local notes", "old-notes-operation")
+        first.queueRenameProject(SESSION_A, PROJECT_ID, 1, "Queued rename", "rename-operation")
+
+        service.notesConflict = false
+        val restarted = repository(service, drafts, state)
+        restarted.activate(SESSION_A)
+        val resolved = restarted.retryConflict(SESSION_A, "old-notes-operation", "fresh-notes-operation")
+
+        assertEquals(listOf(4), service.savedNotesVersions)
+        assertEquals(listOf("Local notes"), service.savedNotesBodies)
+        assertEquals(listOf("Queued rename"), service.renamedNames)
+        assertTrue(resolved.cache.commands.isEmpty())
+        assertTrue("old-notes-operation" in resolved.cache.retiredOperationIds)
+        assertTrue("fresh-notes-operation" in resolved.cache.retiredOperationIds)
+        assertTrue("rename-operation" in resolved.cache.retiredOperationIds)
+        assertFalse(resolved.reconciliationRequired)
+    }
+
+    @Test
+    fun lifecycleConflictCanBeDiscardedExplicitlyAndTheFollowingCommandStillRuns() {
+        val drafts = MemoryDrafts()
+        val state = MemoryState()
+        state.saveSyncState(TENANT_A, loadedState())
+        val service = FakeProjectService().apply { projectConflict = true }
+        val repository = repository(service, drafts, state)
+        repository.activate(SESSION_A)
+        val conflict = repository.queueArchiveProject(SESSION_A, PROJECT_ID, 1, "archive-operation")
+        repository.queueSaveNotes(SESSION_A, PROJECT_ID, 4, "After archive", "notes-after-archive")
+
+        assertEquals(ProjectMutationType.ARCHIVE_PROJECT, conflict.conflict?.type)
+        service.projectConflict = false
+        val resolved = repository.discardConflict(SESSION_A, "archive-operation")
+
+        assertTrue(resolved.cache.commands.isEmpty())
+        assertEquals(listOf("After archive"), service.savedNotesBodies)
+        assertTrue("archive-operation" in resolved.cache.retiredOperationIds)
+        assertTrue("notes-after-archive" in resolved.cache.retiredOperationIds)
+    }
+
+    @Test
+    fun renameConflictPresentsBothNamesAndRetriesWithAFreshOperationIdentity() {
+        val drafts = MemoryDrafts()
+        val state = MemoryState()
+        state.saveSyncState(TENANT_A, loadedState())
+        val service = FakeProjectService().apply { projectConflict = true }
+        val repository = repository(service, drafts, state)
+        repository.activate(SESSION_A)
+
+        val conflict = repository.queueRenameProject(
+            SESSION_A,
+            PROJECT_ID,
+            rowVersion = 1,
+            name = "My retained name",
+            operationId = "old-rename-operation",
+        )
+
+        assertEquals("My retained name", conflict.conflict?.localProjectName)
+        assertEquals("Project", conflict.conflict?.authoritativePage?.project?.name)
+        service.projectConflict = false
+        val resolved = repository.retryConflict(
+            SESSION_A,
+            "old-rename-operation",
+            "fresh-rename-operation",
+        )
+
+        assertEquals(listOf("My retained name"), service.renamedNames)
+        assertTrue("old-rename-operation" in resolved.cache.retiredOperationIds)
+        assertTrue("fresh-rename-operation" in resolved.cache.retiredOperationIds)
+        assertTrue(resolved.cache.commands.isEmpty())
+    }
+
+    @Test
+    fun authoritativeDiscoveryRetiresAmbiguousSuccessBeforeSamePayloadCanUseANewIdentity() {
+        val drafts = MemoryDrafts()
+        val state = MemoryState()
+        state.saveSyncState(TENANT_A, loadedState())
+        val service = FakeProjectService().apply { notesAmbiguousAfterSuccess = true }
+        val first = repository(service, drafts, state)
+        first.activate(SESSION_A)
+
+        val ambiguous = first.queueSaveNotes(
+            SESSION_A,
+            PROJECT_ID,
+            rowVersion = 3,
+            body = "Accepted despite lost response",
+            operationId = "ambiguous-operation",
+        )
+        assertTrue(ambiguous.cache.commands.single().deliveryUncertain)
+        assertEquals(listOf("Accepted despite lost response"), service.savedNotesBodies)
+
+        val discovered = state.loadSyncState(TENANT_A)
+        state.saveSyncState(
+            TENANT_A,
+            discovered.copy(
+                projectCache = discovered.projectCache.copy(
+                    pages = listOf(
+                        page().copy(
+                            notes = page().notes.copy(body = "Accepted despite lost response", rowVersion = 5),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        service.notesAmbiguousAfterSuccess = false
+        val restarted = repository(service, drafts, state)
+        restarted.activate(SESSION_A)
+        val reconciled = restarted.backgroundSync(SESSION_A)
+
+        assertEquals(1, service.savedNotesBodies.size)
+        assertTrue("ambiguous-operation" in reconciled.cache.retiredOperationIds)
+        assertTrue(
+            runCatching {
+                restarted.queueSaveNotes(
+                    SESSION_A,
+                    PROJECT_ID,
+                    5,
+                    "Accepted despite lost response",
+                    "ambiguous-operation",
+                )
+            }.exceptionOrNull() is IllegalArgumentException,
+        )
+
+        val later = restarted.queueSaveNotes(
+            SESSION_A,
+            PROJECT_ID,
+            5,
+            "Accepted despite lost response",
+            "later-distinct-operation",
+        )
+        assertTrue(later.cache.commands.isEmpty())
+        assertEquals(2, service.savedNotesBodies.size)
     }
 
     @Test
@@ -216,6 +444,39 @@ class ProjectSyncRepositoryTest {
         assertEquals(listOf("First edit", "Second edit"), service.savedNotesBodies)
         assertTrue(drafts.load(TENANT_A).projectNotes.isEmpty())
         assertTrue(complete.cache.commands.isEmpty())
+    }
+
+    @Test
+    fun unavailableAuthenticationRetainsQueuedWorkUntilAForegroundCredentialRefresh() {
+        val drafts = MemoryDrafts()
+        val state = MemoryState()
+        state.saveSyncState(TENANT_A, loadedState())
+        val service = FakeProjectService().apply { authenticationRequired = true }
+        val repository = repository(service, drafts, state)
+        repository.activate(SESSION_A)
+
+        val error = runCatching {
+            repository.queueSaveNotes(
+                SESSION_A,
+                PROJECT_ID,
+                rowVersion = 3,
+                body = "Keep until sign-in refresh",
+                operationId = "auth-refresh-key",
+            )
+        }.exceptionOrNull()
+
+        assertTrue(error is ServiceException && error.status == 401)
+        val deferred = repository.snapshot(SESSION_A)
+        assertEquals(listOf("auth-refresh-key"), deferred.cache.commands.map { it.operationId })
+        assertFalse(deferred.reconciliationRequired)
+        assertEquals("Keep until sign-in refresh", drafts.load(TENANT_A).projectNotes[PROJECT_ID])
+
+        service.authenticationRequired = false
+        val completed = repository.backgroundSync(SESSION_A.copy(identityToken = "fresh-token"))
+
+        assertTrue(completed.cache.commands.isEmpty())
+        assertTrue("auth-refresh-key" in completed.cache.retiredOperationIds)
+        assertTrue(drafts.load(TENANT_A).projectNotes.isEmpty())
     }
 
     @Test
@@ -294,10 +555,21 @@ class ProjectSyncRepositoryTest {
     private class FakeProjectService : ProjectService {
         var offline = false
         var notesConflict = false
+        var projectConflict = false
+        var conflictPageUnavailable = false
+        var notesAmbiguousAfterSuccess = false
+        var parkingResponseLostAfterSuccess = false
         var membershipRevoked = false
+        var authenticationRequired = false
         var notesFailureAfterSuccessfulSaves: Int? = null
         val parkingKeys = mutableListOf<String>()
+        var parkingAppendCount = 0
+            private set
+        private val parkingOutcomes = mutableMapOf<String, ProjectParking>()
+        private val lostParkingResponses = mutableSetOf<String>()
         val savedNotesBodies = mutableListOf<String>()
+        val savedNotesVersions = mutableListOf<Int>()
+        val renamedNames = mutableListOf<String>()
         val changePages = ArrayDeque<ChangePage>()
 
         override fun listProjects(session: Session, lifecycle: ProjectLifecycle): List<ProjectSummary> {
@@ -310,22 +582,32 @@ class ProjectSyncRepositoryTest {
 
         override fun projectPage(session: Session, projectId: String): ProjectPage {
             failIfNeeded()
+            if (conflictPageUnavailable) throw IOException("authoritative page unavailable")
             return page(session.tenantId)
         }
 
-        override fun renameProject(session: Session, projectId: String, rowVersion: Int, name: String) =
-            project(name = name, rowVersion = rowVersion + 1, tenantId = session.tenantId)
+        override fun renameProject(session: Session, projectId: String, rowVersion: Int, name: String): ProjectSummary {
+            failIfNeeded()
+            if (projectConflict) throw ServiceException(409, ApiError(ApiErrorCode.CONFLICT, "Project changed"))
+            renamedNames += name
+            return project(name = name, rowVersion = rowVersion + 1, tenantId = session.tenantId)
+        }
 
-        override fun archiveProject(session: Session, projectId: String, rowVersion: Int) = project(
-            lifecycle = ProjectLifecycle.ARCHIVED,
-            rowVersion = rowVersion + 1,
-            tenantId = session.tenantId,
-        )
+        override fun archiveProject(session: Session, projectId: String, rowVersion: Int): ProjectSummary {
+            failIfNeeded()
+            if (projectConflict) throw ServiceException(409, ApiError(ApiErrorCode.CONFLICT, "Project changed"))
+            return project(
+                lifecycle = ProjectLifecycle.ARCHIVED,
+                rowVersion = rowVersion + 1,
+                tenantId = session.tenantId,
+            )
+        }
 
-        override fun reopenProject(session: Session, projectId: String, rowVersion: Int) = project(
-            rowVersion = rowVersion + 1,
-            tenantId = session.tenantId,
-        )
+        override fun reopenProject(session: Session, projectId: String, rowVersion: Int): ProjectSummary {
+            failIfNeeded()
+            if (projectConflict) throw ServiceException(409, ApiError(ApiErrorCode.CONFLICT, "Project changed"))
+            return project(rowVersion = rowVersion + 1, tenantId = session.tenantId)
+        }
 
         override fun notes(session: Session, projectId: String) = page(session.tenantId).notes
 
@@ -336,6 +618,8 @@ class ProjectSyncRepositoryTest {
                 if (savedNotesBodies.size >= successfulLimit) throw IOException("offline")
             }
             savedNotesBodies += body
+            savedNotesVersions += rowVersion
+            if (notesAmbiguousAfterSuccess) throw IOException("response lost after acceptance")
             return ProjectNotes(projectId, body, rowVersion + 1, NOW)
         }
 
@@ -348,16 +632,14 @@ class ProjectSyncRepositoryTest {
         ): ProjectParking {
             parkingKeys += idempotencyKey
             failIfNeeded()
-            return ProjectParking(
-                id = "parking-id",
-                projectId = projectId,
-                location = parking.location,
-                nextAction = parking.nextAction,
-                mustNotForget = parking.mustNotForget,
-                authoredByUserId = "user-id",
-                createdAt = NOW,
-                supersedesId = supersedesId,
-            )
+            val outcome = parkingOutcomes.getOrPut(idempotencyKey) {
+                parkingAppendCount += 1
+                projectParking(id = "parking-$parkingAppendCount", draft = parking, supersedesId = supersedesId)
+            }
+            if (parkingResponseLostAfterSuccess && lostParkingResponses.add(idempotencyKey)) {
+                throw IOException("response lost after parking acceptance")
+            }
+            return outcome
         }
 
         override fun parking(session: Session, projectId: String) = listOfNotNull(page(session.tenantId).newestParking)
@@ -378,6 +660,9 @@ class ProjectSyncRepositoryTest {
 
         private fun failIfNeeded() {
             if (membershipRevoked) throw ServiceException(403, ApiError(ApiErrorCode.UNAUTHORIZED, "Revoked"))
+            if (authenticationRequired) {
+                throw ServiceException(401, ApiError(ApiErrorCode.UNAUTHENTICATED, "Refresh required"))
+            }
             if (offline) throw IOException("offline")
         }
     }
@@ -445,6 +730,21 @@ class ProjectSyncRepositoryTest {
             project = project(tenantId = tenantId),
             notes = ProjectNotes(PROJECT_ID, "Server notes", 4, NOW),
             newestParking = null,
+        )
+
+        private fun projectParking(
+            id: String,
+            draft: ParkingDraft,
+            supersedesId: String? = null,
+        ) = ProjectParking(
+            id = id,
+            projectId = PROJECT_ID,
+            location = draft.location,
+            nextAction = draft.nextAction,
+            mustNotForget = draft.mustNotForget,
+            authoredByUserId = "user-id",
+            createdAt = NOW,
+            supersedesId = supersedesId,
         )
 
         private fun event(id: String, type: String, payload: Map<String, Any?>) =

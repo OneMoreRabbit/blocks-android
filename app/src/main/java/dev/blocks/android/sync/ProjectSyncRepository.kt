@@ -6,6 +6,7 @@ import dev.blocks.android.mvp.ChangePage
 import dev.blocks.android.mvp.DraftStore
 import dev.blocks.android.mvp.MembershipRevokedException
 import dev.blocks.android.mvp.ParkingDraft
+import dev.blocks.android.mvp.PendingMutation
 import dev.blocks.android.mvp.Session
 import dev.blocks.android.mvp.SyncStateStore
 import dev.blocks.android.mvp.TenantSyncState
@@ -13,6 +14,7 @@ import dev.blocks.android.project.BackgroundSyncResult
 import dev.blocks.android.project.BlockBinding
 import dev.blocks.android.project.PhysicalBlock
 import dev.blocks.android.project.ProjectCacheState
+import dev.blocks.android.project.ProjectConflict
 import dev.blocks.android.project.ProjectLifecycle
 import dev.blocks.android.project.ProjectMutation
 import dev.blocks.android.project.ProjectMutationStatus
@@ -22,6 +24,7 @@ import dev.blocks.android.project.ProjectPage
 import dev.blocks.android.project.ProjectParking
 import dev.blocks.android.project.ProjectService
 import dev.blocks.android.project.ProjectSummary
+import dev.blocks.android.project.ProjectWorkspace
 import dev.blocks.android.project.newOperationIdentity
 import java.io.IOException
 import java.math.BigInteger
@@ -32,11 +35,11 @@ class ProjectSyncRepository(
     private val legacyReplayer: LegacyQueueReplay,
     private val draftStore: DraftStore,
     private val syncStore: SyncStateStore,
-) {
+) : ProjectWorkspace {
     private var activeTenantId: String? = null
 
     @Synchronized
-    fun activate(session: Session) {
+    override fun activate(session: Session) {
         activeTenantId?.takeIf { it != session.tenantId }?.let { departedTenant ->
             activeTenantId = null
             purge(departedTenant)
@@ -44,6 +47,9 @@ class ProjectSyncRepository(
         activeTenantId = session.tenantId
         syncStore.loadSyncState(session.tenantId)
     }
+
+    @Synchronized
+    override fun snapshot(session: Session): BackgroundSyncResult = activeState(session).toResult()
 
     @Synchronized
     fun activeProjects(session: Session): List<ProjectSummary> {
@@ -71,7 +77,7 @@ class ProjectSyncRepository(
     }
 
     @Synchronized
-    fun archivedProjects(session: Session): List<ProjectSummary> {
+    override fun archivedProjects(session: Session): List<ProjectSummary> {
         val state = activeState(session)
         return try {
             service.listProjects(session, ProjectLifecycle.ARCHIVED).also { projects ->
@@ -96,7 +102,7 @@ class ProjectSyncRepository(
     }
 
     @Synchronized
-    fun projectPage(session: Session, projectId: String): ProjectPage {
+    override fun projectPage(session: Session, projectId: String): ProjectPage {
         val state = activeState(session)
         return try {
             service.projectPage(session, projectId).also { page ->
@@ -126,10 +132,10 @@ class ProjectSyncRepository(
         }
     }
 
-    fun queueCreateProject(
+    override fun queueCreateProject(
         session: Session,
         name: String,
-        operationId: String = newOperationIdentity(),
+        operationId: String,
     ): BackgroundSyncResult {
         require(name.isNotBlank())
         val drafts = draftStore.load(session.tenantId)
@@ -146,49 +152,57 @@ class ProjectSyncRepository(
         )
     }
 
-    fun queueRenameProject(
+    override fun queueRenameProject(
         session: Session,
         projectId: String,
         rowVersion: Int,
         name: String,
-        operationId: String = newOperationIdentity(),
-    ) = enqueue(
-        session,
-        ProjectMutation(
-            operationId = operationId,
-            type = ProjectMutationType.RENAME_PROJECT,
-            targetId = projectId,
-            ifMatch = rowVersion,
-            projectName = name,
-        ),
-    )
+        operationId: String,
+    ): BackgroundSyncResult {
+        require(name.isNotBlank())
+        val drafts = draftStore.load(session.tenantId)
+        draftStore.save(
+            session.tenantId,
+            drafts.copy(projectRenames = drafts.projectRenames + (projectId to name)),
+        )
+        return enqueue(
+            session,
+            ProjectMutation(
+                operationId = operationId,
+                type = ProjectMutationType.RENAME_PROJECT,
+                targetId = projectId,
+                ifMatch = rowVersion,
+                projectName = name,
+            ),
+        )
+    }
 
-    fun queueArchiveProject(
+    override fun queueArchiveProject(
         session: Session,
         projectId: String,
         rowVersion: Int,
-        operationId: String = newOperationIdentity(),
+        operationId: String,
     ) = enqueue(
         session,
         ProjectMutation(operationId, ProjectMutationType.ARCHIVE_PROJECT, projectId, ifMatch = rowVersion),
     )
 
-    fun queueReopenProject(
+    override fun queueReopenProject(
         session: Session,
         projectId: String,
         rowVersion: Int,
-        operationId: String = newOperationIdentity(),
+        operationId: String,
     ) = enqueue(
         session,
         ProjectMutation(operationId, ProjectMutationType.REOPEN_PROJECT, projectId, ifMatch = rowVersion),
     )
 
-    fun queueSaveNotes(
+    override fun queueSaveNotes(
         session: Session,
         projectId: String,
         rowVersion: Int,
         body: String,
-        operationId: String = newOperationIdentity(),
+        operationId: String,
     ): BackgroundSyncResult {
         val drafts = draftStore.load(session.tenantId)
         draftStore.save(session.tenantId, drafts.copy(projectNotes = drafts.projectNotes + (projectId to body)))
@@ -204,12 +218,12 @@ class ProjectSyncRepository(
         )
     }
 
-    fun queueParking(
+    override fun queueParking(
         session: Session,
         projectId: String,
         parking: ParkingDraft,
-        supersedesId: String? = null,
-        operationId: String = newOperationIdentity(),
+        supersedesId: String?,
+        operationId: String,
     ): BackgroundSyncResult {
         require(parking.location.isNotBlank() && parking.nextAction.isNotBlank() && parking.mustNotForget.isNotBlank())
         val drafts = draftStore.load(session.tenantId)
@@ -229,6 +243,81 @@ class ProjectSyncRepository(
                 supersedesId = supersedesId,
             ),
         )
+    }
+
+    @Synchronized
+    override fun discardConflict(session: Session, operationId: String): BackgroundSyncResult {
+        val state = activeState(session)
+        val command = state.projectCache.commands.firstOrNull { it.operationId == operationId }
+            ?: throw IllegalArgumentException("The saved change is no longer pending")
+        require(command.status == ProjectMutationStatus.REQUIRES_RECONCILIATION) {
+            "Only a conflicting saved change can be discarded"
+        }
+        retireProjectCommand(session, state, command)
+        return backgroundSync(session)
+    }
+
+    @Synchronized
+    override fun retryConflict(
+        session: Session,
+        operationId: String,
+        newOperationId: String,
+    ): BackgroundSyncResult {
+        var state = activeState(session)
+        val command = state.projectCache.commands.firstOrNull { it.operationId == operationId }
+            ?: throw IllegalArgumentException("The saved change is no longer pending")
+        require(command.status == ProjectMutationStatus.REQUIRES_RECONCILIATION) {
+            "Only a conflicting saved change can be retried"
+        }
+        if (command.isSatisfiedBy(state.projectCache)) {
+            retireProjectCommand(session, state, command)
+            return backgroundSync(session)
+        }
+        require(newOperationId != command.operationId)
+        require(newOperationId !in state.projectCache.retiredOperationIds)
+        require(state.projectCache.commands.none { it.operationId == newOperationId })
+        require(command.authoritativeStateConfirmed) {
+            "The authoritative project version must be loaded before retry"
+        }
+        val authoritative = state.projectCache.pages.firstOrNull {
+            it.project.id == command.projectIdOrTarget()
+        } ?: throw IllegalStateException("The authoritative project version is unavailable")
+        val replacement = command.copy(
+            operationId = newOperationId,
+            idempotencyKey = command.idempotencyKey?.let { newOperationId },
+            ifMatch = when (command.type) {
+                ProjectMutationType.SAVE_NOTES -> authoritative.notes.rowVersion
+                ProjectMutationType.RENAME_PROJECT,
+                ProjectMutationType.ARCHIVE_PROJECT,
+                ProjectMutationType.REOPEN_PROJECT,
+                -> authoritative.project.rowVersion
+                else -> command.ifMatch
+            },
+            status = ProjectMutationStatus.PENDING,
+            deliveryUncertain = false,
+            failureMessage = null,
+            authoritativeStateConfirmed = false,
+        )
+        state = state.copy(
+            projectCache = state.projectCache.copy(
+                commands = state.projectCache.commands.map {
+                    if (it.operationId == command.operationId) replacement else it
+                },
+                retiredOperationIds = (state.projectCache.retiredOperationIds + command.operationId).distinct(),
+            ),
+        )
+        save(session, state)
+        replaceDraftIdentity(session, command, replacement)
+        return backgroundSync(session)
+    }
+
+    @Synchronized
+    override fun discardPendingOperation(session: Session, operationId: String): BackgroundSyncResult {
+        val state = activeState(session)
+        val command = state.projectCache.commands.firstOrNull { it.operationId == operationId }
+            ?: return state.toResult()
+        retireProjectCommand(session, state, command)
+        return backgroundSync(session)
     }
 
     // Block registration is intentionally absent: its one-time tag token requires a
@@ -259,7 +348,7 @@ class ProjectSyncRepository(
     )
 
     @Synchronized
-    fun backgroundSync(session: Session): BackgroundSyncResult {
+    override fun backgroundSync(session: Session): BackgroundSyncResult {
         checkActive(session)
         var state = syncStore.loadSyncState(session.tenantId)
         try {
@@ -277,7 +366,7 @@ class ProjectSyncRepository(
     }
 
     @Synchronized
-    fun clearLocalState(session: Session) {
+    override fun clearLocalState(session: Session) {
         if (activeTenantId == session.tenantId) activeTenantId = null
         purge(session.tenantId)
     }
@@ -308,7 +397,23 @@ class ProjectSyncRepository(
     private fun drainProjectQueue(session: Session, initial: TenantSyncState): TenantSyncState {
         var state = initial
         while (true) {
-            val command = state.projectCache.commands.firstOrNull() ?: return state
+            var command = state.projectCache.commands.firstOrNull() ?: return state
+            if (command.status == ProjectMutationStatus.REQUIRES_RECONCILIATION &&
+                !command.authoritativeStateConfirmed
+            ) {
+                val refreshed = refreshConflictTargetBestEffort(session, state, command)
+                state = refreshed.state.updateCommand(command.operationId) {
+                    it.copy(authoritativeStateConfirmed = refreshed.confirmed)
+                }
+                save(session, state)
+                command = state.projectCache.commands.first { it.operationId == command.operationId }
+            }
+            if ((command.deliveryUncertain || command.status == ProjectMutationStatus.REQUIRES_RECONCILIATION) &&
+                command.isSatisfiedBy(state.projectCache)
+            ) {
+                state = retireProjectCommand(session, state, command)
+                continue
+            }
             if (command.status == ProjectMutationStatus.REQUIRES_RECONCILIATION) return state
             try {
                 val outcome = sendProjectCommand(session, command)
@@ -316,19 +421,29 @@ class ProjectSyncRepository(
                 state = retireProjectCommand(session, state, command)
             } catch (error: Exception) {
                 if (error is ServiceException && error.status == 403) throw error
+                if (error is ServiceException && error.status == 401) {
+                    save(session, state)
+                    throw error
+                }
                 if (error.isRetryable()) {
                     state = state.updateCommand(command.operationId) { it.copy(deliveryUncertain = true) }
                     save(session, state)
                     return state
                 }
-                state = refreshConflictTargetBestEffort(session, state, command)
-                state = state.updateCommand(command.operationId) {
+                val refreshed = refreshConflictTargetBestEffort(session, state, command)
+                state = refreshed.state.updateCommand(command.operationId) {
                     it.copy(
                         status = ProjectMutationStatus.REQUIRES_RECONCILIATION,
                         failureMessage = error.message,
+                        authoritativeStateConfirmed = refreshed.confirmed,
                     )
                 }
                 save(session, state)
+                val reconciled = state.projectCache.commands.first { it.operationId == command.operationId }
+                if (reconciled.isSatisfiedBy(state.projectCache)) {
+                    state = retireProjectCommand(session, state, reconciled)
+                    continue
+                }
                 return state
             }
         }
@@ -476,12 +591,18 @@ class ProjectSyncRepository(
         session: Session,
         state: TenantSyncState,
         command: ProjectMutation,
-    ): TenantSyncState {
+    ): ConflictRefresh {
         val projectId = command.projectId ?: command.targetId
         if (command.type == ProjectMutationType.CREATE_PROJECT) {
-            return state
+            return ConflictRefresh(state, confirmed = false)
         }
-        return runCatching { state.withPage(service.projectPage(session, projectId)) }.getOrDefault(state)
+        return try {
+            ConflictRefresh(state.withPage(service.projectPage(session, projectId)), confirmed = true)
+        } catch (error: Exception) {
+            error.handleMembershipRevocation(session)
+            if (!error.isRetryable()) throw error
+            ConflictRefresh(state, confirmed = false)
+        }
     }
 
     private fun applyOutcome(state: TenantSyncState, outcome: ProjectOutcome): TenantSyncState = when (outcome) {
@@ -519,9 +640,16 @@ class ProjectSyncRepository(
         )
         save(session, updated)
         val drafts = draftStore.load(session.tenantId)
-        val cleaned = when (command.type) {
+        val contentCleaned = when (command.type) {
             ProjectMutationType.CREATE_PROJECT -> drafts.copy(
                 projectName = if (drafts.projectName == command.projectName) "" else drafts.projectName,
+            )
+            ProjectMutationType.RENAME_PROJECT -> drafts.copy(
+                projectRenames = if (drafts.projectRenames[command.targetId] == command.projectName) {
+                    drafts.projectRenames - command.targetId
+                } else {
+                    drafts.projectRenames
+                },
             )
             ProjectMutationType.SAVE_NOTES -> drafts.copy(
                 projectNotes = if (drafts.projectNotes[command.targetId] == command.notesBody) {
@@ -539,8 +667,36 @@ class ProjectSyncRepository(
             )
             else -> drafts
         }
+        val cleaned = contentCleaned.copy(
+            pendingMutations = contentCleaned.pendingMutations.filterValues {
+                it.idempotencyKey != command.operationId
+            },
+        )
         if (cleaned != drafts) draftStore.save(session.tenantId, cleaned)
         return updated
+    }
+
+    private fun replaceDraftIdentity(
+        session: Session,
+        previous: ProjectMutation,
+        replacement: ProjectMutation,
+    ) {
+        val drafts = draftStore.load(session.tenantId)
+        val updated = drafts.copy(
+            pendingMutations = drafts.pendingMutations.mapValues { (_, mutation) ->
+                if (mutation.idempotencyKey == previous.operationId) {
+                    PendingMutation(
+                        mutation.operation,
+                        mutation.targetId,
+                        mutation.payloadDigest,
+                        replacement.operationId,
+                    )
+                } else {
+                    mutation
+                }
+            },
+        )
+        if (updated != drafts) draftStore.save(session.tenantId, updated)
     }
 
     private fun TenantSyncState.withProject(project: ProjectSummary): TenantSyncState {
@@ -587,7 +743,39 @@ class ProjectSyncRepository(
         status = ProjectMutationStatus.PENDING,
         deliveryUncertain = false,
         failureMessage = null,
+        authoritativeStateConfirmed = false,
     )
+
+    private fun ProjectMutation.projectIdOrTarget() = projectId ?: targetId
+
+    private fun ProjectMutation.isSatisfiedBy(cache: ProjectCacheState): Boolean {
+        if (status == ProjectMutationStatus.REQUIRES_RECONCILIATION && !authoritativeStateConfirmed) return false
+        val page = cache.pages.firstOrNull { it.project.id == projectIdOrTarget() }
+        return when (type) {
+            ProjectMutationType.CREATE_PROJECT -> false
+            ProjectMutationType.RENAME_PROJECT -> page?.let {
+                it.project.rowVersion > requireNotNull(ifMatch) && it.project.name == projectName
+            } == true
+            ProjectMutationType.ARCHIVE_PROJECT -> page?.let {
+                it.project.rowVersion > requireNotNull(ifMatch) && it.project.lifecycle == ProjectLifecycle.ARCHIVED
+            } == true
+            ProjectMutationType.REOPEN_PROJECT -> page?.let {
+                it.project.rowVersion > requireNotNull(ifMatch) && it.project.lifecycle == ProjectLifecycle.ACTIVE
+            } == true
+            ProjectMutationType.SAVE_NOTES -> page?.let {
+                it.notes.rowVersion > requireNotNull(ifMatch) && it.notes.body == notesBody
+            } == true
+            // Appends cannot be proven from content: two intentional records may be identical.
+            // Retry the persisted idempotency key until the Service returns its canonical result.
+            ProjectMutationType.ADD_PARKING -> false
+            ProjectMutationType.BIND_BLOCK -> cache.blocks.any {
+                it.id == targetId && it.boundProjectId == projectId
+            }
+            ProjectMutationType.UNBIND_BLOCK -> cache.blocks.any {
+                it.id == targetId && it.boundProjectId == null
+            }
+        }
+    }
 
     private fun ChangePage.validateOrderAfter(cursor: String?) {
         var previous = cursor?.let(::BigInteger) ?: BigInteger.valueOf(-1)
@@ -604,14 +792,34 @@ class ProjectSyncRepository(
         val reconciliation = projectCache.commands.any {
             it.status == ProjectMutationStatus.REQUIRES_RECONCILIATION
         } || commands.any { it.status.name == ProjectMutationStatus.REQUIRES_RECONCILIATION.name }
+        val conflicting = projectCache.commands.firstOrNull {
+            it.status == ProjectMutationStatus.REQUIRES_RECONCILIATION
+        }
         return BackgroundSyncResult(
             cache = projectCache,
             cursor = changeCursor,
             pendingLegacyOperations = commands.size,
             pendingProjectOperations = projectCache.commands.size,
             reconciliationRequired = reconciliation,
+            conflict = conflicting?.let { command ->
+                ProjectConflict(
+                    operationId = command.operationId,
+                    type = command.type,
+                    projectId = command.projectIdOrTarget().takeUnless {
+                        command.type == ProjectMutationType.CREATE_PROJECT
+                    },
+                    localProjectName = command.projectName,
+                    localNotes = command.notesBody,
+                    localParking = command.parking,
+                    authoritativePage = projectCache.pages.firstOrNull {
+                        command.authoritativeStateConfirmed && it.project.id == command.projectIdOrTarget()
+                    },
+                )
+            },
         )
     }
+
+    private data class ConflictRefresh(val state: TenantSyncState, val confirmed: Boolean)
 
     private fun checkActive(session: Session) {
         check(activeTenantId == session.tenantId) { "No project state is active for this tenant" }

@@ -99,6 +99,7 @@ data class ProjectMutation(
     val status: ProjectMutationStatus = ProjectMutationStatus.PENDING,
     val deliveryUncertain: Boolean = false,
     val failureMessage: String? = null,
+    val authoritativeStateConfirmed: Boolean = false,
 )
 
 data class ProjectCacheState(
@@ -120,7 +121,26 @@ data class BackgroundSyncResult(
     val pendingLegacyOperations: Int,
     val pendingProjectOperations: Int,
     val reconciliationRequired: Boolean,
+    val conflict: ProjectConflict? = null,
 )
+
+data class ProjectConflict(
+    val operationId: String,
+    val type: ProjectMutationType,
+    val projectId: String?,
+    val localProjectName: String? = null,
+    val localNotes: String? = null,
+    val localParking: ParkingDraft? = null,
+    val authoritativePage: ProjectPage? = null,
+) {
+    val canRetry: Boolean
+        get() = type in setOf(
+            ProjectMutationType.RENAME_PROJECT,
+            ProjectMutationType.ARCHIVE_PROJECT,
+            ProjectMutationType.REOPEN_PROJECT,
+            ProjectMutationType.SAVE_NOTES,
+        ) && authoritativePage != null
+}
 
 interface ProjectService {
     fun listProjects(session: Session, lifecycle: ProjectLifecycle): List<ProjectSummary>
@@ -149,6 +169,65 @@ interface ProjectService {
     fun unbindBlock(session: Session, blockId: String)
     fun lookupBlock(session: Session, tagToken: String): BlockLookup
     fun changes(session: Session, cursor: String?, limit: Int = 100): ChangePage
+}
+
+fun interface SessionAuthenticator {
+    fun login(identityToken: String): Session
+}
+
+/** Presentation-facing boundary around the durable project cache and command dispatcher. */
+interface ProjectWorkspace {
+    fun activate(session: Session)
+    fun snapshot(session: Session): BackgroundSyncResult
+    fun archivedProjects(session: Session): List<ProjectSummary>
+    fun projectPage(session: Session, projectId: String): ProjectPage
+    fun backgroundSync(session: Session): BackgroundSyncResult
+    fun queueCreateProject(
+        session: Session,
+        name: String,
+        operationId: String = newOperationIdentity(),
+    ): BackgroundSyncResult
+    fun queueRenameProject(
+        session: Session,
+        projectId: String,
+        rowVersion: Int,
+        name: String,
+        operationId: String = newOperationIdentity(),
+    ): BackgroundSyncResult
+    fun queueArchiveProject(
+        session: Session,
+        projectId: String,
+        rowVersion: Int,
+        operationId: String = newOperationIdentity(),
+    ): BackgroundSyncResult
+    fun queueReopenProject(
+        session: Session,
+        projectId: String,
+        rowVersion: Int,
+        operationId: String = newOperationIdentity(),
+    ): BackgroundSyncResult
+    fun queueSaveNotes(
+        session: Session,
+        projectId: String,
+        rowVersion: Int,
+        body: String,
+        operationId: String = newOperationIdentity(),
+    ): BackgroundSyncResult
+    fun queueParking(
+        session: Session,
+        projectId: String,
+        parking: ParkingDraft,
+        supersedesId: String? = null,
+        operationId: String = newOperationIdentity(),
+    ): BackgroundSyncResult
+    fun discardConflict(session: Session, operationId: String): BackgroundSyncResult
+    fun retryConflict(
+        session: Session,
+        operationId: String,
+        newOperationId: String = newOperationIdentity(),
+    ): BackgroundSyncResult
+    fun discardPendingOperation(session: Session, operationId: String): BackgroundSyncResult
+    fun clearLocalState(session: Session)
 }
 
 fun newOperationIdentity(): String = UUID.randomUUID().toString()
