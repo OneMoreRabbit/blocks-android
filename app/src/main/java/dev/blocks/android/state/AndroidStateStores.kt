@@ -65,13 +65,15 @@ class AndroidEncryptedDraftStore(context: Context) : DraftStore {
         }
         val ciphertext = cipher.doFinal(encode(drafts).toByteArray(Charsets.UTF_8))
         val packed = byteArrayOf(cipher.iv.size.toByte()) + cipher.iv + ciphertext
-        preferences(tenantId).edit()
+        check(
+            preferences(tenantId).edit()
             .putString(CIPHERTEXT, Base64.encodeToString(packed, Base64.NO_WRAP))
-            .apply()
+                .commit(),
+        ) { "Could not persist encrypted draft state" }
     }
 
     override fun clear(tenantId: String) {
-        preferences(tenantId).edit().clear().apply()
+        check(preferences(tenantId).edit().clear().commit()) { "Could not clear encrypted draft state" }
         runCatching {
             KeyStore.getInstance("AndroidKeyStore").apply {
                 load(null)

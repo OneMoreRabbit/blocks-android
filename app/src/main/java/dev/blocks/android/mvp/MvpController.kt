@@ -36,6 +36,7 @@ data class MvpState(
     val parking: ParkingRecord? = null,
     val parkingAction: ParkingAction = ParkingAction.PARK,
     val drafts: FormDrafts = FormDrafts(),
+    val syncStatus: SyncStatus = SyncStatus(),
     val invalidField: FormField? = null,
     val reconciliation: Reconciliation? = null,
     val error: String? = null,
@@ -52,10 +53,13 @@ class MvpController(
 
     fun login(identityToken: String) {
         if (identityToken.isBlank()) return fail("Enter an identity token.")
+        session = null
+        state = MvpState()
         val activeSession = repository.login(identityToken)
-        val tenantDrafts = draftStore.load(activeSession.tenantId)
         val projects = repository.projects(activeSession)
-        val reentry = repository.current(activeSession)
+        val sync = repository.synchronize(activeSession)
+        val tenantDrafts = draftStore.load(activeSession.tenantId)
+        val reentry = sync.reentry
         val reentryProject = projects.firstOrNull { it.id == reentry.workSession?.projectId }
         session = activeSession
         state = MvpState(
@@ -65,6 +69,7 @@ class MvpController(
             workSession = reentry.workSession,
             parking = reentry.parking,
             drafts = tenantDrafts,
+            syncStatus = sync.status,
         )
     }
 
@@ -130,10 +135,13 @@ class MvpController(
                 applyReentry(result.reentry, project)
             }
             is PickupResult.ExistingSession -> {
+                val activeSession = requireNotNull(session)
+                val sync = repository.synchronize(activeSession)
                 val existingProject = state.projects.firstOrNull {
-                    it.id == result.reentry.workSession?.projectId
+                    it.id == sync.reentry.workSession?.projectId
                 }
-                applyReentry(result.reentry, existingProject ?: project)
+                applyReentry(sync.reentry, existingProject ?: project)
+                state = state.copy(syncStatus = sync.status)
                 fail("Another session is already active. Showing it; your pickup draft is retained.")
             }
         }
@@ -257,6 +265,46 @@ class MvpController(
 
     fun reportError(message: String) = fail(message)
 
+    fun reportRepositoryError(error: Exception): Boolean {
+        if (error is MembershipRevokedException) {
+            session = null
+            state = MvpState(error = error.message)
+            return true
+        }
+        fail(error.message ?: "Blocks could not complete that request.")
+        return false
+    }
+
+    fun synchronize() {
+        val activeSession = requireNotNull(session)
+        val sync = repository.synchronize(activeSession)
+        applySynchronizedState(activeSession, sync)
+    }
+
+    fun acceptAuthoritativeState() {
+        val activeSession = requireNotNull(session)
+        val sync = repository.resolveReconciliation(activeSession)
+        applySynchronizedState(activeSession, sync)
+    }
+
+    private fun applySynchronizedState(activeSession: Session, sync: SyncResult) {
+        val projects = repository.projects(activeSession)
+        val selectedProject = projects.firstOrNull { it.id == sync.reentry.workSession?.projectId }
+            ?: state.selectedProject?.let { selected -> projects.firstOrNull { it.id == selected.id } }
+        state = state.copy(
+            projects = projects,
+            selectedProject = selectedProject,
+            workSession = sync.reentry.workSession,
+            parking = sync.reentry.parking,
+            drafts = draftStore.load(activeSession.tenantId),
+            syncStatus = sync.status,
+            screen = if (selectedProject == null) MvpScreen.PROJECTS else MvpScreen.PICKUP,
+            error = null,
+            invalidField = null,
+            reconciliation = null,
+        )
+    }
+
     fun updateProjectNameDraft(value: String) {
         persistDrafts(state.drafts.copy(projectName = value))
         if (value.isNotBlank() && state.invalidField == FormField.PROJECT_NAME) clearValidation()
@@ -294,7 +342,13 @@ class MvpController(
         val activeSession = session
         session = null
         state = MvpState()
-        activeSession?.let { draftStore.clear(it.tenantId) }
+        activeSession?.let {
+            val draftFailure = runCatching { draftStore.clear(it.tenantId) }.exceptionOrNull()
+            val syncFailure = runCatching { repository.clearLocalState(it) }.exceptionOrNull()
+            (draftFailure ?: syncFailure)?.let { failure ->
+                throw IllegalStateException("Could not clear local tenant state", failure)
+            }
+        }
     }
 
     private fun performTransition(
@@ -305,10 +359,13 @@ class MvpController(
         try {
             action()
         } catch (conflict: TransitionConflictException) {
-            val authoritative = repository.current(requireNotNull(session))
-            applyReentry(authoritative, project)
+            val activeSession = requireNotNull(session)
+            val sync = repository.synchronize(activeSession)
+            applyReentry(sync.reentry, project)
             state = state.copy(
                 error = null,
+                drafts = draftStore.load(activeSession.tenantId),
+                syncStatus = sync.status,
                 reconciliation = Reconciliation(intent, conflict.message.orEmpty()),
             )
         }

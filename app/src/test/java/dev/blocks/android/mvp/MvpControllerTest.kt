@@ -8,6 +8,23 @@ import org.junit.Test
 
 class MvpControllerTest {
     @Test
+    fun membershipRevocationClearsTheActiveInMemoryTenantAndRequiresLogin() {
+        val controller = MvpController(InMemoryBlocksRepository())
+        controller.login("development-token")
+        assertTrue(controller.state.screen != MvpScreen.LOGIN)
+
+        val requiresReauthentication = controller.reportRepositoryError(
+            MembershipRevokedException(IllegalStateException("forbidden")),
+        )
+
+        assertTrue(requiresReauthentication)
+        assertEquals(MvpScreen.LOGIN, controller.state.screen)
+        assertNull(controller.state.selectedProject)
+        assertNull(controller.state.workSession)
+        assertEquals(FormDrafts(), controller.state.drafts)
+    }
+
+    @Test
     fun completesLoginProjectPickupAndParkingLoop() {
         val controller = MvpController(InMemoryBlocksRepository())
         controller.login("development-token")
@@ -100,6 +117,7 @@ class MvpControllerTest {
         assertEquals(listOf("tenant-a"), drafts.clearedTenants)
         assertEquals(FormDrafts(), drafts.load("tenant-a"))
         assertTrue(controller.state.drafts.pendingMutations.isEmpty())
+        assertEquals(listOf("tenant-a"), repository.clearedLocalTenants)
     }
 
     @Test

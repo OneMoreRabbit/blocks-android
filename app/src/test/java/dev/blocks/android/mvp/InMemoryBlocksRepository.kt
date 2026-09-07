@@ -19,6 +19,7 @@ class InMemoryBlocksRepository(
     var resumeFailure: RuntimeException? = null
     var currentOverride: Reentry? = null
     var currentCalls = 0
+    val clearedLocalTenants = mutableListOf<String>()
 
     override fun login(identityToken: String): Session {
         require(identityToken.isNotBlank())
@@ -117,6 +118,10 @@ class InMemoryBlocksRepository(
 
     fun setReentry(value: Reentry) {
         reentry = value
+    }
+
+    override fun clearLocalState(session: Session) {
+        clearedLocalTenants += session.tenantId
     }
 
     private fun transition(workSession: WorkSession?, parking: ParkingRecord?): Reentry {

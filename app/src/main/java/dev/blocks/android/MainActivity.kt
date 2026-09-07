@@ -24,7 +24,9 @@ import dev.blocks.android.mvp.ParkingDraft
 import dev.blocks.android.mvp.PickupDraft
 import dev.blocks.android.mvp.WorkSessionState
 import dev.blocks.android.state.AndroidEncryptedDraftStore
+import dev.blocks.android.state.AndroidEncryptedSyncStateStore
 import dev.blocks.android.state.SessionContinuityStore
+import dev.blocks.android.sync.DurableBlocksRepository
 import java.net.URI
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -35,10 +37,16 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 class MainActivity : Activity() {
+    private val draftStore by lazy { AndroidEncryptedDraftStore(this) }
+    private val syncStore by lazy { AndroidEncryptedSyncStateStore(this) }
     private val controller by lazy {
         MvpController(
-            ServiceBlocksRepository(BlocksApiClient(URI(BuildConfig.BLOCKS_API_BASE_URL))),
-            AndroidEncryptedDraftStore(this),
+            DurableBlocksRepository(
+                ServiceBlocksRepository(BlocksApiClient(URI(BuildConfig.BLOCKS_API_BASE_URL))),
+                draftStore,
+                syncStore,
+            ),
+            draftStore,
         )
     }
     private val googleIdentity by lazy { GoogleIdentityClient(BuildConfig.BLOCKS_GOOGLE_SERVER_CLIENT_ID) }
@@ -73,11 +81,24 @@ class MainActivity : Activity() {
                 ),
             )
         }
+        controller.state.syncStatus.message?.let {
+            content.addView(label(it, 14f, Color.rgb(53, 104, 89)))
+        }
         when (controller.state.screen) {
             MvpScreen.LOGIN -> renderLogin()
             MvpScreen.PROJECTS -> renderProjects()
             MvpScreen.PICKUP -> renderPickup()
             MvpScreen.PARKING -> renderParking()
+        }
+        if (controller.state.screen != MvpScreen.LOGIN) {
+            if (controller.state.syncStatus.reconciliationRequired) {
+                content.addView(button("Accept latest state and keep my draft") {
+                    runRepositoryAction { controller.acceptAuthoritativeState() }
+                })
+            }
+            content.addView(button("Sync saved changes") {
+                runRepositoryAction { controller.synchronize() }
+            })
         }
     }
 
@@ -271,7 +292,8 @@ class MainActivity : Activity() {
             } catch (_: CancellationException) {
                 return@launch
             } catch (error: Exception) {
-                controller.reportError(error.message ?: "Sign-in failed. Try again.")
+                val membershipRevoked = controller.reportRepositoryError(error)
+                if (membershipRevoked) continuity.shouldRestore = false
             }
             render()
         }
@@ -296,7 +318,9 @@ class MainActivity : Activity() {
         uiScope.launch {
             continuity.shouldRestore = false
             runCatching { googleIdentity.clear(this@MainActivity) }
-            controller.logout()
+            runCatching { withContext(Dispatchers.IO) { controller.logout() } }.onFailure {
+                controller.reportError("Sign-out could not finish clearing local data. Try again.")
+            }
             render()
         }
     }
@@ -306,7 +330,8 @@ class MainActivity : Activity() {
             try {
                 withContext(Dispatchers.IO) { action() }
             } catch (error: Exception) {
-                controller.reportError(error.message ?: "Blocks could not complete that request.")
+                val membershipRevoked = controller.reportRepositoryError(error)
+                if (membershipRevoked) continuity.shouldRestore = false
             }
             render()
         }

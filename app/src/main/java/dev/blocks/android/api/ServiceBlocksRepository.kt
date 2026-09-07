@@ -6,6 +6,7 @@ import dev.blocks.android.api.generated.model.CloseOnExistingContinuation
 import dev.blocks.android.api.generated.model.CloseOut
 import dev.blocks.android.api.generated.model.CloseWithContinuation
 import dev.blocks.android.api.generated.model.CloseWithOutcome
+import dev.blocks.android.api.generated.model.ChangesOut
 import dev.blocks.android.api.generated.model.ParkIn
 import dev.blocks.android.api.generated.model.ParkOut
 import dev.blocks.android.api.generated.model.ParkingOut
@@ -17,6 +18,8 @@ import dev.blocks.android.api.generated.model.SessionOut
 import dev.blocks.android.api.generated.model.TransitionOut
 import dev.blocks.android.api.generated.model.WorkSessionOut
 import dev.blocks.android.mvp.BlocksRepository
+import dev.blocks.android.mvp.ChangeEvent
+import dev.blocks.android.mvp.ChangePage
 import dev.blocks.android.mvp.OutcomeTier
 import dev.blocks.android.mvp.ParkingRecord
 import dev.blocks.android.mvp.PickupRequest
@@ -183,6 +186,29 @@ class ServiceBlocksRepository(
             idempotencyKey,
         )
         return current(session)
+    }
+
+    override fun changes(session: Session, cursor: String?, limit: Int): ChangePage {
+        val response = json.fromJson(
+            client.changes(session.identityToken, session.tenantId, cursor, limit).successBody(),
+            ChangesOut::class.java,
+        )
+        return ChangePage(
+            events = response.events.map { event ->
+                check(event.tenantId.toString() == session.tenantId) {
+                    "Service returned a change from another tenant"
+                }
+                ChangeEvent(
+                    eventId = event.eventId,
+                    eventType = event.eventType,
+                    eventVersion = event.eventVersion,
+                    tenantId = event.tenantId.toString(),
+                    payload = event.payload.mapValues { it.value },
+                )
+            },
+            nextCursor = response.nextSince,
+            hasMore = response.hasMore,
+        )
     }
 
     private fun toProject(project: ProjectOut, expectedTenantId: String): Project {

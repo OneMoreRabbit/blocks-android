@@ -133,4 +133,13 @@ interface BlocksRepository {
         outcomeTier: OutcomeTier,
         idempotencyKey: String,
     ): Reentry
+
+    fun changes(session: Session, cursor: String?, limit: Int = 100): ChangePage =
+        ChangePage(emptyList(), cursor, false)
+
+    fun synchronize(session: Session): SyncResult = SyncResult(current(session))
+
+    fun resolveReconciliation(session: Session): SyncResult = synchronize(session)
+
+    fun clearLocalState(session: Session) = Unit
 }
