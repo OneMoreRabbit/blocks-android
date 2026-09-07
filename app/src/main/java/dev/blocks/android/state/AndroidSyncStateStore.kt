@@ -473,7 +473,11 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
     private class TenantDatabaseHelper(context: Context, name: String) :
         SQLiteOpenHelper(context, name, null, DATABASE_VERSION) {
         override fun onConfigure(database: SQLiteDatabase) {
-            database.execSQL("PRAGMA secure_delete=ON")
+            database.rawQuery("PRAGMA secure_delete=ON", null).use { cursor ->
+                check(cursor.moveToFirst() && cursor.getInt(0) == 1) {
+                    "Could not enable secure SQLite deletion"
+                }
+            }
         }
 
         override fun onCreate(database: SQLiteDatabase) {
