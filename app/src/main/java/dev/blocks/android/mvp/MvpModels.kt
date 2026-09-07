@@ -85,6 +85,8 @@ data class FormDrafts(
     val projectName: String = "",
     val pickups: Map<String, PickupDraft> = emptyMap(),
     val parking: ParkingDraft = ParkingDraft(),
+    val projectNotes: Map<String, String> = emptyMap(),
+    val projectParking: Map<String, ParkingDraft> = emptyMap(),
     val pendingMutations: Map<String, PendingMutation> = emptyMap(),
 )
 

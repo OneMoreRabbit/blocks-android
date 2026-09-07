@@ -3,8 +3,10 @@ import org.gradle.api.DefaultTask
 import org.gradle.api.file.DirectoryProperty
 import org.gradle.api.tasks.CacheableTask
 import org.gradle.api.tasks.InputDirectory
+import org.gradle.api.tasks.Input
 import org.gradle.api.tasks.PathSensitive
 import org.gradle.api.tasks.PathSensitivity
+import org.gradle.api.provider.Property
 import org.gradle.api.tasks.TaskAction
 import org.openapitools.generator.gradle.plugin.tasks.GenerateTask
 
@@ -14,11 +16,16 @@ abstract class VerifyContractArtifacts : DefaultTask() {
     @get:PathSensitive(PathSensitivity.RELATIVE)
     abstract val contractDirectory: DirectoryProperty
 
+    @get:Input
+    abstract val expectedArtifactCount: Property<Int>
+
     @TaskAction
     fun verifyArtifacts() {
         val directory = contractDirectory.get()
         val entries = directory.file("SHA256SUMS").asFile.readLines().filter(String::isNotBlank)
-        check(entries.size == 10) { "Expected 10 Service API contract artifacts, got ${entries.size}" }
+        check(entries.size == expectedArtifactCount.get()) {
+            "Expected ${expectedArtifactCount.get()} Service API contract artifacts, got ${entries.size}"
+        }
         val declaredNames = entries.map { it.split(Regex("\\s+"), limit = 2)[1] }.toSet()
         val deliveredNames = directory.asFile.listFiles()
             .orEmpty()
@@ -48,21 +55,32 @@ plugins {
 }
 
 val serviceApiContractDir = rootProject.layout.projectDirectory.dir("contracts/blocks-service-api")
-val serviceApiSpec = serviceApiContractDir.file("blocks-service-api-openapi-v0_2.json")
-val generatedServiceApi = layout.buildDirectory.dir("generated/openapi")
+val serviceApiSpec = serviceApiContractDir.file("blocks-service-api-openapi-v0_3.json")
+val legacyServiceApiContractDir = rootProject.layout.projectDirectory.dir("contracts/blocks-service-api-legacy-v0_2")
+val legacyServiceApiSpec = legacyServiceApiContractDir.file("blocks-service-api-openapi-v0_2.json")
+val generatedServiceApi = layout.buildDirectory.dir("generated/openapi-v0_3")
+val generatedLegacyServiceApi = layout.buildDirectory.dir("generated/openapi-v0_2")
 
 val verifyServiceApiContract by tasks.registering(VerifyContractArtifacts::class) {
     group = "verification"
-    description = "Verifies the Atlas-delivered Service API 0.2 artifacts."
+    description = "Verifies the Atlas-delivered Service API 0.3 artifacts."
     contractDirectory.set(serviceApiContractDir)
+    expectedArtifactCount.set(15)
+}
+
+val verifyLegacyServiceApiContract by tasks.registering(VerifyContractArtifacts::class) {
+    group = "verification"
+    description = "Verifies the frozen Service API 0.2 compatibility artifacts."
+    contractDirectory.set(legacyServiceApiContractDir)
+    expectedArtifactCount.set(10)
 }
 
 openApiGenerate {
     generatorName.set("kotlin")
     inputSpec.set(serviceApiSpec.asFile.absolutePath)
     outputDir.set(generatedServiceApi.get().asFile.absolutePath)
-    modelPackage.set("dev.blocks.android.api.generated.model")
-    packageName.set("dev.blocks.android.api.generated")
+    modelPackage.set("dev.blocks.android.api.generated.v03.model")
+    packageName.set("dev.blocks.android.api.generated.v03")
     validateSpec.set(true)
     configOptions.set(
         mapOf(
@@ -85,6 +103,35 @@ openApiGenerate {
     )
 }
 
+val openApiGenerateLegacyV02 by tasks.registering(GenerateTask::class) {
+    generatorName.set("kotlin")
+    inputSpec.set(legacyServiceApiSpec.asFile.absolutePath)
+    outputDir.set(generatedLegacyServiceApi.get().asFile.absolutePath)
+    modelPackage.set("dev.blocks.android.api.generated.v02.model")
+    packageName.set("dev.blocks.android.api.generated.v02")
+    validateSpec.set(true)
+    configOptions.set(
+        mapOf(
+            "dateLibrary" to "string",
+            "enumPropertyNaming" to "UPPERCASE",
+            "library" to "jvm-okhttp4",
+            "serializationLibrary" to "gson",
+            "sourceFolder" to "src/main/kotlin",
+        ),
+    )
+    globalProperties.set(
+        mapOf(
+            "apiDocs" to "false",
+            "apis" to "false",
+            "modelDocs" to "false",
+            "models" to "",
+            "modelTests" to "false",
+            "supportingFiles" to "false",
+        ),
+    )
+    dependsOn(verifyLegacyServiceApiContract)
+}
+
 android {
     namespace = "dev.blocks.android"
     compileSdk = 37
@@ -103,7 +150,7 @@ android {
             "BLOCKS_GOOGLE_SERVER_CLIENT_ID",
             "\"12259488358-ogmpp0cg1a8v1pbvkoivo9lgr94n0kb9.apps.googleusercontent.com\"",
         )
-        buildConfigField("String", "BLOCKS_SERVICE_API_VERSION", "\"0.2\"")
+        buildConfigField("String", "BLOCKS_SERVICE_API_VERSION", "\"0.3\"")
     }
 
     buildTypes {
@@ -144,6 +191,10 @@ val openApiGenerateTask = tasks.named<GenerateTask>("openApiGenerate")
 androidComponents.onVariants { variant ->
     variant.sources.kotlin?.addGeneratedSourceDirectory(
         openApiGenerateTask,
+        GenerateTask::outputDir,
+    )
+    variant.sources.kotlin?.addGeneratedSourceDirectory(
+        openApiGenerateLegacyV02,
         GenerateTask::outputDir,
     )
 }

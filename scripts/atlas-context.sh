@@ -12,10 +12,7 @@ cd "$ATLAS_REPO_ROOT"
 
 # The SessionStart payload arrives on stdin as JSON carrying "source". Read it only when
 # stdin is not a terminal, so a manual `sh scripts/atlas-context.sh` never blocks on cat.
-ATLAS_SRC=""
-if [ ! -t 0 ]; then
-  ATLAS_SRC=$(cat 2>/dev/null | sed -n 's/.*"source"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p' | head -1)
-fi
+ATLAS_SRC=$(atlas_hook_payload | sed -n 's/.*"source"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p' | head -1)
 
 # ---- the seat, discovered from the filesystem (method 1.21) ------------------------
 # One SEAT holding N wired repos gets ONE briefing: shared vault content once, then a
@@ -132,6 +129,18 @@ case "$ATLAS_SRC" in
 > a half-remembered task until you have reconciled it against what follows."
     OUT=$(printf '%s\n\n%s' "$REORIENT" "$OUT") ;;
 esac
+
+# Record which vault commit this briefing was compiled from, for every seat member —
+# the Stop guard compares it against the remote at each turn end (alignment gate, 1.24):
+# an arch push then reaches a running seat at the end of its CURRENT turn, not at its
+# next compaction.
+FULLSHA=$(git -C "$SRC" rev-parse HEAD 2>/dev/null || true)
+if [ -n "$FULLSHA" ]; then
+  for _r in $SEAT_ROOTS; do
+    [ -d "$_r/.git/info" ] || mkdir -p "$_r/.git/info" 2>/dev/null || continue
+    printf '%s\n' "$FULLSHA" > "$_r/.git/info/atlas-compiled-sha" 2>/dev/null || true
+  done
+fi
 
 # Report the size of what we inject. Growth here is a defect in the io-graph,
 # not a fact of life — the retrieval invariant is only worth anything if measured.

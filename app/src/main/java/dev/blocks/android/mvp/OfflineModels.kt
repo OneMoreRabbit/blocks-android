@@ -1,5 +1,7 @@
 package dev.blocks.android.mvp
 
+import dev.blocks.android.project.ProjectCacheState
+
 data class ChangeEvent(
     val eventId: String,
     val eventType: String,
@@ -51,6 +53,7 @@ data class TenantSyncState(
     val changeCursor: String? = null,
     val retiredIdempotencyKeys: List<String> = emptyList(),
     val notice: String? = null,
+    val projectCache: ProjectCacheState = ProjectCacheState(),
 )
 
 data class SyncStatus(

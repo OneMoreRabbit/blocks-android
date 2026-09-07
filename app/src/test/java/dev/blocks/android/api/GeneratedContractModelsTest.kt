@@ -1,9 +1,11 @@
 package dev.blocks.android.api
 
 import com.google.gson.Gson
-import dev.blocks.android.api.generated.model.CloseWithContinuation
-import dev.blocks.android.api.generated.model.EventEnvelopeOut
-import dev.blocks.android.api.generated.model.ReentryOut
+import dev.blocks.android.api.generated.v02.model.CloseWithContinuation
+import dev.blocks.android.api.generated.v02.model.EventEnvelopeOut
+import dev.blocks.android.api.generated.v02.model.ReentryOut
+import dev.blocks.android.api.generated.v03.model.ProjectPageOut
+import dev.blocks.android.api.generated.v03.model.ProjectParkIn
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -80,5 +82,51 @@ class GeneratedContractModelsTest {
         assertEquals("future.event", event.eventType)
         assertEquals("value", event.payload["future_id"])
         assertNull(event.payload["not_present"])
+    }
+
+    @Test
+    fun decodesTheGeneratedApi03ProjectPageAsOneRead() {
+        val page = json.fromJson(
+            """
+            {
+              "project": {
+                "archived_at": null,
+                "created_at": "2026-09-07T10:00:00Z",
+                "id": "00000000-0000-0000-0000-000000000003",
+                "name": "Project",
+                "row_version": 4,
+                "status": "active",
+                "tenant_id": "00000000-0000-0000-0000-000000000002",
+                "updated_at": "2026-09-07T10:00:00Z"
+              },
+              "notes": {
+                "body": "Saved notes",
+                "project_id": "00000000-0000-0000-0000-000000000003",
+                "row_version": 2,
+                "updated_at": "2026-09-07T10:00:00Z"
+              },
+              "newest_parking": null
+            }
+            """.trimIndent(),
+            ProjectPageOut::class.java,
+        )
+
+        assertEquals("Project", page.project.name)
+        assertEquals("Saved notes", page.notes.body)
+        assertNull(page.newestParking)
+    }
+
+    @Test
+    fun generatedApi03ParkingRequestContainsExactlyThreeAnswersByDefault() {
+        val request = ProjectParkIn(
+            whereIAm = "At the boundary",
+            nextPhysicalAction = "Open the test",
+            mustNotForget = "Keep the retry key",
+        )
+
+        assertEquals(
+            setOf("where_i_am", "next_physical_action", "must_not_forget"),
+            JSONObject(json.toJson(request)).keys().asSequence().toSet(),
+        )
     }
 }

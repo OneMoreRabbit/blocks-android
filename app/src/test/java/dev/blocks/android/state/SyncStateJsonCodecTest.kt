@@ -8,6 +8,11 @@ import dev.blocks.android.mvp.QueuedCommand
 import dev.blocks.android.mvp.TenantSyncState
 import dev.blocks.android.mvp.WorkSession
 import dev.blocks.android.mvp.WorkSessionState
+import dev.blocks.android.project.ProjectCacheState
+import dev.blocks.android.project.ProjectLifecycle
+import dev.blocks.android.project.ProjectMutation
+import dev.blocks.android.project.ProjectMutationType
+import dev.blocks.android.project.ProjectSummary
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -45,7 +50,7 @@ class SyncStateStorageCodecTest {
         val rows = SyncStateRowCodec().encode(state)
         val decoded = SyncStateRowCodec().decode(rows)
 
-        assertEquals(1, rows.schemaVersion)
+        assertEquals(2, rows.schemaVersion)
         assertEquals(1, rows.projects.size)
         assertEquals(1, rows.commands.size)
         assertEquals(1, rows.retiredIdempotencyKeys.size)
@@ -107,10 +112,68 @@ class SyncStateStorageCodecTest {
 
     @Test
     fun rejectsAnUnknownDatabaseRowSchemaWithoutDiscardingIt() {
-        val rows = SyncStateRowCodec().encode(TenantSyncState()).copy(schemaVersion = 2)
+        val rows = SyncStateRowCodec().encode(TenantSyncState()).copy(schemaVersion = 3)
 
         val error = runCatching { SyncStateRowCodec().decode(rows) }.exceptionOrNull()
 
         assertTrue(error is IllegalArgumentException)
+    }
+
+    @Test
+    fun roundTripsApi03CacheAndQueueBesideUnchangedLegacyOperations() {
+        val legacy = QueuedCommand(
+            operation = OfflineOperation.PICKUP,
+            targetId = "legacy-project",
+            projectId = "legacy-project",
+            idempotencyKey = "legacy-key",
+            pickup = dev.blocks.android.mvp.PickupRequest("legacy-project", "Legacy core"),
+        )
+        val project = ProjectSummary(
+            id = "project-3",
+            tenantId = "tenant-a",
+            name = "New project",
+            lifecycle = ProjectLifecycle.ACTIVE,
+            rowVersion = 2,
+            createdAt = "2026-09-07T10:00:00Z",
+            updatedAt = "2026-09-07T10:00:00Z",
+        )
+        val command = ProjectMutation(
+            operationId = "notes-operation",
+            type = ProjectMutationType.SAVE_NOTES,
+            targetId = project.id,
+            ifMatch = 4,
+            notesBody = "Unsent notes",
+        )
+        val state = TenantSyncState(
+            commands = listOf(legacy),
+            changeCursor = "71",
+            projectCache = ProjectCacheState(
+                activeProjects = listOf(project),
+                activeProjectsLoaded = true,
+                commands = listOf(command),
+            ),
+        )
+
+        assertEquals(state, SyncStateRowCodec().decode(SyncStateRowCodec().encode(state)))
+    }
+
+    @Test
+    fun pilotSchemaMigrationPreservesLegacyQueueAndCursorWithoutImportingNewRows() {
+        val command = QueuedCommand(
+            operation = OfflineOperation.PICKUP,
+            targetId = "legacy-project",
+            projectId = "legacy-project",
+            idempotencyKey = "pilot-original-key",
+            pickup = dev.blocks.android.mvp.PickupRequest("legacy-project", "Legacy core"),
+        )
+        val currentRows = SyncStateRowCodec().encode(
+            TenantSyncState(commands = listOf(command), changeCursor = "39"),
+        )
+
+        val migrated = SyncStateRowCodec().decode(currentRows.copy(schemaVersion = 1))
+
+        assertEquals("pilot-original-key", migrated.commands.single().idempotencyKey)
+        assertEquals("39", migrated.changeCursor)
+        assertEquals(ProjectCacheState(), migrated.projectCache)
     }
 }
