@@ -13,6 +13,7 @@ import dev.blocks.android.project.ProjectLifecycle
 import dev.blocks.android.project.ProjectMutation
 import dev.blocks.android.project.ProjectMutationType
 import dev.blocks.android.project.ProjectSummary
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -50,7 +51,7 @@ class SyncStateStorageCodecTest {
         val rows = SyncStateRowCodec().encode(state)
         val decoded = SyncStateRowCodec().decode(rows)
 
-        assertEquals(2, rows.schemaVersion)
+        assertEquals(3, rows.schemaVersion)
         assertEquals(1, rows.projects.size)
         assertEquals(1, rows.commands.size)
         assertEquals(1, rows.retiredIdempotencyKeys.size)
@@ -112,7 +113,7 @@ class SyncStateStorageCodecTest {
 
     @Test
     fun rejectsAnUnknownDatabaseRowSchemaWithoutDiscardingIt() {
-        val rows = SyncStateRowCodec().encode(TenantSyncState()).copy(schemaVersion = 3)
+        val rows = SyncStateRowCodec().encode(TenantSyncState()).copy(schemaVersion = 4)
 
         val error = runCatching { SyncStateRowCodec().decode(rows) }.exceptionOrNull()
 
@@ -143,6 +144,7 @@ class SyncStateStorageCodecTest {
             targetId = project.id,
             ifMatch = 4,
             notesBody = "Unsent notes",
+            authoritativeStateConfirmed = true,
         )
         val state = TenantSyncState(
             commands = listOf(legacy),
@@ -155,6 +157,32 @@ class SyncStateStorageCodecTest {
         )
 
         assertEquals(state, SyncStateRowCodec().decode(SyncStateRowCodec().encode(state)))
+    }
+
+    @Test
+    fun schemaTwoConflictMigratesFailClosedUntilAuthoritativeStateIsRefreshed() {
+        val command = ProjectMutation(
+            operationId = "old-conflict",
+            type = ProjectMutationType.SAVE_NOTES,
+            targetId = "project-3",
+            ifMatch = 4,
+            notesBody = "Retained notes",
+            status = dev.blocks.android.project.ProjectMutationStatus.REQUIRES_RECONCILIATION,
+            authoritativeStateConfirmed = true,
+        )
+        val current = SyncStateRowCodec().encode(
+            TenantSyncState(projectCache = ProjectCacheState(commands = listOf(command))),
+        )
+        val schemaTwo = current.copy(
+            schemaVersion = 2,
+            projectCommands = current.projectCommands.map {
+                JSONObject(it).apply { remove("authoritativeStateConfirmed") }.toString()
+            },
+        )
+
+        val migrated = SyncStateRowCodec().decode(schemaTwo)
+
+        assertTrue(!migrated.projectCache.commands.single().authoritativeStateConfirmed)
     }
 
     @Test

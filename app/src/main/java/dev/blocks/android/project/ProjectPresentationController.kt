@@ -1,6 +1,7 @@
 package dev.blocks.android.project
 
 import dev.blocks.android.api.ServiceException
+import dev.blocks.android.auth.IdentityBindingMismatchException
 import dev.blocks.android.mvp.DraftStore
 import dev.blocks.android.mvp.FormDrafts
 import dev.blocks.android.mvp.MembershipRevokedException
@@ -30,7 +31,9 @@ data class ProjectPresentationState(
     val showParkingForm: Boolean = false,
     val syncing: Boolean = false,
     val reconciliationRequired: Boolean = false,
+    val conflict: ProjectConflict? = null,
     val authenticationRequired: Boolean = false,
+    val sessionConfirmationRequired: Boolean = false,
     val status: String? = null,
     val error: String? = null,
 )
@@ -51,7 +54,7 @@ class ProjectPresentationController(
         get() = session != null
 
     @Synchronized
-    fun login(identityToken: String) {
+    fun login(identityToken: String): Session {
         require(identityToken.isNotBlank()) { "Google did not return an identity credential." }
         val authenticated = authenticator.login(identityToken)
         workspace.activate(authenticated)
@@ -61,6 +64,7 @@ class ProjectPresentationController(
             state.copy(
                 drafts = draftStore.load(authenticated.tenantId),
                 authenticationRequired = false,
+                sessionConfirmationRequired = false,
                 error = null,
             )
         } else {
@@ -70,6 +74,56 @@ class ProjectPresentationController(
             )
         }
         applyResult(workspace.snapshot(authenticated), synced = false)
+        return authenticated
+    }
+
+    /** Opens only the cache already bound to the restored Google identity. */
+    @Synchronized
+    fun restoreCached(tenantId: String) {
+        require(tenantId.isNotBlank())
+        val cachedSession = Session(tenantId)
+        workspace.activate(cachedSession)
+        session = cachedSession
+        state = ProjectPresentationState(
+            screen = ProjectScreen.DASHBOARD,
+            drafts = draftStore.load(tenantId),
+            sessionConfirmationRequired = true,
+        )
+        applyResult(workspace.snapshot(cachedSession), synced = false)
+        state = state.copy(
+            sessionConfirmationRequired = true,
+            status = "Showing saved projects. Reconnecting in the background.",
+        )
+    }
+
+    /** Exchanges a fresh Google credential without exposing a different tenant's cache. */
+    @Synchronized
+    fun confirmSession(identityToken: String): Session {
+        require(identityToken.isNotBlank()) { "Google did not return an identity credential." }
+        val previous = activeSession()
+        val authenticated = authenticator.login(identityToken)
+        if (authenticated.tenantId != previous.tenantId) {
+            session = null
+            state = ProjectPresentationState()
+            workspace.clearLocalState(previous)
+            throw IdentityBindingMismatchException()
+        }
+        session = authenticated
+        state = state.copy(
+            authenticationRequired = false,
+            sessionConfirmationRequired = false,
+            error = null,
+        )
+        return authenticated
+    }
+
+    @Synchronized
+    fun rejectCachedBinding(tenantId: String) {
+        val cached = session?.takeIf { it.tenantId == tenantId } ?: Session(tenantId)
+        session = null
+        state = ProjectPresentationState()
+        workspace.activate(cached)
+        workspace.clearLocalState(cached)
     }
 
     @Synchronized
@@ -82,7 +136,12 @@ class ProjectPresentationController(
     @Synchronized
     fun openProject(projectId: String) {
         val active = activeSession()
-        val page = workspace.projectPage(active, projectId)
+        val page = if (state.sessionConfirmationRequired) {
+            workspace.snapshot(active).cache.pages.firstOrNull { it.project.id == projectId }
+                ?: throw IllegalStateException("This project is not available in the saved offline data.")
+        } else {
+            workspace.projectPage(active, projectId)
+        }
         val drafts = draftStore.load(active.tenantId)
         state = state.copy(
             screen = ProjectScreen.PROJECT,
@@ -108,7 +167,12 @@ class ProjectPresentationController(
     @Synchronized
     fun loadArchive() {
         val active = activeSession()
-        state = state.copy(archivedProjects = workspace.archivedProjects(active), error = null)
+        val archived = if (state.sessionConfirmationRequired) {
+            workspace.snapshot(active).cache.archivedProjects
+        } else {
+            workspace.archivedProjects(active)
+        }
+        state = state.copy(archivedProjects = archived, error = null)
     }
 
     @Synchronized
@@ -157,6 +221,22 @@ class ProjectPresentationController(
         applyResult(
             workspace.queueCreateProject(activeSession(), name, operation.idempotencyKey),
         )
+    }
+
+    @Synchronized
+    fun discardCreateProjectDraft() {
+        val active = activeSession()
+        val drafts = draftStore.load(active.tenantId)
+        drafts.pendingMutations[CREATE_SLOT]?.let { pending ->
+            applyResult(workspace.discardPendingOperation(active, pending.idempotencyKey))
+        }
+        val current = draftStore.load(active.tenantId)
+        val cleared = current.copy(
+            projectName = "",
+            pendingMutations = current.pendingMutations - CREATE_SLOT,
+        )
+        draftStore.save(active.tenantId, cleared)
+        state = state.copy(drafts = cleared, invalidField = null, error = null)
     }
 
     @Synchronized
@@ -271,10 +351,24 @@ class ProjectPresentationController(
     }
 
     @Synchronized
+    fun discardConflict() {
+        val conflict = requireNotNull(state.conflict) { "No saved change needs resolution" }
+        applyResult(workspace.discardConflict(activeSession(), conflict.operationId))
+    }
+
+    @Synchronized
+    fun retryConflict() {
+        val conflict = requireNotNull(state.conflict) { "No saved change needs resolution" }
+        require(conflict.canRetry) { "This saved change cannot be retried against a newer version" }
+        applyResult(workspace.retryConflict(activeSession(), conflict.operationId, newOperationId()))
+    }
+
+    @Synchronized
     fun logout() {
-        session?.let(workspace::clearLocalState)
+        val active = session
         session = null
         state = ProjectPresentationState()
+        active?.let(workspace::clearLocalState)
     }
 
     @Synchronized
@@ -332,6 +426,7 @@ class ProjectPresentationController(
             invalidField = null,
             syncing = false,
             reconciliationRequired = result.reconciliationRequired,
+            conflict = result.conflict,
             authenticationRequired = false,
             status = status,
             error = null,

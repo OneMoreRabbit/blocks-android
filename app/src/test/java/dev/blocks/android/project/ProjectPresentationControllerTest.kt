@@ -3,6 +3,7 @@ package dev.blocks.android.project
 import dev.blocks.android.api.ApiError
 import dev.blocks.android.api.ApiErrorCode
 import dev.blocks.android.api.ServiceException
+import dev.blocks.android.auth.IdentityBindingMismatchException
 import dev.blocks.android.mvp.DraftStore
 import dev.blocks.android.mvp.FormDrafts
 import dev.blocks.android.mvp.ParkingDraft
@@ -25,6 +26,43 @@ class ProjectPresentationControllerTest {
         assertEquals(listOf("Active project"), controller.state.activeProjects.map { it.name })
         assertEquals(0, workspace.syncCalls)
         assertTrue(controller.isAuthenticated)
+    }
+
+    @Test
+    fun identityBoundRestoreOpensCachedDashboardWithoutCallingOnlineAuthenticator() {
+        val drafts = MemoryDrafts()
+        val workspace = FakeWorkspace().apply { draftStore = drafts }
+        val controller = ProjectPresentationController(
+            authenticator = SessionAuthenticator { error("online session exchange must not run first") },
+            workspace = workspace,
+            draftStore = drafts,
+        )
+
+        controller.restoreCached(TENANT_ID)
+        controller.openProject(PROJECT_ID)
+
+        assertEquals(ProjectScreen.PROJECT, controller.state.screen)
+        assertTrue(controller.state.sessionConfirmationRequired)
+        assertEquals(0, workspace.pageCalls)
+    }
+
+    @Test
+    fun onlineConfirmationWithADifferentTenantErasesTheBoundTenantAndFailsClosed() {
+        val drafts = MemoryDrafts()
+        val workspace = FakeWorkspace().apply { draftStore = drafts }
+        val controller = ProjectPresentationController(
+            authenticator = SessionAuthenticator { Session("different-tenant", it) },
+            workspace = workspace,
+            draftStore = drafts,
+        )
+        controller.restoreCached(TENANT_ID)
+
+        val error = runCatching { controller.confirmSession("fresh-google-token") }.exceptionOrNull()
+
+        assertTrue(error is IdentityBindingMismatchException)
+        assertEquals(listOf(TENANT_ID), workspace.clearedTenants)
+        assertFalse(controller.isAuthenticated)
+        assertEquals(ProjectScreen.LOGIN, controller.state.screen)
     }
 
     @Test
@@ -86,6 +124,22 @@ class ProjectPresentationControllerTest {
         recreated.synchronize()
         assertEquals("", recreated.state.drafts.projectName)
         assertTrue(recreated.state.drafts.pendingMutations.isEmpty())
+    }
+
+    @Test
+    fun explicitCreateDraftDiscardRemovesItsQueuedOperationAndDraft() {
+        val drafts = MemoryDrafts()
+        val workspace = FakeWorkspace().apply { offline = true }
+        val controller = controller(workspace, drafts, ids = ArrayDeque(listOf("create-operation")))
+        controller.login("identity-token")
+        controller.createProject("Discard me")
+
+        controller.discardCreateProjectDraft()
+
+        assertEquals("", controller.state.drafts.projectName)
+        assertTrue(controller.state.drafts.pendingMutations.isEmpty())
+        assertTrue(workspace.cache.commands.isEmpty())
+        assertTrue("create-operation" in workspace.cache.retiredOperationIds)
     }
 
     @Test
@@ -230,6 +284,7 @@ class ProjectPresentationControllerTest {
         val operationIds = mutableListOf<String>()
         val clearedTenants = mutableListOf<String>()
         var lastSupersedesId: String? = "not-called"
+        val conflictRetries = mutableListOf<Pair<String, String>>()
 
         override fun activate(session: Session) = Unit
         override fun snapshot(session: Session) = result()
@@ -312,6 +367,41 @@ class ProjectPresentationControllerTest {
             return queue("parking", operationId, ProjectMutationType.ADD_PARKING, projectId, parking = parking)
         }
 
+        override fun discardConflict(session: Session, operationId: String): BackgroundSyncResult {
+            val command = cache.commands.single { it.operationId == operationId }
+            acknowledge(command)
+            return result()
+        }
+
+        override fun retryConflict(
+            session: Session,
+            operationId: String,
+            newOperationId: String,
+        ): BackgroundSyncResult {
+            cache.commands.single { it.operationId == operationId }
+            conflictRetries += operationId to newOperationId
+            cache = cache.copy(
+                commands = cache.commands.map {
+                    if (it.operationId == operationId) {
+                        it.copy(
+                            operationId = newOperationId,
+                            idempotencyKey = it.idempotencyKey?.let { newOperationId },
+                            status = ProjectMutationStatus.PENDING,
+                        )
+                    } else {
+                        it
+                    }
+                },
+                retiredOperationIds = cache.retiredOperationIds + operationId,
+            )
+            return result()
+        }
+
+        override fun discardPendingOperation(session: Session, operationId: String): BackgroundSyncResult {
+            cache.commands.firstOrNull { it.operationId == operationId }?.let(::acknowledge)
+            return result()
+        }
+
         override fun clearLocalState(session: Session) {
             clearedTenants += session.tenantId
             draftStore.clear(session.tenantId)
@@ -386,15 +476,29 @@ class ProjectPresentationControllerTest {
             )
         }
 
-        private fun result() = BackgroundSyncResult(
+        private fun result(): BackgroundSyncResult {
+            val conflicting = cache.commands.firstOrNull {
+                it.status == ProjectMutationStatus.REQUIRES_RECONCILIATION
+            }
+            return BackgroundSyncResult(
             cache,
             cursor = null,
             pendingLegacyOperations = 0,
             pendingProjectOperations = cache.commands.size,
-            reconciliationRequired = cache.commands.any {
-                it.status == ProjectMutationStatus.REQUIRES_RECONCILIATION
+            reconciliationRequired = conflicting != null,
+            conflict = conflicting?.let {
+                ProjectConflict(
+                    it.operationId,
+                    it.type,
+                    it.targetId,
+                    localProjectName = it.projectName,
+                    localNotes = it.notesBody,
+                    localParking = it.parking,
+                    authoritativePage = cache.pages.single(),
+                )
             },
-        )
+            )
+        }
     }
 
     companion object {

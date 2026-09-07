@@ -99,6 +99,7 @@ data class ProjectMutation(
     val status: ProjectMutationStatus = ProjectMutationStatus.PENDING,
     val deliveryUncertain: Boolean = false,
     val failureMessage: String? = null,
+    val authoritativeStateConfirmed: Boolean = false,
 )
 
 data class ProjectCacheState(
@@ -120,7 +121,26 @@ data class BackgroundSyncResult(
     val pendingLegacyOperations: Int,
     val pendingProjectOperations: Int,
     val reconciliationRequired: Boolean,
+    val conflict: ProjectConflict? = null,
 )
+
+data class ProjectConflict(
+    val operationId: String,
+    val type: ProjectMutationType,
+    val projectId: String?,
+    val localProjectName: String? = null,
+    val localNotes: String? = null,
+    val localParking: ParkingDraft? = null,
+    val authoritativePage: ProjectPage? = null,
+) {
+    val canRetry: Boolean
+        get() = type in setOf(
+            ProjectMutationType.RENAME_PROJECT,
+            ProjectMutationType.ARCHIVE_PROJECT,
+            ProjectMutationType.REOPEN_PROJECT,
+            ProjectMutationType.SAVE_NOTES,
+        ) && authoritativePage != null
+}
 
 interface ProjectService {
     fun listProjects(session: Session, lifecycle: ProjectLifecycle): List<ProjectSummary>
@@ -200,6 +220,13 @@ interface ProjectWorkspace {
         supersedesId: String? = null,
         operationId: String = newOperationIdentity(),
     ): BackgroundSyncResult
+    fun discardConflict(session: Session, operationId: String): BackgroundSyncResult
+    fun retryConflict(
+        session: Session,
+        operationId: String,
+        newOperationId: String = newOperationIdentity(),
+    ): BackgroundSyncResult
+    fun discardPendingOperation(session: Session, operationId: String): BackgroundSyncResult
     fun clearLocalState(session: Session)
 }
 

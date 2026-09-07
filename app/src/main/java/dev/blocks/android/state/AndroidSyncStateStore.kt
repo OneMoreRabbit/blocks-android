@@ -126,7 +126,7 @@ internal class SyncStateRowCodec(private val gson: Gson = Gson()) {
 
     companion object {
         const val PILOT_SCHEMA_VERSION = 1
-        const val CURRENT_SCHEMA_VERSION = 2
+        const val CURRENT_SCHEMA_VERSION = 3
     }
 }
 

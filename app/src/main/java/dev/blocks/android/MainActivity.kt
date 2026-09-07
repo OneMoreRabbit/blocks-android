@@ -22,10 +22,17 @@ import dev.blocks.android.api.ProjectApiClient
 import dev.blocks.android.api.ServiceBlocksRepository
 import dev.blocks.android.api.ServiceProjectRepository
 import dev.blocks.android.api.ServiceSessionAuthenticator
+import dev.blocks.android.auth.AcceptedIdentityBinding
+import dev.blocks.android.auth.AndroidEncryptedIdentityBindingStore
 import dev.blocks.android.auth.GoogleIdentityClient
+import dev.blocks.android.auth.GoogleIdentityProofVerifier
+import dev.blocks.android.auth.IdentityBindingMismatchException
+import dev.blocks.android.auth.IdentityBindingStore
 import dev.blocks.android.auth.IdentityProvider
+import dev.blocks.android.auth.IdentityProofVerifier
 import dev.blocks.android.mvp.ParkingDraft
 import dev.blocks.android.project.ProjectFormField
+import dev.blocks.android.project.ProjectMutationType
 import dev.blocks.android.project.ProjectPresentationController
 import dev.blocks.android.project.ProjectScreen
 import dev.blocks.android.project.ProjectSummary
@@ -49,6 +56,8 @@ internal data class ProjectAppDependencies(
     val controller: ProjectPresentationController,
     val identity: IdentityProvider,
     val continuity: SessionContinuity,
+    val identityProofVerifier: IdentityProofVerifier,
+    val identityBindingStore: IdentityBindingStore,
     val observeConnectivity: Boolean = true,
 )
 
@@ -70,6 +79,7 @@ internal object ProjectUiIds {
     const val SAVE_PARKING = 1027
     const val PROJECT_ACTIONS = 1028
     const val REAUTHENTICATE = 1029
+    const val RESOLVE_CONFLICT = 1030
 }
 
 class MainActivity : ComponentActivity() {
@@ -77,11 +87,15 @@ class MainActivity : ComponentActivity() {
     private val controller get() = dependencies.controller
     private val identity get() = dependencies.identity
     private val continuity get() = dependencies.continuity
+    private val identityProofVerifier get() = dependencies.identityProofVerifier
+    private val identityBindingStore get() = dependencies.identityBindingStore
     private val uiScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private lateinit var content: LinearLayout
     private var syncJob: Job? = null
     private var restoreProjectId: String? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    internal var activeDialog: AlertDialog? = null
+        private set
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -119,7 +133,10 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         if (controller.isAuthenticated) {
-            synchronizeAutomatically(refreshCredential = controller.state.authenticationRequired)
+            synchronizeAutomatically(
+                refreshCredential = controller.state.authenticationRequired ||
+                    controller.state.sessionConfirmationRequired,
+            )
         }
     }
 
@@ -150,6 +167,8 @@ class MainActivity : ComponentActivity() {
             controller = ProjectPresentationController(sessionAuthenticator, workspace, draftStore),
             identity = GoogleIdentityClient(BuildConfig.BLOCKS_GOOGLE_SERVER_CLIENT_ID),
             continuity = SessionContinuityStore(this),
+            identityProofVerifier = GoogleIdentityProofVerifier(BuildConfig.BLOCKS_GOOGLE_SERVER_CLIENT_ID),
+            identityBindingStore = AndroidEncryptedIdentityBindingStore(this),
         )
     }
 
@@ -161,6 +180,11 @@ class MainActivity : ComponentActivity() {
         if (controller.state.authenticationRequired) {
             content.addView(button("Reconnect Google account") { reauthenticate() }.apply {
                 id = ProjectUiIds.REAUTHENTICATE
+            })
+        }
+        controller.state.conflict?.let {
+            content.addView(button("Resolve saved change") { showConflictResolution() }.apply {
+                id = ProjectUiIds.RESOLVE_CONFLICT
             })
         }
         when (controller.state.screen) {
@@ -187,14 +211,9 @@ class MainActivity : ComponentActivity() {
             content.addView(button(project.name) { runRepositoryAction { controller.openProject(project.id) } })
         }
 
-        val name = input("Project name", controller.state.drafts.projectName) {
-            controller.updateProjectName(it)
-        }.apply { id = ProjectUiIds.PROJECT_NAME }
-        name.markInvalid(ProjectFormField.PROJECT_NAME)
-        content.addView(name)
-        content.addView(button("Create project") {
-            runRepositoryAction { controller.createProject(name.text.toString()) }
-        }.apply { id = ProjectUiIds.CREATE_PROJECT })
+        content.addView(button("Create project") { showCreateProject() }.apply {
+            id = ProjectUiIds.CREATE_PROJECT
+        })
         content.addView(button("Archive") { showArchive() }.apply { id = ProjectUiIds.OPEN_ARCHIVE })
         content.addView(button("Account") { showAccountActions() }.apply { id = ProjectUiIds.ACCOUNT })
     }
@@ -294,6 +313,37 @@ class MainActivity : ComponentActivity() {
         }, action = controller::loadArchive)
     }
 
+    private fun showCreateProject() {
+        val input = EditText(this).apply {
+            id = ProjectUiIds.PROJECT_NAME
+            hint = "Project name"
+            setText(controller.state.drafts.projectName)
+            addTextChangedListener(watcher(controller::updateProjectName))
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Create project")
+            .setView(input)
+            .setPositiveButton("Create", null)
+            .setNegativeButton("Cancel", null)
+            .setNeutralButton("Discard draft", null)
+            .create()
+        showManagedDialog(dialog)
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+            val value = input.text.toString()
+            if (value.isBlank() || value.length > 200) {
+                input.error = if (value.isBlank()) "Required" else "Maximum 200 characters"
+                input.requestFocus()
+                return@setOnClickListener
+            }
+            dialog.dismiss()
+            runRepositoryAction { controller.createProject(value) }
+        }
+        dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
+            dialog.dismiss()
+            runRepositoryAction { controller.discardCreateProjectDraft() }
+        }
+    }
+
     private fun confirmReopen(project: ProjectSummary) {
         AlertDialog.Builder(this).setTitle(project.name).setMessage("Return this project to the dashboard?")
             .setPositiveButton("Reopen") { _, _ -> runRepositoryAction { controller.reopenProject(project) } }
@@ -305,6 +355,42 @@ class MainActivity : ComponentActivity() {
             .setItems(arrayOf("Rename", "Archive")) { _, which ->
                 if (which == 0) showRename() else confirmArchive()
             }.setNegativeButton("Cancel", null).show()
+    }
+
+    private fun showConflictResolution() {
+        val conflict = controller.state.conflict ?: return
+        val page = conflict.authoritativePage
+        val local = when (conflict.type) {
+            ProjectMutationType.RENAME_PROJECT -> conflict.localProjectName.orEmpty()
+            ProjectMutationType.SAVE_NOTES -> conflict.localNotes.orEmpty()
+            ProjectMutationType.ADD_PARKING -> conflict.localParking?.let {
+                "${it.location} / ${it.nextAction} / ${it.mustNotForget}"
+            }.orEmpty()
+            ProjectMutationType.ARCHIVE_PROJECT -> "Archive project"
+            ProjectMutationType.REOPEN_PROJECT -> "Reopen project"
+            else -> "Saved change"
+        }
+        val authoritative = when (conflict.type) {
+            ProjectMutationType.SAVE_NOTES -> {
+                page?.let { "Notes version ${it.notes.rowVersion}: ${it.notes.body}" }
+            }
+            else -> page?.let {
+                "Project version ${it.project.rowVersion}: ${it.project.name} (${it.project.lifecycle.wireValue})"
+            }
+        } ?: "The authoritative value could not be loaded."
+        val builder = AlertDialog.Builder(this)
+            .setTitle("Resolve saved change")
+            .setMessage("Your saved attempt:\n$local\n\nCurrent service value:\n$authoritative")
+            .setNegativeButton("Discard saved change") { _, _ ->
+                runRepositoryAction { controller.discardConflict() }
+            }
+            .setNeutralButton("Cancel", null)
+        if (conflict.canRetry) {
+            builder.setPositiveButton("Retry with latest") { _, _ ->
+                runRepositoryAction { controller.retryConflict() }
+            }
+        }
+        showManagedDialog(builder.create())
     }
 
     private fun showRename() {
@@ -393,7 +479,7 @@ class MainActivity : ComponentActivity() {
             } catch (_: CancellationException) {
                 return@launch
             } catch (error: Exception) {
-                controller.reportRepositoryError(error)
+                handleRepositoryError(error)
                 render()
             }
         }
@@ -402,7 +488,24 @@ class MainActivity : ComponentActivity() {
     private fun restoreSignIn() {
         uiScope.launch {
             try {
-                authenticate(identity.restore(this@MainActivity))
+                val token = identity.restore(this@MainActivity)
+                val fingerprint = identityProofVerifier.fingerprint(token)
+                val binding = withContext(Dispatchers.IO) { identityBindingStore.load() }
+                if (binding == null) {
+                    authenticate(token, fingerprint)
+                } else if (binding.identityFingerprint != fingerprint) {
+                    rejectRestoredIdentity(binding)
+                } else {
+                    withContext(Dispatchers.IO) {
+                        controller.restoreCached(binding.tenantId)
+                        restoreProjectId?.let { projectId ->
+                            controller.openProject(projectId)
+                            restoreProjectId = null
+                        }
+                    }
+                    render()
+                    reconcileRestoredIdentity(token, binding)
+                }
             } catch (_: CancellationException) {
                 return@launch
             } catch (_: Exception) {
@@ -421,15 +524,48 @@ class MainActivity : ComponentActivity() {
             } catch (_: CancellationException) {
                 return@launch
             } catch (error: Exception) {
-                controller.reportRepositoryError(error)
+                handleRepositoryError(error)
                 render()
             }
         }
     }
 
-    private suspend fun authenticate(token: String) {
+    private suspend fun authenticate(
+        token: String,
+        verifiedFingerprint: String = identityProofVerifier.fingerprint(token),
+    ) {
+        val priorBinding = withContext(Dispatchers.IO) { identityBindingStore.load() }
+        val session = try {
+            withContext(Dispatchers.IO) {
+                when {
+                    priorBinding == null -> controller.login(token)
+                    priorBinding.identityFingerprint != verifiedFingerprint -> {
+                        controller.rejectCachedBinding(priorBinding.tenantId)
+                        identityBindingStore.clear()
+                        controller.login(token)
+                    }
+                    controller.isAuthenticated -> controller.confirmSession(token)
+                    else -> {
+                        controller.restoreCached(priorBinding.tenantId)
+                        controller.confirmSession(token)
+                    }
+                }
+            }
+        } catch (error: IdentityBindingMismatchException) {
+            withContext(Dispatchers.IO) { identityBindingStore.clear() }
+            continuity.shouldRestore = false
+            throw error
+        }
+        try {
+            withContext(Dispatchers.IO) {
+                identityBindingStore.save(AcceptedIdentityBinding(session.tenantId, verifiedFingerprint))
+            }
+        } catch (error: Exception) {
+            runCatching { withContext(Dispatchers.IO) { controller.logout() } }
+            continuity.shouldRestore = false
+            throw error
+        }
         withContext(Dispatchers.IO) {
-            controller.login(token)
             restoreProjectId?.let { projectId ->
                 controller.openProject(projectId)
                 restoreProjectId = null
@@ -440,6 +576,39 @@ class MainActivity : ComponentActivity() {
         synchronizeAutomatically()
     }
 
+    private suspend fun reconcileRestoredIdentity(token: String, binding: AcceptedIdentityBinding) {
+        try {
+            withContext(Dispatchers.IO) {
+                controller.confirmSession(token)
+                controller.synchronize()
+            }
+        } catch (_: IdentityBindingMismatchException) {
+            rejectRestoredIdentity(binding)
+            return
+        } catch (error: Exception) {
+            handleRepositoryError(error)
+        }
+        render()
+    }
+
+    private suspend fun rejectRestoredIdentity(binding: AcceptedIdentityBinding) {
+        continuity.shouldRestore = false
+        val erased = runCatching {
+            withContext(Dispatchers.IO) {
+                controller.rejectCachedBinding(binding.tenantId)
+                identityBindingStore.clear()
+            }
+        }
+        controller.reportError(
+            if (erased.isSuccess) {
+                "The restored Google account does not match this saved Blocks account. Sign in again."
+            } else {
+                "Blocks could not safely erase the previous account data. Sign-in remains locked."
+            },
+        )
+        render()
+    }
+
     private fun signOut() = clearAccount(switch = false)
 
     private fun switchAccount() = clearAccount(switch = true)
@@ -448,7 +617,18 @@ class MainActivity : ComponentActivity() {
         uiScope.launch {
             continuity.shouldRestore = false
             runCatching { identity.clear(this@MainActivity) }
-            val cleared = runCatching { withContext(Dispatchers.IO) { controller.logout() } }
+            val cleared = runCatching {
+                withContext(Dispatchers.IO) {
+                    val localFailure = runCatching { controller.logout() }.exceptionOrNull()
+                    val bindingFailure = runCatching { identityBindingStore.clear() }.exceptionOrNull()
+                    (localFailure ?: bindingFailure)?.let { failure ->
+                        if (localFailure != null && bindingFailure != null) {
+                            failure.addSuppressed(bindingFailure)
+                        }
+                        throw failure
+                    }
+                }
+            }
             if (cleared.isFailure) {
                 controller.reportError("Sign-out could not finish clearing local data. Try again.")
             }
@@ -463,12 +643,11 @@ class MainActivity : ComponentActivity() {
             try {
                 val refreshedToken = if (refreshCredential) identity.restore(this@MainActivity) else null
                 withContext(Dispatchers.IO) {
-                    refreshedToken?.let(controller::login)
+                    refreshedToken?.let(controller::confirmSession)
                     controller.synchronize()
                 }
             } catch (error: Exception) {
-                val revoked = controller.reportRepositoryError(error)
-                if (revoked) continuity.shouldRestore = false
+                handleRepositoryError(error)
             }
             render()
         }
@@ -483,8 +662,7 @@ class MainActivity : ComponentActivity() {
             try {
                 withContext(Dispatchers.IO) { action() }
             } catch (error: Exception) {
-                val revoked = controller.reportRepositoryError(error)
-                if (revoked) continuity.shouldRestore = false
+                handleRepositoryError(error)
             }
             if (afterRender) render()
             complete?.invoke()
@@ -496,7 +674,10 @@ class MainActivity : ComponentActivity() {
         val manager = getSystemService(ConnectivityManager::class.java)
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                synchronizeAutomatically(refreshCredential = controller.state.authenticationRequired)
+                synchronizeAutomatically(
+                    refreshCredential = controller.state.authenticationRequired ||
+                        controller.state.sessionConfirmationRequired,
+                )
             }
         }
         runCatching { manager.registerDefaultNetworkCallback(callback) }
@@ -508,6 +689,28 @@ class MainActivity : ComponentActivity() {
         val manager = getSystemService(ConnectivityManager::class.java)
         runCatching { manager.unregisterNetworkCallback(callback) }
         networkCallback = null
+    }
+
+    private fun showManagedDialog(dialog: AlertDialog) {
+        activeDialog = dialog
+        dialog.setOnDismissListener {
+            if (activeDialog === dialog) activeDialog = null
+        }
+        dialog.show()
+    }
+
+    private fun handleRepositoryError(error: Exception) {
+        if (error is IdentityBindingMismatchException) {
+            continuity.shouldRestore = false
+            runCatching { identityBindingStore.clear() }
+            controller.reportError("The restored Google account no longer matches this Blocks account. Sign in again.")
+            return
+        }
+        val revoked = controller.reportRepositoryError(error)
+        if (revoked) {
+            continuity.shouldRestore = false
+            runCatching { identityBindingStore.clear() }
+        }
     }
 
     override fun onDestroy() {
