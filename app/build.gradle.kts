@@ -55,15 +55,15 @@ plugins {
 }
 
 val serviceApiContractDir = rootProject.layout.projectDirectory.dir("contracts/blocks-service-api")
-val serviceApiSpec = serviceApiContractDir.file("blocks-service-api-openapi-v0_3.json")
+val serviceApiSpec = serviceApiContractDir.file("blocks-service-api-openapi-v0_4.json")
 val legacyServiceApiContractDir = rootProject.layout.projectDirectory.dir("contracts/blocks-service-api-legacy-v0_2")
 val legacyServiceApiSpec = legacyServiceApiContractDir.file("blocks-service-api-openapi-v0_2.json")
-val generatedServiceApi = layout.buildDirectory.dir("generated/openapi-v0_3")
+val generatedServiceApi = layout.buildDirectory.dir("generated/openapi-v0_4")
 val generatedLegacyServiceApi = layout.buildDirectory.dir("generated/openapi-v0_2")
 
 val verifyServiceApiContract by tasks.registering(VerifyContractArtifacts::class) {
     group = "verification"
-    description = "Verifies the Atlas-delivered Service API 0.3 artifacts."
+    description = "Verifies the Atlas-delivered Service API 0.4 artifacts."
     contractDirectory.set(serviceApiContractDir)
     expectedArtifactCount.set(15)
 }
@@ -79,8 +79,8 @@ openApiGenerate {
     generatorName.set("kotlin")
     inputSpec.set(serviceApiSpec.asFile.absolutePath)
     outputDir.set(generatedServiceApi.get().asFile.absolutePath)
-    modelPackage.set("dev.blocks.android.api.generated.v03.model")
-    packageName.set("dev.blocks.android.api.generated.v03")
+    modelPackage.set("dev.blocks.android.api.generated.v04.model")
+    packageName.set("dev.blocks.android.api.generated.v04")
     validateSpec.set(true)
     configOptions.set(
         mapOf(
@@ -140,8 +140,8 @@ android {
         applicationId = "dev.blocks.android"
         minSdk = 26
         targetSdk = 37
-        versionCode = 4
-        versionName = "0.4.0"
+        versionCode = 5
+        versionName = "0.5.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "BLOCKS_API_BASE_URL", "\"https://api.blocks.onemorerabbit.co.uk\"")
@@ -150,7 +150,7 @@ android {
             "BLOCKS_GOOGLE_SERVER_CLIENT_ID",
             "\"12259488358-ogmpp0cg1a8v1pbvkoivo9lgr94n0kb9.apps.googleusercontent.com\"",
         )
-        buildConfigField("String", "BLOCKS_SERVICE_API_VERSION", "\"0.3\"")
+        buildConfigField("String", "BLOCKS_SERVICE_API_VERSION", "\"0.4\"")
     }
 
     buildTypes {

@@ -10,6 +10,7 @@ import android.util.Base64
 import com.google.gson.Gson
 import com.google.gson.annotations.SerializedName
 import dev.blocks.android.mvp.OfflineOperation
+import dev.blocks.android.mvp.FormDrafts
 import dev.blocks.android.mvp.Project
 import dev.blocks.android.mvp.QueuedCommand
 import dev.blocks.android.mvp.Reentry
@@ -17,10 +18,12 @@ import dev.blocks.android.mvp.SyncStateStore
 import dev.blocks.android.mvp.TenantSyncState
 import dev.blocks.android.project.PhysicalBlock
 import dev.blocks.android.project.ProjectCacheState
+import dev.blocks.android.project.ProjectIdentityMapping
 import dev.blocks.android.project.ProjectMutation
 import dev.blocks.android.project.ProjectMutationType
 import dev.blocks.android.project.ProjectPage
 import dev.blocks.android.project.ProjectSummary
+import dev.blocks.android.project.ProjectUiPreferences
 import java.io.File
 import java.security.KeyStore
 import java.security.MessageDigest
@@ -49,6 +52,12 @@ internal data class EncodedSyncRows(
     val blocks: List<String> = emptyList(),
     val projectCommands: List<String> = emptyList(),
     val retiredOperationIds: List<String> = emptyList(),
+    val provisionalProjectIds: List<String> = emptyList(),
+    val projectIdMappings: List<String> = emptyList(),
+    val projectsAwaitingNotesBaseline: List<String> = emptyList(),
+    val projectDrafts: String? = null,
+    val projectDraftsMigrated: Boolean = false,
+    val projectUiPreferences: String? = null,
 )
 
 internal class SyncStateRowCodec(private val gson: Gson = Gson()) {
@@ -80,6 +89,12 @@ internal class SyncStateRowCodec(private val gson: Gson = Gson()) {
             blocks = state.projectCache.blocks.map(gson::toJson),
             projectCommands = state.projectCache.commands.map(gson::toJson),
             retiredOperationIds = state.projectCache.retiredOperationIds.distinct(),
+            provisionalProjectIds = state.projectCache.provisionalProjectIds.distinct(),
+            projectIdMappings = state.projectCache.projectIdMappings.map(gson::toJson),
+            projectsAwaitingNotesBaseline = state.projectCache.projectsAwaitingNotesBaseline.distinct(),
+            projectDrafts = gson.toJson(state.projectDrafts),
+            projectDraftsMigrated = state.projectDraftsMigrated,
+            projectUiPreferences = gson.toJson(state.projectUiPreferences),
         )
     }
 
@@ -107,8 +122,25 @@ internal class SyncStateRowCodec(private val gson: Gson = Gson()) {
                 stalePageIds = rows.stalePageIds.distinct(),
                 blocks = rows.blocks.map { gson.fromJson(it, PhysicalBlock::class.java) },
                 blocksLoaded = rows.blocksLoaded,
-                commands = rows.projectCommands.map { gson.fromJson(it, ProjectMutation::class.java) },
+                commands = rows.projectCommands.map {
+                    gson.fromJson(it, ProjectMutation::class.java).migrateFrom(rows.schemaVersion)
+                },
                 retiredOperationIds = rows.retiredOperationIds.distinct(),
+                provisionalProjectIds = if (rows.schemaVersion >= LOCAL_FIRST_SCHEMA_VERSION) {
+                    rows.provisionalProjectIds.distinct()
+                } else {
+                    emptyList()
+                },
+                projectIdMappings = if (rows.schemaVersion >= LOCAL_FIRST_SCHEMA_VERSION) {
+                    rows.projectIdMappings.map { gson.fromJson(it, ProjectIdentityMapping::class.java) }
+                } else {
+                    emptyList()
+                },
+                projectsAwaitingNotesBaseline = if (rows.schemaVersion >= LOCAL_FIRST_SCHEMA_VERSION) {
+                    rows.projectsAwaitingNotesBaseline.distinct()
+                } else {
+                    emptyList()
+                },
             ).also(::validateProjectCache)
         }
         return TenantSyncState(
@@ -121,12 +153,36 @@ internal class SyncStateRowCodec(private val gson: Gson = Gson()) {
             retiredIdempotencyKeys = retiredKeys,
             notice = rows.notice,
             projectCache = projectCache,
+            projectDrafts = if (rows.schemaVersion >= LOCAL_FIRST_SCHEMA_VERSION) {
+                rows.projectDrafts?.let { gson.fromJson(it, FormDrafts::class.java) } ?: FormDrafts()
+            } else {
+                FormDrafts()
+            },
+            projectDraftsMigrated = rows.schemaVersion >= LOCAL_FIRST_SCHEMA_VERSION && rows.projectDraftsMigrated,
+            projectUiPreferences = if (rows.schemaVersion >= STANDALONE_SCHEMA_VERSION) {
+                rows.projectUiPreferences?.let { gson.fromJson(it, ProjectUiPreferences::class.java) }
+                    ?: ProjectUiPreferences()
+            } else {
+                ProjectUiPreferences()
+            },
         )
     }
 
+    private fun ProjectMutation.migrateFrom(schemaVersion: Int): ProjectMutation =
+        if (schemaVersion >= STANDALONE_SCHEMA_VERSION) {
+            this
+        } else {
+            copy(
+                clientResourceId = null,
+                contractVersion = "0.3",
+            )
+        }
+
     companion object {
         const val PILOT_SCHEMA_VERSION = 1
-        const val CURRENT_SCHEMA_VERSION = 3
+        const val LOCAL_FIRST_SCHEMA_VERSION = 4
+        const val STANDALONE_SCHEMA_VERSION = 5
+        const val CURRENT_SCHEMA_VERSION = STANDALONE_SCHEMA_VERSION
     }
 }
 
@@ -238,11 +294,35 @@ private fun validateProjectCache(cache: ProjectCacheState) {
     require(cache.commands.map { it.operationId }.distinct().size == cache.commands.size) {
         "Queued project operation identifiers are not unique"
     }
+    val commandPositions = cache.commands.mapIndexed { index, command -> command.operationId to index }.toMap()
+    cache.commands.forEachIndexed { index, command ->
+        command.dependsOnOperationId?.let { dependency ->
+            require(dependency != command.operationId) { "A project operation cannot depend on itself" }
+            require(commandPositions[dependency]?.let { it < index } != false) {
+                "A project operation dependency must precede the dependent operation"
+            }
+        }
+    }
     val retryKeys = cache.commands.mapNotNull { it.idempotencyKey }
     require(retryKeys.distinct().size == retryKeys.size) {
         "Queued project idempotency keys are not unique"
     }
     cache.commands.forEach(::validateProjectMutation)
+    require(cache.provisionalProjectIds.distinct().size == cache.provisionalProjectIds.size) {
+        "Provisional project identifiers are not unique"
+    }
+    require(cache.projectIdMappings.map { it.provisionalId }.distinct().size == cache.projectIdMappings.size) {
+        "A provisional project has more than one server identity"
+    }
+    require(cache.projectIdMappings.map { it.serverId }.distinct().size == cache.projectIdMappings.size) {
+        "A server project identity is mapped from more than one provisional project"
+    }
+    require(cache.projectIdMappings.none { it.provisionalId == it.serverId }) {
+        "A provisional project identity cannot map to itself"
+    }
+    require(cache.projectsAwaitingNotesBaseline.distinct().size == cache.projectsAwaitingNotesBaseline.size) {
+        "Projects awaiting a notes baseline are not unique"
+    }
 }
 
 private fun validateProjectMutation(command: ProjectMutation) {
@@ -251,25 +331,40 @@ private fun validateProjectMutation(command: ProjectMutation) {
     when (command.type) {
         ProjectMutationType.CREATE_PROJECT -> {
             require(!command.projectName.isNullOrBlank()) { "Queued project name is missing" }
-            require(command.idempotencyKey == command.operationId) {
-                "Queued project creation must retain its original retry identity"
+            require(!command.idempotencyKey.isNullOrBlank()) { "Queued project creation retry identity is missing" }
+            if (command.contractVersion == "0.4") {
+                require(!command.clientResourceId.isNullOrBlank()) {
+                    "Queued project creation client identity is missing"
+                }
             }
         }
         ProjectMutationType.RENAME_PROJECT -> {
             require(!command.projectName.isNullOrBlank()) { "Queued project rename is missing" }
-            requireNotNull(command.ifMatch) { "Queued project rename If-Match is missing" }
+            require(command.ifMatch != null || command.dependsOnOperationId != null) {
+                "Queued project rename has neither If-Match nor a dependency"
+            }
         }
         ProjectMutationType.ARCHIVE_PROJECT,
         ProjectMutationType.REOPEN_PROJECT,
-        -> requireNotNull(command.ifMatch) { "Queued project lifecycle If-Match is missing" }
+        -> require(command.ifMatch != null || command.dependsOnOperationId != null) {
+            "Queued project lifecycle has neither If-Match nor a dependency"
+        }
         ProjectMutationType.SAVE_NOTES -> {
             require(command.notesBody != null) { "Queued project notes body is missing" }
-            requireNotNull(command.ifMatch) { "Queued project notes If-Match is missing" }
+            require(command.ifMatch != null || command.dependsOnOperationId != null) {
+                "Queued project notes has neither If-Match nor a dependency"
+            }
         }
         ProjectMutationType.ADD_PARKING -> {
             requireNotNull(command.parking) { "Queued project parking is missing" }
-            require(command.idempotencyKey == command.operationId) {
-                "Queued project parking must retain its original retry identity"
+            require(!command.idempotencyKey.isNullOrBlank()) { "Queued project parking retry identity is missing" }
+            if (command.contractVersion == "0.4") {
+                require(!command.clientResourceId.isNullOrBlank()) {
+                    "Queued project parking client identity is missing"
+                }
+                require(!command.localCreatedAt.isNullOrBlank()) {
+                    "Queued project parking authored time is missing"
+                }
             }
         }
         ProjectMutationType.BIND_BLOCK -> {
@@ -433,6 +528,27 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
             blocks = readRows(database, tenantId, secretKey, TABLE_BLOCKS),
             projectCommands = readRows(database, tenantId, secretKey, TABLE_PROJECT_COMMANDS),
             retiredOperationIds = readRows(database, tenantId, secretKey, TABLE_RETIRED_OPERATIONS),
+            provisionalProjectIds = readRows(database, tenantId, secretKey, TABLE_PROVISIONAL_PROJECTS),
+            projectIdMappings = readRows(database, tenantId, secretKey, TABLE_PROJECT_ID_MAPPINGS),
+            projectsAwaitingNotesBaseline = readRows(
+                database,
+                tenantId,
+                secretKey,
+                TABLE_PROJECTS_AWAITING_NOTES_BASELINE,
+            ),
+            projectDrafts = readRows(database, tenantId, secretKey, TABLE_PROJECT_DRAFTS).singleOrNull(),
+            projectDraftsMigrated = readOptionalMetadata(
+                database,
+                tenantId,
+                secretKey,
+                META_PROJECT_DRAFTS_MIGRATED,
+            )?.toBooleanStrict() ?: false,
+            projectUiPreferences = readRows(
+                database,
+                tenantId,
+                secretKey,
+                TABLE_PROJECT_UI_PREFERENCES,
+            ).singleOrNull(),
         )
     }
 
@@ -461,6 +577,13 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
             rows.archivedProjectsLoaded.toString(),
         )
         writeMetadata(database, tenantId, secretKey, META_BLOCKS_LOADED, rows.blocksLoaded.toString())
+        writeMetadata(
+            database,
+            tenantId,
+            secretKey,
+            META_PROJECT_DRAFTS_MIGRATED,
+            rows.projectDraftsMigrated.toString(),
+        )
         rows.changeCursor?.let { writeMetadata(database, tenantId, secretKey, META_CHANGE_CURSOR, it) }
         rows.notice?.let { writeMetadata(database, tenantId, secretKey, META_NOTICE, it) }
         writeRows(database, tenantId, secretKey, TABLE_PROJECTS, rows.projects)
@@ -474,6 +597,23 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
         writeRows(database, tenantId, secretKey, TABLE_BLOCKS, rows.blocks)
         writeRows(database, tenantId, secretKey, TABLE_PROJECT_COMMANDS, rows.projectCommands)
         writeRows(database, tenantId, secretKey, TABLE_RETIRED_OPERATIONS, rows.retiredOperationIds)
+        writeRows(database, tenantId, secretKey, TABLE_PROVISIONAL_PROJECTS, rows.provisionalProjectIds)
+        writeRows(database, tenantId, secretKey, TABLE_PROJECT_ID_MAPPINGS, rows.projectIdMappings)
+        writeRows(
+            database,
+            tenantId,
+            secretKey,
+            TABLE_PROJECTS_AWAITING_NOTES_BASELINE,
+            rows.projectsAwaitingNotesBaseline,
+        )
+        writeRows(database, tenantId, secretKey, TABLE_PROJECT_DRAFTS, listOfNotNull(rows.projectDrafts))
+        writeRows(
+            database,
+            tenantId,
+            secretKey,
+            TABLE_PROJECT_UI_PREFERENCES,
+            listOfNotNull(rows.projectUiPreferences),
+        )
     }
 
     private fun writeMetadata(
@@ -662,10 +802,12 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
         }
 
         override fun onUpgrade(database: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-            require(oldVersion == 1 && newVersion == 2) {
+            require(oldVersion in 1 until newVersion && newVersion == DATABASE_VERSION) {
                 "No sync database migration from $oldVersion to $newVersion"
             }
-            PROJECT_MODEL_TABLES.forEach { table -> createPositionTable(database, table) }
+            if (oldVersion < 2) PROJECT_MODEL_TABLES.forEach { table -> createPositionTable(database, table) }
+            if (oldVersion < 3) LOCAL_FIRST_TABLES.forEach { table -> createPositionTable(database, table) }
+            if (oldVersion < 4) STANDALONE_TABLES.forEach { table -> createPositionTable(database, table) }
         }
 
         override fun onDowngrade(database: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -682,7 +824,7 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
     }
 
     private companion object {
-        const val DATABASE_VERSION = 2
+        const val DATABASE_VERSION = 4
         const val DATABASE_PREFIX = "blocks_sync_"
         const val DATABASE_KEY_PREFIX = "blocks-sync-db-v1-"
         const val LEGACY_PREFERENCES_PREFIX = "encrypted_sync_state_v1_"
@@ -701,6 +843,11 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
         const val TABLE_BLOCKS = "blocks_v3"
         const val TABLE_PROJECT_COMMANDS = "pending_project_commands_v3"
         const val TABLE_RETIRED_OPERATIONS = "retired_project_operations_v3"
+        const val TABLE_PROVISIONAL_PROJECTS = "provisional_projects_v4"
+        const val TABLE_PROJECT_ID_MAPPINGS = "project_id_mappings_v4"
+        const val TABLE_PROJECTS_AWAITING_NOTES_BASELINE = "projects_awaiting_notes_baseline_v4"
+        const val TABLE_PROJECT_DRAFTS = "project_drafts_v4"
+        const val TABLE_PROJECT_UI_PREFERENCES = "project_ui_preferences_v5"
         const val COLUMN_NAME = "name"
         const val COLUMN_POSITION = "position"
         const val COLUMN_CIPHERTEXT = "ciphertext"
@@ -712,6 +859,7 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
         const val META_ACTIVE_PROJECTS_LOADED = "active_projects_loaded_v3"
         const val META_ARCHIVED_PROJECTS_LOADED = "archived_projects_loaded_v3"
         const val META_BLOCKS_LOADED = "blocks_loaded_v3"
+        const val META_PROJECT_DRAFTS_MIGRATED = "project_drafts_migrated_v4"
         val PROJECT_MODEL_TABLES = listOf(
             TABLE_ACTIVE_PROJECTS,
             TABLE_ARCHIVED_PROJECTS,
@@ -721,12 +869,19 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
             TABLE_PROJECT_COMMANDS,
             TABLE_RETIRED_OPERATIONS,
         )
+        val LOCAL_FIRST_TABLES = listOf(
+            TABLE_PROVISIONAL_PROJECTS,
+            TABLE_PROJECT_ID_MAPPINGS,
+            TABLE_PROJECTS_AWAITING_NOTES_BASELINE,
+            TABLE_PROJECT_DRAFTS,
+        )
+        val STANDALONE_TABLES = listOf(TABLE_PROJECT_UI_PREFERENCES)
         val POSITION_TABLES = listOf(
             TABLE_PROJECTS,
             TABLE_REENTRY,
             TABLE_COMMANDS,
             TABLE_RETIRED_KEYS,
-        ) + PROJECT_MODEL_TABLES
+        ) + PROJECT_MODEL_TABLES + LOCAL_FIRST_TABLES + STANDALONE_TABLES
         val TABLES = listOf(
             TABLE_METADATA,
         ) + POSITION_TABLES

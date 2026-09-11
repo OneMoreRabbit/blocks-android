@@ -1,6 +1,7 @@
 package dev.blocks.android.mvp
 
 import dev.blocks.android.project.ProjectCacheState
+import dev.blocks.android.project.ProjectUiPreferences
 
 data class ChangeEvent(
     val eventId: String,
@@ -54,6 +55,9 @@ data class TenantSyncState(
     val retiredIdempotencyKeys: List<String> = emptyList(),
     val notice: String? = null,
     val projectCache: ProjectCacheState = ProjectCacheState(),
+    val projectDrafts: FormDrafts = FormDrafts(),
+    val projectDraftsMigrated: Boolean = false,
+    val projectUiPreferences: ProjectUiPreferences = ProjectUiPreferences(),
 )
 
 data class SyncStatus(

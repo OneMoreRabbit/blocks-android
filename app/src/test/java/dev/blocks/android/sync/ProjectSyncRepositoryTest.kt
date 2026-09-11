@@ -2,6 +2,7 @@ package dev.blocks.android.sync
 
 import dev.blocks.android.api.ApiError
 import dev.blocks.android.api.ApiErrorCode
+import dev.blocks.android.api.IncompatibleServiceApiException
 import dev.blocks.android.api.ServiceException
 import dev.blocks.android.mvp.BlocksRepository
 import dev.blocks.android.mvp.ChangeEvent
@@ -27,6 +28,7 @@ import dev.blocks.android.project.BlockBinding
 import dev.blocks.android.project.BlockLookup
 import dev.blocks.android.project.PhysicalBlock
 import dev.blocks.android.project.ProjectCacheState
+import dev.blocks.android.project.ProjectIdentityMapping
 import dev.blocks.android.project.ProjectLifecycle
 import dev.blocks.android.project.ProjectMutationType
 import dev.blocks.android.project.ProjectMutationStatus
@@ -37,6 +39,8 @@ import dev.blocks.android.project.ProjectService
 import dev.blocks.android.project.ProjectSummary
 import dev.blocks.android.project.RegisteredBlock
 import java.io.IOException
+import java.net.ConnectException
+import java.net.SocketTimeoutException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -44,6 +48,257 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ProjectSyncRepositoryTest {
+    @Test
+    fun emptyCacheJourneyIsImmediatelyUsableOfflineAndConvergesInDependencyOrderAfterRestart() {
+        val drafts = MemoryDrafts()
+        val state = MemoryState()
+        val service = FakeProjectService().apply { offline = true }
+        val first = repository(service, drafts, state)
+        first.activate(SESSION_A)
+
+        val created = first.queueCreateProject(SESSION_A, "Offline project", "create-project-key")
+        val provisionalId = created.cache.activeProjects.single().id
+        assertEquals("create-project-key", provisionalId)
+        assertEquals("Offline project", first.projectPage(SESSION_A, provisionalId).project.name)
+        state.saveSyncState(
+            TENANT_A,
+            state.loadSyncState(TENANT_A).copy(
+                projectCache = state.loadSyncState(TENANT_A).projectCache.copy(
+                    blocks = listOf(PhysicalBlock("local-block", "Desk", "bound", provisionalId)),
+                    blocksLoaded = true,
+                ),
+            ),
+        )
+        first.queueSaveNotes(SESSION_A, provisionalId, 0, "Offline notes", "save-notes-key")
+        first.queueParking(
+            SESSION_A,
+            provisionalId,
+            ParkingDraft("Workbench", "Fit bracket", "Bring screws"),
+            operationId = "append-parking-key",
+        )
+        first.updateProjectDrafts(SESSION_A) {
+            it.copy(
+                projectNotes = mapOf(provisionalId to "Newer notes draft"),
+                projectParking = mapOf(
+                    provisionalId to ParkingDraft("Packing bench", "Label parts", "Keep the receipt"),
+                ),
+            )
+        }
+
+        assertTrue(service.calls.isEmpty())
+        val local = first.snapshot(SESSION_A)
+        assertEquals("Offline notes", local.cache.pages.single().notes.body)
+        assertEquals("Workbench", local.cache.pages.single().newestParking?.location)
+        assertEquals(
+            listOf(null, "create-project-key", "save-notes-key"),
+            local.cache.commands.map { it.dependsOnOperationId },
+        )
+
+        val restarted = repository(service, drafts, state)
+        restarted.activate(SESSION_A)
+        assertEquals("Offline notes", restarted.projectPage(SESSION_A, provisionalId).notes.body)
+        assertEquals(3, restarted.snapshot(SESSION_A).pendingProjectOperations)
+
+        service.offline = false
+        val converged = restarted.backgroundSync(SESSION_A)
+
+        assertEquals(
+            listOf("create", "page", "notes", "parking"),
+            service.calls.filter { it in setOf("create", "page", "notes", "parking") }.take(4),
+        )
+        assertEquals(listOf("create-project-key"), service.createClientIds)
+        assertEquals(listOf("append-parking-key"), service.parkingClientIds)
+        assertNotNull(service.parkingOccurredAt.single())
+        assertTrue(converged.cache.commands.isEmpty())
+        assertEquals(PROJECT_ID, converged.cache.pages.single().project.id)
+        assertEquals("Offline notes", converged.cache.pages.single().notes.body)
+        assertEquals("parking-1", converged.cache.pages.single().newestParking?.id)
+        assertEquals(
+            listOf(ProjectIdentityMapping("create-project-key", PROJECT_ID)),
+            converged.cache.projectIdMappings,
+        )
+        val identityRewrite = state.saved.first {
+            it.projectCache.projectIdMappings.any { mapping -> mapping.provisionalId == provisionalId } &&
+                it.projectCache.commands.isNotEmpty()
+        }
+        assertTrue(identityRewrite.projectCache.pages.all { it.project.id == PROJECT_ID })
+        assertTrue(identityRewrite.projectCache.commands.all {
+            it.targetId == PROJECT_ID && (it.projectId == null || it.projectId == PROJECT_ID)
+        })
+        assertEquals(PROJECT_ID, identityRewrite.projectCache.blocks.single().boundProjectId)
+        assertEquals("Newer notes draft", identityRewrite.projectDrafts.projectNotes[PROJECT_ID])
+        assertEquals("Packing bench", identityRewrite.projectDrafts.projectParking[PROJECT_ID]?.location)
+        assertTrue(provisionalId !in identityRewrite.projectDrafts.projectNotes)
+        assertTrue(provisionalId !in identityRewrite.projectDrafts.projectParking)
+        assertEquals("Newer notes draft", restarted.projectDrafts(SESSION_A).projectNotes[PROJECT_ID])
+        assertEquals("Packing bench", restarted.projectDrafts(SESSION_A).projectParking[PROJECT_ID]?.location)
+        assertTrue(
+            listOf("create-project-key", "save-notes-key", "append-parking-key")
+                .all { it in converged.cache.retiredOperationIds },
+        )
+    }
+
+    @Test
+    fun olderRouteApiRejectingApi04FieldsDefersWithoutRollingBackTheEmptyCacheJourney() {
+        val state = MemoryState()
+        val service = FakeProjectService().apply { rejectApi04Mutation = true }
+        val repository = repository(service, MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+
+        repository.queueCreateProject(SESSION_A, "Saved locally", "old-route-create-key")
+        repository.queueSaveNotes(
+            SESSION_A,
+            "old-route-create-key",
+            0,
+            "Saved old-route notes",
+            "old-route-notes-key",
+        )
+        repository.queueParking(
+            SESSION_A,
+            "old-route-create-key",
+            ParkingDraft("Old route shelf", "Keep working", "Retain local state"),
+            operationId = "old-route-parking-key",
+        )
+        val deferred = repository.backgroundSync(SESSION_A)
+
+        assertTrue(deferred.cache.activeProjects.any { it.name == "Saved locally" })
+        val localPage = repository.projectPage(SESSION_A, "old-route-create-key")
+        assertEquals("Saved locally", localPage.project.name)
+        assertEquals("Saved old-route notes", localPage.notes.body)
+        assertEquals("Old route shelf", localPage.newestParking?.location)
+        assertEquals(
+            listOf("old-route-create-key", "old-route-notes-key", "old-route-parking-key"),
+            deferred.cache.commands.map { it.operationId },
+        )
+        assertTrue(deferred.cache.commands.none { it.deliveryUncertain })
+        assertFalse(deferred.reconciliationRequired)
+        assertEquals(listOf("list-active", "create"), service.calls.take(2))
+    }
+
+    @Test
+    fun noEndpointAndTimeoutKeepTheCompleteEmptyCacheJourneyLocallyUsableAndQuietlyPending() {
+        listOf(
+            ConnectException("no endpoint"),
+            SocketTimeoutException("request timed out"),
+        ).forEachIndexed { index, transportFailure ->
+            val state = MemoryState()
+            val service = FakeProjectService().apply { deferredFailure = transportFailure }
+            val repository = repository(service, MemoryDrafts(), state)
+            repository.activate(SESSION_A)
+            val createId = "failure-$index-create"
+
+            repository.queueCreateProject(SESSION_A, "Locally useful $index", createId)
+            repository.queueSaveNotes(SESSION_A, createId, 0, "Offline notes $index", "failure-$index-notes")
+            repository.queueParking(
+                SESSION_A,
+                createId,
+                ParkingDraft("Shelf $index", "Continue $index", "Remember $index"),
+                operationId = "failure-$index-parking",
+            )
+            val deferred = repository.backgroundSync(SESSION_A)
+
+            assertEquals(3, deferred.pendingProjectOperations)
+            assertEquals("Locally useful $index", deferred.cache.activeProjects.single().name)
+            assertEquals("Offline notes $index", repository.projectPage(SESSION_A, createId).notes.body)
+            assertEquals("Shelf $index", repository.projectPage(SESSION_A, createId).newestParking?.location)
+            assertTrue(deferred.cache.commands.none { it.deliveryUncertain })
+            assertTrue("create" !in service.calls)
+        }
+    }
+
+    @Test
+    fun everyOrdinaryMutationPersistsItsProjectionAndDependencyBeforeTransport() {
+        val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
+        val service = FakeProjectService().apply { offline = true }
+        val repository = repository(service, MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+        val savesBeforeMutations = state.saved.size
+
+        repository.queueRenameProject(SESSION_A, PROJECT_ID, 1, "Renamed", "rename-local")
+        repository.queueSaveNotes(SESSION_A, PROJECT_ID, 4, "Local notes", "notes-local")
+        repository.queueParking(
+            SESSION_A,
+            PROJECT_ID,
+            ParkingDraft("Bench", "Tighten clamp", "Keep shim"),
+            operationId = "parking-local",
+        )
+        repository.queueArchiveProject(SESSION_A, PROJECT_ID, 1, "archive-local")
+        val reopened = repository.queueReopenProject(SESSION_A, PROJECT_ID, 1, "reopen-local")
+
+        assertTrue(service.calls.isEmpty())
+        assertEquals(5, state.saved.size - savesBeforeMutations)
+        assertEquals("Renamed", reopened.cache.activeProjects.single().name)
+        assertEquals("Local notes", reopened.cache.pages.single().notes.body)
+        assertEquals("Bench", reopened.cache.pages.single().newestParking?.location)
+        assertEquals(
+            listOf(
+                ProjectMutationType.RENAME_PROJECT,
+                ProjectMutationType.SAVE_NOTES,
+                ProjectMutationType.ADD_PARKING,
+                ProjectMutationType.ARCHIVE_PROJECT,
+                ProjectMutationType.REOPEN_PROJECT,
+            ),
+            reopened.cache.commands.map { it.type },
+        )
+        assertEquals(
+            listOf(null, "rename-local", "notes-local", "parking-local", "archive-local"),
+            reopened.cache.commands.map { it.dependsOnOperationId },
+        )
+    }
+
+    @Test
+    fun lostCreateResponseReplaysTheOriginalIdentityAndReconcilesWithoutDuplicateProject() {
+        val state = MemoryState()
+        val service = FakeProjectService().apply { createResponseLostAfterSuccess = true }
+        val first = repository(service, MemoryDrafts(), state)
+        first.activate(SESSION_A)
+        first.queueCreateProject(SESSION_A, "One project", "stable-create-key")
+
+        val ambiguous = first.backgroundSync(SESSION_A)
+        assertTrue(ambiguous.cache.commands.single().deliveryUncertain)
+        assertEquals(1, service.projectCreateCount)
+        service.expireIdempotencyResults()
+
+        val restarted = repository(service, MemoryDrafts(), state)
+        restarted.activate(SESSION_A)
+        val completed = restarted.backgroundSync(SESSION_A)
+
+        assertEquals(listOf("stable-create-key", "stable-create-key"), service.createKeys)
+        assertEquals(listOf("stable-create-key", "stable-create-key"), service.createClientIds)
+        assertEquals(1, service.projectCreateCount)
+        assertTrue(completed.cache.commands.isEmpty())
+        assertEquals(PROJECT_ID, completed.cache.projectIdMappings.single().serverId)
+    }
+
+    @Test
+    fun archivedSummaryCanBeReopenedLocallyBeforeItsPageHasEverBeenCached() {
+        val state = MemoryState()
+        val archived = project(lifecycle = ProjectLifecycle.ARCHIVED)
+        state.saveSyncState(
+            TENANT_A,
+            TenantSyncState(
+                projectCache = ProjectCacheState(
+                    archivedProjects = listOf(archived),
+                    archivedProjectsLoaded = true,
+                ),
+            ),
+        )
+        val service = FakeProjectService().apply { offline = true }
+        val repository = repository(service, MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+
+        val reopened = repository.queueReopenProject(
+            SESSION_A,
+            PROJECT_ID,
+            archived.rowVersion,
+            "reopen-offline-key",
+        )
+
+        assertEquals(listOf(PROJECT_ID), reopened.cache.activeProjects.map { it.id })
+        assertTrue(reopened.cache.archivedProjects.isEmpty())
+        assertTrue(service.calls.isEmpty())
+    }
+
     @Test
     fun failedBeforeDeliveryWithIdenticalNewestParkingRetriesOriginalIdentityAndAppendsOnce() {
         val drafts = MemoryDrafts()
@@ -78,20 +333,24 @@ class ProjectSyncRepositoryTest {
         assertEquals(1, firstResult.pendingProjectOperations)
         assertEquals(0, firstResult.pendingLegacyOperations)
         assertEquals("project-park-key", state.loadSyncState(TENANT_A).projectCache.commands.single().idempotencyKey)
-        assertTrue(state.loadSyncState(TENANT_A).projectCache.commands.single().deliveryUncertain)
-        assertEquals("Here", drafts.load(TENANT_A).projectParking[PROJECT_ID]?.location)
+        assertFalse(state.loadSyncState(TENANT_A).projectCache.commands.single().deliveryUncertain)
+        assertTrue(service.parkingKeys.isEmpty())
+        assertTrue(first.projectDrafts(SESSION_A).projectParking.isEmpty())
+
+        first.backgroundSync(SESSION_A)
+        assertFalse(state.loadSyncState(TENANT_A).projectCache.commands.single().deliveryUncertain)
 
         service.offline = false
         val recreated = repository(service, drafts, state)
         recreated.activate(SESSION_A)
         val final = recreated.backgroundSync(SESSION_A)
 
-        assertEquals(listOf("project-park-key", "project-park-key"), service.parkingKeys)
+        assertEquals(listOf("project-park-key"), service.parkingKeys)
         assertEquals(1, service.parkingAppendCount)
         assertEquals("parking-1", final.cache.pages.single().newestParking?.id)
         assertEquals(0, final.pendingProjectOperations)
         assertTrue("project-park-key" in final.cache.retiredOperationIds)
-        assertTrue(drafts.load(TENANT_A).projectParking.isEmpty())
+        assertTrue(recreated.projectDrafts(SESSION_A).projectParking.isEmpty())
         assertTrue(state.loadSyncState(TENANT_A).commands.isEmpty())
         val sendsBeforeReuse = service.parkingKeys.size
         assertTrue(
@@ -124,15 +383,22 @@ class ProjectSyncRepositoryTest {
         )
 
         assertEquals(1, ambiguous.pendingProjectOperations)
-        assertTrue(ambiguous.cache.commands.single().deliveryUncertain)
+        assertFalse(ambiguous.cache.commands.single().deliveryUncertain)
+        val attempted = first.backgroundSync(SESSION_A)
+        assertTrue(attempted.cache.commands.single().deliveryUncertain)
         assertEquals(1, service.parkingAppendCount)
         assertEquals(listOf("lost-parking-response-key"), service.parkingKeys)
+        service.expireIdempotencyResults()
 
         val restarted = repository(service, drafts, state)
         restarted.activate(SESSION_A)
         val replayed = restarted.backgroundSync(SESSION_A)
 
         assertEquals(listOf("lost-parking-response-key", "lost-parking-response-key"), service.parkingKeys)
+        assertEquals(
+            listOf("lost-parking-response-key", "lost-parking-response-key"),
+            service.parkingClientIds,
+        )
         assertEquals(1, service.parkingAppendCount)
         assertEquals("parking-1", replayed.cache.pages.single().newestParking?.id)
         assertTrue(replayed.cache.commands.isEmpty())
@@ -223,7 +489,7 @@ class ProjectSyncRepositoryTest {
         val repository = repository(service, drafts, state)
         repository.activate(SESSION_A)
 
-        val result = repository.queueSaveNotes(
+        repository.queueSaveNotes(
             SESSION_A,
             PROJECT_ID,
             rowVersion = 3,
@@ -231,13 +497,14 @@ class ProjectSyncRepositoryTest {
             operationId = "notes-operation",
         )
 
+        val result = repository.backgroundSync(SESSION_A)
         assertTrue(result.reconciliationRequired)
         val command = result.cache.commands.single()
         assertEquals(ProjectMutationStatus.REQUIRES_RECONCILIATION, command.status)
         assertEquals("Local unsent notes", command.notesBody)
         assertEquals(3, command.ifMatch)
-        assertEquals("Local unsent notes", drafts.load(TENANT_A).projectNotes[PROJECT_ID])
-        assertEquals("Server notes", result.cache.pages.single().notes.body)
+        assertTrue(repository.projectDrafts(SESSION_A).projectNotes.isEmpty())
+        assertEquals("Local unsent notes", result.cache.pages.single().notes.body)
         assertEquals("Local unsent notes", result.conflict?.localNotes)
         assertEquals(4, result.conflict?.authoritativePage?.notes?.rowVersion)
     }
@@ -254,7 +521,7 @@ class ProjectSyncRepositoryTest {
         val repository = repository(service, drafts, state)
         repository.activate(SESSION_A)
 
-        val unavailable = repository.queueSaveNotes(
+        repository.queueSaveNotes(
             SESSION_A,
             PROJECT_ID,
             rowVersion = 3,
@@ -262,6 +529,7 @@ class ProjectSyncRepositoryTest {
             operationId = "notes-operation",
         )
 
+        val unavailable = repository.backgroundSync(SESSION_A)
         assertFalse(unavailable.conflict?.canRetry == true)
         assertEquals(null, unavailable.conflict?.authoritativePage)
         assertTrue(
@@ -286,12 +554,14 @@ class ProjectSyncRepositoryTest {
         val first = repository(service, drafts, state)
         first.activate(SESSION_A)
         first.queueSaveNotes(SESSION_A, PROJECT_ID, 3, "Local notes", "old-notes-operation")
+        first.backgroundSync(SESSION_A)
         first.queueRenameProject(SESSION_A, PROJECT_ID, 1, "Queued rename", "rename-operation")
 
         service.notesConflict = false
         val restarted = repository(service, drafts, state)
         restarted.activate(SESSION_A)
-        val resolved = restarted.retryConflict(SESSION_A, "old-notes-operation", "fresh-notes-operation")
+        restarted.retryConflict(SESSION_A, "old-notes-operation", "fresh-notes-operation")
+        val resolved = restarted.backgroundSync(SESSION_A)
 
         assertEquals(listOf(4), service.savedNotesVersions)
         assertEquals(listOf("Local notes"), service.savedNotesBodies)
@@ -311,12 +581,14 @@ class ProjectSyncRepositoryTest {
         val service = FakeProjectService().apply { projectConflict = true }
         val repository = repository(service, drafts, state)
         repository.activate(SESSION_A)
-        val conflict = repository.queueArchiveProject(SESSION_A, PROJECT_ID, 1, "archive-operation")
+        repository.queueArchiveProject(SESSION_A, PROJECT_ID, 1, "archive-operation")
+        val conflict = repository.backgroundSync(SESSION_A)
         repository.queueSaveNotes(SESSION_A, PROJECT_ID, 4, "After archive", "notes-after-archive")
 
         assertEquals(ProjectMutationType.ARCHIVE_PROJECT, conflict.conflict?.type)
         service.projectConflict = false
-        val resolved = repository.discardConflict(SESSION_A, "archive-operation")
+        repository.discardConflict(SESSION_A, "archive-operation")
+        val resolved = repository.backgroundSync(SESSION_A)
 
         assertTrue(resolved.cache.commands.isEmpty())
         assertEquals(listOf("After archive"), service.savedNotesBodies)
@@ -333,7 +605,7 @@ class ProjectSyncRepositoryTest {
         val repository = repository(service, drafts, state)
         repository.activate(SESSION_A)
 
-        val conflict = repository.queueRenameProject(
+        repository.queueRenameProject(
             SESSION_A,
             PROJECT_ID,
             rowVersion = 1,
@@ -341,15 +613,17 @@ class ProjectSyncRepositoryTest {
             operationId = "old-rename-operation",
         )
 
+        val conflict = repository.backgroundSync(SESSION_A)
         assertEquals("My retained name", conflict.conflict?.localProjectName)
         assertEquals("Project", conflict.conflict?.authoritativePage?.project?.name)
         service.projectConflict = false
-        val resolved = repository.retryConflict(
+        repository.retryConflict(
             SESSION_A,
             "old-rename-operation",
             "fresh-rename-operation",
         )
 
+        val resolved = repository.backgroundSync(SESSION_A)
         assertEquals(listOf("My retained name"), service.renamedNames)
         assertTrue("old-rename-operation" in resolved.cache.retiredOperationIds)
         assertTrue("fresh-rename-operation" in resolved.cache.retiredOperationIds)
@@ -365,29 +639,17 @@ class ProjectSyncRepositoryTest {
         val first = repository(service, drafts, state)
         first.activate(SESSION_A)
 
-        val ambiguous = first.queueSaveNotes(
+        first.queueSaveNotes(
             SESSION_A,
             PROJECT_ID,
             rowVersion = 3,
             body = "Accepted despite lost response",
             operationId = "ambiguous-operation",
         )
+        val ambiguous = first.backgroundSync(SESSION_A)
         assertTrue(ambiguous.cache.commands.single().deliveryUncertain)
         assertEquals(listOf("Accepted despite lost response"), service.savedNotesBodies)
 
-        val discovered = state.loadSyncState(TENANT_A)
-        state.saveSyncState(
-            TENANT_A,
-            discovered.copy(
-                projectCache = discovered.projectCache.copy(
-                    pages = listOf(
-                        page().copy(
-                            notes = page().notes.copy(body = "Accepted despite lost response", rowVersion = 5),
-                        ),
-                    ),
-                ),
-            ),
-        )
         service.notesAmbiguousAfterSuccess = false
         val restarted = repository(service, drafts, state)
         restarted.activate(SESSION_A)
@@ -407,19 +669,20 @@ class ProjectSyncRepositoryTest {
             }.exceptionOrNull() is IllegalArgumentException,
         )
 
-        val later = restarted.queueSaveNotes(
+        restarted.queueSaveNotes(
             SESSION_A,
             PROJECT_ID,
             5,
             "Accepted despite lost response",
             "later-distinct-operation",
         )
+        val later = restarted.backgroundSync(SESSION_A)
         assertTrue(later.cache.commands.isEmpty())
         assertEquals(2, service.savedNotesBodies.size)
     }
 
     @Test
-    fun acknowledgingAnOlderNotesWriteDoesNotDiscardTheNewerDraft() {
+    fun remoteAcknowledgementsDoNotDiscardANewerUnsavedDraft() {
         val drafts = MemoryDrafts()
         val state = MemoryState()
         state.saveSyncState(TENANT_A, loadedState())
@@ -429,20 +692,23 @@ class ProjectSyncRepositoryTest {
 
         repository.queueSaveNotes(SESSION_A, PROJECT_ID, 3, "First edit", "notes-one")
         repository.queueSaveNotes(SESSION_A, PROJECT_ID, 4, "Second edit", "notes-two")
+        repository.updateProjectDrafts(SESSION_A) {
+            it.copy(projectNotes = mapOf(PROJECT_ID to "Third unsaved edit"))
+        }
         service.offline = false
         service.notesFailureAfterSuccessfulSaves = 1
 
         val partiallySynced = repository.backgroundSync(SESSION_A)
 
         assertEquals(listOf("First edit"), service.savedNotesBodies)
-        assertEquals("Second edit", drafts.load(TENANT_A).projectNotes[PROJECT_ID])
+        assertEquals("Third unsaved edit", repository.projectDrafts(SESSION_A).projectNotes[PROJECT_ID])
         assertEquals(listOf("notes-two"), partiallySynced.cache.commands.map { it.operationId })
 
         service.notesFailureAfterSuccessfulSaves = null
         val complete = repository.backgroundSync(SESSION_A)
 
         assertEquals(listOf("First edit", "Second edit"), service.savedNotesBodies)
-        assertTrue(drafts.load(TENANT_A).projectNotes.isEmpty())
+        assertEquals("Third unsaved edit", repository.projectDrafts(SESSION_A).projectNotes[PROJECT_ID])
         assertTrue(complete.cache.commands.isEmpty())
     }
 
@@ -455,28 +721,27 @@ class ProjectSyncRepositoryTest {
         val repository = repository(service, drafts, state)
         repository.activate(SESSION_A)
 
-        val error = runCatching {
-            repository.queueSaveNotes(
-                SESSION_A,
-                PROJECT_ID,
-                rowVersion = 3,
-                body = "Keep until sign-in refresh",
-                operationId = "auth-refresh-key",
-            )
-        }.exceptionOrNull()
+        repository.queueSaveNotes(
+            SESSION_A,
+            PROJECT_ID,
+            rowVersion = 3,
+            body = "Keep until sign-in refresh",
+            operationId = "auth-refresh-key",
+        )
+        val error = runCatching { repository.backgroundSync(SESSION_A) }.exceptionOrNull()
 
         assertTrue(error is ServiceException && error.status == 401)
         val deferred = repository.snapshot(SESSION_A)
         assertEquals(listOf("auth-refresh-key"), deferred.cache.commands.map { it.operationId })
         assertFalse(deferred.reconciliationRequired)
-        assertEquals("Keep until sign-in refresh", drafts.load(TENANT_A).projectNotes[PROJECT_ID])
+        assertTrue(repository.projectDrafts(SESSION_A).projectNotes.isEmpty())
 
         service.authenticationRequired = false
         val completed = repository.backgroundSync(SESSION_A.copy(identityToken = "fresh-token"))
 
         assertTrue(completed.cache.commands.isEmpty())
         assertTrue("auth-refresh-key" in completed.cache.retiredOperationIds)
-        assertTrue(drafts.load(TENANT_A).projectNotes.isEmpty())
+        assertTrue(repository.projectDrafts(SESSION_A).projectNotes.isEmpty())
     }
 
     @Test
@@ -496,10 +761,10 @@ class ProjectSyncRepositoryTest {
         assertEquals(TenantSyncState(), state.loadSyncState(TENANT_A))
         assertEquals(FormDrafts(), drafts.load(TENANT_A))
         assertFalse(state.loadSyncState(TENANT_B) == TenantSyncState())
-        assertEquals("Tenant B", drafts.load(TENANT_B).projectNotes[PROJECT_ID])
+        assertEquals("Tenant B", repository.projectDrafts(SESSION_B).projectNotes[PROJECT_ID])
 
         service.membershipRevoked = true
-        val error = runCatching { repository.activeProjects(SESSION_B) }.exceptionOrNull()
+        val error = runCatching { repository.backgroundSync(SESSION_B) }.exceptionOrNull()
 
         assertTrue(error is MembershipRevokedException)
         assertEquals(TenantSyncState(), state.loadSyncState(TENANT_B))
@@ -561,7 +826,13 @@ class ProjectSyncRepositoryTest {
         var parkingResponseLostAfterSuccess = false
         var membershipRevoked = false
         var authenticationRequired = false
+        var incompatibleApi = false
+        var rejectApi04Mutation = false
+        var deferredFailure: IOException? = null
+        var createResponseLostAfterSuccess = false
         var notesFailureAfterSuccessfulSaves: Int? = null
+        var serverNotesBody = "Server notes"
+        var serverNotesVersion = 4
         val parkingKeys = mutableListOf<String>()
         var parkingAppendCount = 0
             private set
@@ -570,20 +841,64 @@ class ProjectSyncRepositoryTest {
         val savedNotesBodies = mutableListOf<String>()
         val savedNotesVersions = mutableListOf<Int>()
         val renamedNames = mutableListOf<String>()
+        val calls = mutableListOf<String>()
+        val createKeys = mutableListOf<String>()
+        val createClientIds = mutableListOf<String?>()
+        val parkingClientIds = mutableListOf<String?>()
+        val parkingOccurredAt = mutableListOf<String?>()
+        var projectCreateCount = 0
+            private set
+        private val createOutcomes = mutableMapOf<String, ProjectSummary>()
+        private val projectsByClientId = mutableMapOf<String, ProjectSummary>()
+        private val parkingByClientId = mutableMapOf<String, ProjectParking>()
+        private val lostCreateResponses = mutableSetOf<String>()
         val changePages = ArrayDeque<ChangePage>()
 
         override fun listProjects(session: Session, lifecycle: ProjectLifecycle): List<ProjectSummary> {
+            calls += "list-${lifecycle.wireValue}"
+            if (incompatibleApi) throw IncompatibleServiceApiException()
             failIfNeeded()
             return if (lifecycle == ProjectLifecycle.ACTIVE) listOf(project(tenantId = session.tenantId)) else emptyList()
         }
 
-        override fun createProject(session: Session, name: String, idempotencyKey: String) =
-            project(name = name, tenantId = session.tenantId)
+        override fun createProject(
+            session: Session,
+            name: String,
+            clientId: String?,
+            idempotencyKey: String,
+        ): ProjectSummary {
+            calls += "create"
+            createKeys += idempotencyKey
+            createClientIds += clientId
+            if (rejectApi04Mutation) {
+                throw ServiceException(422, ApiError(ApiErrorCode.INVALID_REQUEST, "Unknown client_id"))
+            }
+            if (incompatibleApi) throw IncompatibleServiceApiException()
+            failIfNeeded()
+            val outcome = createOutcomes.getOrPut(idempotencyKey) {
+                clientId?.let { stableClientId ->
+                    projectsByClientId.getOrPut(stableClientId) {
+                        projectCreateCount += 1
+                        project(name = name, tenantId = session.tenantId).copy(clientId = stableClientId)
+                    }
+                } ?: run {
+                    projectCreateCount += 1
+                    project(name = name, tenantId = session.tenantId)
+                }
+            }
+            if (createResponseLostAfterSuccess && lostCreateResponses.add(idempotencyKey)) {
+                throw IOException("response lost after project acceptance")
+            }
+            return outcome
+        }
 
         override fun projectPage(session: Session, projectId: String): ProjectPage {
+            calls += "page"
             failIfNeeded()
             if (conflictPageUnavailable) throw IOException("authoritative page unavailable")
-            return page(session.tenantId)
+            return page(session.tenantId).copy(
+                notes = page(session.tenantId).notes.copy(body = serverNotesBody, rowVersion = serverNotesVersion),
+            )
         }
 
         override fun renameProject(session: Session, projectId: String, rowVersion: Int, name: String): ProjectSummary {
@@ -612,6 +927,7 @@ class ProjectSyncRepositoryTest {
         override fun notes(session: Session, projectId: String) = page(session.tenantId).notes
 
         override fun saveNotes(session: Session, projectId: String, rowVersion: Int, body: String): ProjectNotes {
+            calls += "notes"
             failIfNeeded()
             if (notesConflict) throw ServiceException(409, ApiError(ApiErrorCode.CONFLICT, "Notes changed"))
             notesFailureAfterSuccessfulSaves?.let { successfulLimit ->
@@ -619,6 +935,8 @@ class ProjectSyncRepositoryTest {
             }
             savedNotesBodies += body
             savedNotesVersions += rowVersion
+            serverNotesBody = body
+            serverNotesVersion = rowVersion + 1
             if (notesAmbiguousAfterSuccess) throw IOException("response lost after acceptance")
             return ProjectNotes(projectId, body, rowVersion + 1, NOW)
         }
@@ -628,13 +946,36 @@ class ProjectSyncRepositoryTest {
             projectId: String,
             parking: ParkingDraft,
             supersedesId: String?,
+            clientId: String?,
+            occurredAt: String?,
             idempotencyKey: String,
         ): ProjectParking {
+            calls += "parking"
             parkingKeys += idempotencyKey
+            parkingClientIds += clientId
+            parkingOccurredAt += occurredAt
+            if (rejectApi04Mutation) {
+                throw ServiceException(422, ApiError(ApiErrorCode.INVALID_REQUEST, "Unknown client_id"))
+            }
             failIfNeeded()
             val outcome = parkingOutcomes.getOrPut(idempotencyKey) {
-                parkingAppendCount += 1
-                projectParking(id = "parking-$parkingAppendCount", draft = parking, supersedesId = supersedesId)
+                clientId?.let { stableClientId ->
+                    parkingByClientId.getOrPut(stableClientId) {
+                        parkingAppendCount += 1
+                        projectParking(
+                            id = "parking-$parkingAppendCount",
+                            draft = parking,
+                            supersedesId = supersedesId,
+                        ).copy(clientId = stableClientId, occurredAt = occurredAt ?: NOW)
+                    }
+                } ?: run {
+                    parkingAppendCount += 1
+                    projectParking(
+                        id = "parking-$parkingAppendCount",
+                        draft = parking,
+                        supersedesId = supersedesId,
+                    )
+                }
             }
             if (parkingResponseLostAfterSuccess && lostParkingResponses.add(idempotencyKey)) {
                 throw IOException("response lost after parking acceptance")
@@ -644,6 +985,7 @@ class ProjectSyncRepositoryTest {
 
         override fun parking(session: Session, projectId: String) = listOfNotNull(page(session.tenantId).newestParking)
         override fun blocks(session: Session): List<PhysicalBlock> {
+            calls += "blocks"
             failIfNeeded()
             return emptyList()
         }
@@ -654,8 +996,14 @@ class ProjectSyncRepositoryTest {
         override fun unbindBlock(session: Session, blockId: String) = Unit
         override fun lookupBlock(session: Session, tagToken: String) = BlockLookup("block-id", "Block", PROJECT_ID)
         override fun changes(session: Session, cursor: String?, limit: Int): ChangePage {
+            calls += "changes"
             failIfNeeded()
             return if (changePages.isEmpty()) ChangePage(emptyList(), cursor, false) else changePages.removeFirst()
+        }
+
+        fun expireIdempotencyResults() {
+            createOutcomes.clear()
+            parkingOutcomes.clear()
         }
 
         private fun failIfNeeded() {
@@ -663,6 +1011,7 @@ class ProjectSyncRepositoryTest {
             if (authenticationRequired) {
                 throw ServiceException(401, ApiError(ApiErrorCode.UNAUTHENTICATED, "Refresh required"))
             }
+            deferredFailure?.let { throw it }
             if (offline) throw IOException("offline")
         }
     }

@@ -19,6 +19,7 @@ import dev.blocks.android.auth.AcceptedTenantContinuityStore
 import dev.blocks.android.auth.AndroidEncryptedAcceptedTenantContinuityStore
 import dev.blocks.android.auth.IdentityProvider
 import dev.blocks.android.mvp.ChangePage
+import dev.blocks.android.mvp.FormDrafts
 import dev.blocks.android.mvp.ParkingDraft
 import dev.blocks.android.mvp.Session
 import dev.blocks.android.mvp.TenantSyncState
@@ -37,6 +38,7 @@ import dev.blocks.android.project.ProjectParking
 import dev.blocks.android.project.ProjectPresentationController
 import dev.blocks.android.project.ProjectService
 import dev.blocks.android.project.ProjectSummary
+import dev.blocks.android.project.ProjectUiPreferences
 import dev.blocks.android.project.ProjectWorkspace
 import dev.blocks.android.project.RegisteredBlock
 import dev.blocks.android.project.SessionAuthenticator
@@ -87,7 +89,6 @@ class MainActivityPresentationTest {
                     Session(authenticatedTenant, it)
                 },
                 workspace,
-                drafts,
                 newOperationId = { "ui-operation-${operationIds.incrementAndGet()}" },
             )
             ProjectAppDependencies(
@@ -117,10 +118,76 @@ class MainActivityPresentationTest {
                 assertTrue(activity.hasButton("Active project"))
                 assertFalse(activity.hasButton("Sync saved changes"))
                 assertFalse(activity.hasButton("Pick up this project"))
+                assertFalse(
+                    activity.texts().any {
+                        it.contains("NFC", ignoreCase = true) ||
+                            it.contains("QR", ignoreCase = true) ||
+                            it.contains("project links", ignoreCase = true)
+                    },
+                )
             }
             waitUntil { workspace.syncCalls > 0 }
             assertEquals(1, identity.restoreCalls)
             assertEquals(0, identity.signInCalls)
+        }
+    }
+
+    @Test
+    fun dashboardBodyHasOneSettingsEntryInsteadOfArchiveAndAccountActions() {
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+
+            scenario.onActivity { activity ->
+                assertTrue(activity.findViewById<Button>(ProjectUiIds.SETTINGS) != null)
+                assertFalse(activity.hasButton("Archive"))
+                assertFalse(activity.hasButton("Account"))
+                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                val items = activity.activeDialog?.listView?.adapter ?: error("Settings menu is missing")
+                assertEquals(
+                    listOf("Archive", "Tile view", "Switch account", "Sign out"),
+                    (0 until items.count).map { items.getItem(it).toString() },
+                )
+            }
+        }
+    }
+
+    @Test
+    fun viewPreferenceAndArchiveDashboardModeSurviveRecreation() {
+        workspace.cache = workspace.cache.copy(
+            archivedProjects = listOf(
+                project().copy(
+                    id = "00000000-0000-0000-0000-000000000013",
+                    name = "Archived project",
+                    lifecycle = ProjectLifecycle.ARCHIVED,
+                ),
+            ),
+        )
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                activity.selectDialogItem(1)
+            }
+            waitFor(scenario) { it.findViewById<View>(ProjectUiIds.PROJECT_TILES) != null }
+
+            scenario.recreate()
+            waitFor(scenario) { it.findViewById<View>(ProjectUiIds.PROJECT_TILES) != null }
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                activity.selectDialogItem(0)
+            }
+            waitFor(scenario) { activity ->
+                activity.texts().contains("Archive") && activity.hasButton("Archived project")
+            }
+            scenario.onActivity { activity ->
+                assertTrue(activity.findViewById<Button>(ProjectUiIds.CREATE_PROJECT) == null)
+                assertTrue(activity.findViewById<Button>(ProjectUiIds.ARCHIVE_MAIN) != null)
+            }
+
+            scenario.recreate()
+            waitFor(scenario) { it.hasButton("Archived project") }
+            scenario.onActivity { it.findViewById<Button>(ProjectUiIds.ARCHIVE_MAIN).performClick() }
+            waitFor(scenario) { it.hasButton("Active project") }
         }
     }
 
@@ -160,7 +227,7 @@ class MainActivityPresentationTest {
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             scenario.onActivity { activity ->
                 assertTrue(activity.hasButton("Active project"))
-                assertTrue(activity.texts().any { it.contains("Showing saved projects") })
+                assertFalse(activity.texts().any { it.contains("service", ignoreCase = true) })
             }
             assertEquals(0, workspace.syncCalls)
 
@@ -207,7 +274,6 @@ class MainActivityPresentationTest {
                         Session(TENANT_ID, "service-session")
                     },
                     ProjectSyncRepository(service, NoOpLegacyQueueReplay, drafts, persisted),
-                    drafts,
                 ),
                 identity = identity,
                 continuity = continuity,
@@ -233,6 +299,145 @@ class MainActivityPresentationTest {
             restarted.moveToState(Lifecycle.State.RESUMED)
             waitUntil { service.changeCalls > 0 }
             restarted.onActivity { assertTrue(it.hasButton("Active project")) }
+        }
+    }
+
+    @Test
+    fun emptyEncryptedCacheSupportsCreateNotesAndParkingAcrossAFullOfflineActivityRestart() {
+        AndroidEncryptedSyncStateStore(context).clearSyncState(TENANT_ID)
+        AndroidEncryptedDraftStore(context).clear(TENANT_ID)
+        val realAccepted = AndroidEncryptedAcceptedTenantContinuityStore(context).apply {
+            clear()
+            save(AcceptedTenantContinuity(TENANT_ID))
+        }
+        val service = CacheProjectService().apply { offline = true }
+        MainActivity.dependencyFactory = { activity ->
+            val drafts = AndroidEncryptedDraftStore(activity)
+            val repository = ProjectSyncRepository(
+                service,
+                NoOpLegacyQueueReplay,
+                drafts,
+                AndroidEncryptedSyncStateStore(activity),
+            )
+            presentationController = ProjectPresentationController(
+                SessionAuthenticator { Session(TENANT_ID, it) },
+                repository,
+                newOperationId = { "offline-ui-${operationIds.incrementAndGet()}" },
+            )
+            ProjectAppDependencies(
+                controller = presentationController,
+                identity = identity,
+                continuity = continuity,
+                acceptedTenantStore = realAccepted,
+                observeConnectivity = false,
+            )
+        }
+
+        ActivityScenario.launch(MainActivity::class.java).use { first ->
+            waitFor(first) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            first.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                activity.selectDialogItem(1)
+            }
+            waitFor(first) { it.findViewById<View>(ProjectUiIds.PROJECT_TILES) != null }
+            first.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.CREATE_PROJECT).performClick()
+                activity.activeDialog?.findViewById<EditText>(ProjectUiIds.PROJECT_NAME)
+                    ?.setText("Offline project") ?: error("Create-project input is missing")
+                activity.dialogButton("Create").callOnClick()
+            }
+            waitFor(first) { it.hasButton("Offline project") }
+            first.onActivity { activity ->
+                assertTrue(activity.findViewById<View>(ProjectUiIds.PENDING_CHANGES) != null)
+                assertFalse(
+                    activity.texts().any {
+                        it.contains("service", ignoreCase = true) ||
+                            it.contains("sync", ignoreCase = true) ||
+                            it.contains("retry", ignoreCase = true)
+                    },
+                )
+                activity.button("Offline project").performClick()
+            }
+            waitFor(first) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            first.onActivity { activity ->
+                activity.findViewById<EditText>(ProjectUiIds.NOTES).setText("Offline notes")
+                activity.findViewById<Button>(ProjectUiIds.SAVE_NOTES).performClick()
+            }
+            waitUntil { presentationController.state.projectPage?.notes?.body == "Offline notes" }
+            first.onActivity { it.findViewById<Button>(ProjectUiIds.PARK).performClick() }
+            first.onActivity { activity ->
+                activity.findViewById<EditText>(ProjectUiIds.PARKING_LOCATION).setText("Workbench")
+                activity.findViewById<EditText>(ProjectUiIds.PARKING_NEXT_ACTION).setText("Fit bracket")
+                activity.findViewById<EditText>(ProjectUiIds.PARKING_MUST_NOT_FORGET).setText("Bring screws")
+                activity.findViewById<Button>(ProjectUiIds.SAVE_PARKING).performClick()
+            }
+            waitUntil { presentationController.state.projectPage?.newestParking?.location == "Workbench" }
+        }
+
+        ActivityScenario.launch(MainActivity::class.java).use { restarted ->
+            waitFor(restarted) {
+                it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD &&
+                    it.hasButton("Offline project") &&
+                    it.findViewById<View>(ProjectUiIds.PROJECT_TILES) != null
+            }
+            restarted.onActivity { it.button("Offline project").performClick() }
+            waitFor(restarted) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            restarted.onActivity { activity ->
+                assertEquals("Offline notes", activity.findViewById<EditText>(ProjectUiIds.NOTES).text.toString())
+                assertTrue(activity.texts().contains("Workbench"))
+                assertTrue(activity.texts().contains("Fit bracket"))
+                assertTrue(activity.texts().contains("Bring screws"))
+
+                activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS).performClick()
+                activity.selectDialogItem(0)
+                val rename = requireNotNull(activity.activeDialog).window?.decorView?.descendants().orEmpty()
+                    .filterIsInstance<EditText>()
+                    .single()
+                rename.setText("Renamed offline project")
+                activity.dialogButton("Rename").callOnClick()
+            }
+            waitUntil {
+                presentationController.state.projectPage?.project?.name == "Renamed offline project"
+            }
+            waitFor(restarted) { it.texts().contains("Renamed offline project") }
+            restarted.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS).performClick()
+                activity.selectDialogItem(1)
+                activity.dialogButton("Archive").callOnClick()
+            }
+            waitFor(restarted) {
+                it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD && !it.hasButton("Renamed offline project")
+            }
+            restarted.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                activity.selectDialogItem(0)
+            }
+            waitFor(restarted) { it.hasButton("Renamed offline project") }
+
+            restarted.recreate()
+            waitFor(restarted) {
+                it.hasButton("Renamed offline project") &&
+                    it.findViewById<View>(ProjectUiIds.PROJECT_TILES) != null
+            }
+            restarted.onActivity { activity ->
+                activity.button("Renamed offline project").performClick()
+                activity.dialogButton("Reopen").callOnClick()
+            }
+            waitFor(restarted) {
+                !it.hasButton("Renamed offline project") &&
+                    it.findViewById<Button>(ProjectUiIds.ARCHIVE_MAIN) != null
+            }
+            restarted.onActivity { it.findViewById<Button>(ProjectUiIds.ARCHIVE_MAIN).performClick() }
+            waitFor(restarted) { it.hasButton("Renamed offline project") }
+            assertTrue(presentationController.state.pendingChanges)
+        }
+
+        ActivityScenario.launch(MainActivity::class.java).use { finalRestart ->
+            waitFor(finalRestart) {
+                it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD &&
+                    it.hasButton("Renamed offline project") &&
+                    it.findViewById<View>(ProjectUiIds.PROJECT_TILES) != null
+            }
         }
     }
 
@@ -274,7 +479,49 @@ class MainActivityPresentationTest {
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             scenario.onActivity { it.button("Active project").performClick() }
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
-            scenario.onActivity { it.findViewById<Button>(ProjectUiIds.BACK).performClick() }
+            scenario.onActivity { activity ->
+                assertTrue(activity.findViewById<Button>(ProjectUiIds.MAIN) != null)
+                assertTrue(activity.findViewById<Button>(ProjectUiIds.PARK) != null)
+                assertTrue(activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS) != null)
+                assertFalse(activity.hasButton("Back to projects"))
+                assertFalse(activity.hasButton("Add park message"))
+                assertFalse(activity.hasButton("Project actions"))
+
+                activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS).performClick()
+                val projectSettings = activity.activeDialog?.listView?.adapter
+                    ?: error("Project Settings is missing")
+                assertEquals(
+                    listOf("Rename", "Archive"),
+                    (0 until projectSettings.count).map { projectSettings.getItem(it).toString() },
+                )
+                activity.dialogButton("Cancel").callOnClick()
+
+                activity.findViewById<Button>(ProjectUiIds.PARK).performClick()
+                assertTrue(activity.findViewById<View>(ProjectUiIds.PARK_SHEET) != null)
+                val fields = activity.findViewById<ViewGroup>(android.R.id.content)
+                    .descendants()
+                    .filterIsInstance<EditText>()
+                    .map { it.id }
+                    .toSet()
+                assertEquals(
+                    setOf(
+                        ProjectUiIds.PARKING_LOCATION,
+                        ProjectUiIds.PARKING_NEXT_ACTION,
+                        ProjectUiIds.PARKING_MUST_NOT_FORGET,
+                    ),
+                    fields,
+                )
+                activity.findViewById<EditText>(ProjectUiIds.PARKING_LOCATION).setText("Retained place")
+                activity.findViewById<Button>(ProjectUiIds.BACK).performClick()
+                assertTrue(activity.findViewById<Button>(ProjectUiIds.PARK) != null)
+                activity.findViewById<Button>(ProjectUiIds.PARK).performClick()
+                assertEquals(
+                    "Retained place",
+                    activity.findViewById<EditText>(ProjectUiIds.PARKING_LOCATION).text.toString(),
+                )
+                activity.findViewById<Button>(ProjectUiIds.BACK).performClick()
+                activity.findViewById<Button>(ProjectUiIds.MAIN).performClick()
+            }
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
 
             assertTrue(workspace.mutations.isEmpty())
@@ -290,7 +537,7 @@ class MainActivityPresentationTest {
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
             scenario.onActivity { activity ->
                 activity.findViewById<EditText>(ProjectUiIds.NOTES).setText("Draft after recreation")
-                activity.findViewById<Button>(ProjectUiIds.ADD_PARKING).performClick()
+                activity.findViewById<Button>(ProjectUiIds.PARK).performClick()
             }
             scenario.onActivity { activity ->
                 activity.findViewById<EditText>(ProjectUiIds.PARKING_LOCATION).setText("Shelf")
@@ -299,13 +546,12 @@ class MainActivityPresentationTest {
             }
 
             scenario.recreate()
-            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            waitFor(scenario) {
+                it.screenTag() == ProjectUiIds.SCREEN_PROJECT &&
+                    it.findViewById<View>(ProjectUiIds.PARK_SHEET) != null
+            }
 
             scenario.onActivity { activity ->
-                assertEquals(
-                    "Draft after recreation",
-                    activity.findViewById<EditText>(ProjectUiIds.NOTES).text.toString(),
-                )
                 assertEquals("Shelf", activity.findViewById<EditText>(ProjectUiIds.PARKING_LOCATION).text.toString())
                 assertEquals(
                     "Open notebook",
@@ -314,6 +560,11 @@ class MainActivityPresentationTest {
                 assertEquals(
                     "Bring cable",
                     activity.findViewById<EditText>(ProjectUiIds.PARKING_MUST_NOT_FORGET).text.toString(),
+                )
+                activity.findViewById<Button>(ProjectUiIds.BACK).performClick()
+                assertEquals(
+                    "Draft after recreation",
+                    activity.findViewById<EditText>(ProjectUiIds.NOTES).text.toString(),
                 )
             }
             assertTrue(identity.restoreCalls >= 2)
@@ -322,12 +573,11 @@ class MainActivityPresentationTest {
         ActivityScenario.launch(MainActivity::class.java).use { restarted ->
             waitFor(restarted) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             restarted.onActivity { it.button("Active project").performClick() }
-            waitFor(restarted) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            waitFor(restarted) {
+                it.screenTag() == ProjectUiIds.SCREEN_PROJECT &&
+                    it.findViewById<View>(ProjectUiIds.PARK_SHEET) != null
+            }
             restarted.onActivity { activity ->
-                assertEquals(
-                    "Draft after recreation",
-                    activity.findViewById<EditText>(ProjectUiIds.NOTES).text.toString(),
-                )
                 assertEquals("Shelf", activity.findViewById<EditText>(ProjectUiIds.PARKING_LOCATION).text.toString())
                 assertEquals(
                     "Open notebook",
@@ -336,6 +586,11 @@ class MainActivityPresentationTest {
                 assertEquals(
                     "Bring cable",
                     activity.findViewById<EditText>(ProjectUiIds.PARKING_MUST_NOT_FORGET).text.toString(),
+                )
+                activity.findViewById<Button>(ProjectUiIds.BACK).performClick()
+                assertEquals(
+                    "Draft after recreation",
+                    activity.findViewById<EditText>(ProjectUiIds.NOTES).text.toString(),
                 )
             }
         }
@@ -370,7 +625,9 @@ class MainActivityPresentationTest {
                     "Conflict notes",
                     activity.findViewById<EditText>(ProjectUiIds.NOTES).text.toString(),
                 )
-                assertTrue(activity.texts().any { it.contains("retained for reconciliation") })
+                assertTrue(activity.findViewById<Button>(ProjectUiIds.RESOLVE_CONFLICT) != null)
+                assertTrue(activity.findViewById<View>(ProjectUiIds.PENDING_CHANGES) != null)
+                assertFalse(activity.texts().any { it.contains("service", ignoreCase = true) })
                 assertTrue(activity.findViewById<Button>(ProjectUiIds.RESOLVE_CONFLICT) != null)
             }
 
@@ -417,7 +674,7 @@ class MainActivityPresentationTest {
             if (condition()) return
             Thread.sleep(50)
         }
-        error("Timed out waiting for UI state")
+        error("Timed out waiting for UI state: ${presentationController.state}")
     }
 
     private fun Activity.screenTag() = findViewById<ViewGroup>(android.R.id.content)
@@ -445,6 +702,11 @@ class MainActivityPresentationTest {
         .window?.decorView?.descendants().orEmpty()
         .filterIsInstance<Button>()
         .single { it.text.toString() == text }
+
+    private fun MainActivity.selectDialogItem(index: Int) {
+        val list = requireNotNull(activeDialog).listView
+        list.performItemClick(list.getChildAt(index), index, list.adapter.getItemId(index))
+    }
 
     private fun MainActivity.dialogTexts() = requireNotNull(activeDialog)
         .window?.decorView?.descendants().orEmpty()
@@ -487,6 +749,8 @@ class MainActivityPresentationTest {
     }
 
     private class FakeWorkspace : ProjectWorkspace {
+        private var drafts = FormDrafts()
+        private var preferences = ProjectUiPreferences()
         @Volatile
         var cache = ProjectCacheState(
             activeProjects = listOf(project()),
@@ -511,6 +775,16 @@ class MainActivityPresentationTest {
             activatedTenants += session.tenantId
         }
         override fun snapshot(session: Session) = result()
+        override fun projectDrafts(session: Session) = drafts
+        override fun updateProjectDrafts(
+            session: Session,
+            update: (FormDrafts) -> FormDrafts,
+        ): FormDrafts = update(drafts).also { drafts = it }
+        override fun uiPreferences(session: Session) = preferences
+        override fun updateUiPreferences(
+            session: Session,
+            update: (ProjectUiPreferences) -> ProjectUiPreferences,
+        ) = update(preferences).also { preferences = it }
         override fun archivedProjects(session: Session) = cache.archivedProjects
         override fun projectPage(session: Session, projectId: String): ProjectPage {
             pageCalls += 1
@@ -542,7 +816,8 @@ class MainActivityPresentationTest {
             session: Session,
             name: String,
             operationId: String,
-        ) = queue(ProjectMutation(operationId, ProjectMutationType.CREATE_PROJECT, operationId, projectName = name))
+            clientId: String,
+        ) = queue(ProjectMutation(operationId, ProjectMutationType.CREATE_PROJECT, clientId, projectName = name))
         override fun queueRenameProject(
             session: Session,
             projectId: String,
@@ -587,6 +862,7 @@ class MainActivityPresentationTest {
             parking: ParkingDraft,
             supersedesId: String?,
             operationId: String,
+            clientId: String,
         ) = queue(ProjectMutation(operationId, ProjectMutationType.ADD_PARKING, projectId, parking = parking))
         override fun discardConflict(session: Session, operationId: String): BackgroundSyncResult {
             cache = cache.copy(
@@ -623,6 +899,8 @@ class MainActivityPresentationTest {
         }
         override fun clearLocalState(session: Session) {
             cache = ProjectCacheState()
+            drafts = FormDrafts()
+            preferences = ProjectUiPreferences()
         }
 
         @Synchronized
@@ -631,7 +909,7 @@ class MainActivityPresentationTest {
             if (cache.commands.none { it.operationId == command.operationId }) {
                 cache = cache.copy(commands = cache.commands + command)
             }
-            return backgroundSync(Session(TENANT_ID, "token"))
+            return result()
         }
 
         private fun result(): BackgroundSyncResult {
@@ -662,12 +940,25 @@ class MainActivityPresentationTest {
     private class CacheProjectService : ProjectService {
         @Volatile
         var changeCalls = 0
+        @Volatile
+        var offline = false
 
-        override fun listProjects(session: Session, lifecycle: ProjectLifecycle) = when (lifecycle) {
-            ProjectLifecycle.ACTIVE -> listOf(project())
-            ProjectLifecycle.ARCHIVED -> emptyList()
+        override fun listProjects(session: Session, lifecycle: ProjectLifecycle): List<ProjectSummary> {
+            failIfOffline()
+            return when (lifecycle) {
+                ProjectLifecycle.ACTIVE -> listOf(project())
+                ProjectLifecycle.ARCHIVED -> emptyList()
+            }
         }
-        override fun createProject(session: Session, name: String, idempotencyKey: String) = error("Not used")
+        override fun createProject(
+            session: Session,
+            name: String,
+            clientId: String?,
+            idempotencyKey: String,
+        ): ProjectSummary {
+            failIfOffline()
+            return project().copy(name = name, clientId = clientId)
+        }
         override fun projectPage(session: Session, projectId: String) = page()
         override fun renameProject(session: Session, projectId: String, rowVersion: Int, name: String) = error("Not used")
         override fun archiveProject(session: Session, projectId: String, rowVersion: Int) = error("Not used")
@@ -679,10 +970,15 @@ class MainActivityPresentationTest {
             projectId: String,
             parking: ParkingDraft,
             supersedesId: String?,
+            clientId: String?,
+            occurredAt: String?,
             idempotencyKey: String,
         ): ProjectParking = error("Not used")
         override fun parking(session: Session, projectId: String) = emptyList<ProjectParking>()
-        override fun blocks(session: Session) = emptyList<PhysicalBlock>()
+        override fun blocks(session: Session): List<PhysicalBlock> {
+            failIfOffline()
+            return emptyList()
+        }
         override fun registerBlock(session: Session, label: String, idempotencyKey: String): RegisteredBlock =
             error("Not used")
         override fun bindBlock(
@@ -695,7 +991,12 @@ class MainActivityPresentationTest {
         override fun lookupBlock(session: Session, tagToken: String): BlockLookup = error("Not used")
         override fun changes(session: Session, cursor: String?, limit: Int): ChangePage {
             changeCalls += 1
+            failIfOffline()
             return ChangePage(emptyList(), cursor, false)
+        }
+
+        private fun failIfOffline() {
+            if (offline) throw java.io.IOException("API unavailable")
         }
     }
 

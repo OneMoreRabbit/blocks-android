@@ -1,7 +1,7 @@
-# Blocks Service API 0.3 contract artifacts
+# Blocks Service API 0.4 contract artifacts
 
-These files are byte-for-byte copies delivered by the Atlas 1.23 briefing from
-`blocks-service-api` 0.3. The OpenAPI document is the build input for generated client
+These files are byte-for-byte copies delivered by the current Atlas briefing from
+`blocks-service-api` 0.4. The OpenAPI document is the build input for generated client
 models; the event schemas are retained for synchronization compatibility tests.
 
 To refresh them after an architecture-approved edge re-pin:

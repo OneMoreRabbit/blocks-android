@@ -35,7 +35,6 @@ class ProjectPresentationControllerTest {
         val controller = ProjectPresentationController(
             authenticator = SessionAuthenticator { error("online session exchange must not run first") },
             workspace = workspace,
-            draftStore = drafts,
         )
 
         controller.restoreCached(TENANT_ID)
@@ -43,7 +42,7 @@ class ProjectPresentationControllerTest {
 
         assertEquals(ProjectScreen.PROJECT, controller.state.screen)
         assertTrue(controller.state.sessionConfirmationRequired)
-        assertEquals(0, workspace.pageCalls)
+        assertEquals(1, workspace.pageCalls)
     }
 
     @Test
@@ -53,7 +52,6 @@ class ProjectPresentationControllerTest {
         val controller = ProjectPresentationController(
             authenticator = SessionAuthenticator { Session("different-tenant", it) },
             workspace = workspace,
-            draftStore = drafts,
         )
         controller.restoreCached(TENANT_ID)
 
@@ -107,27 +105,27 @@ class ProjectPresentationControllerTest {
     }
 
     @Test
-    fun retryableCreateReusesPersistedIdentityAcrossRestartAndClearsAfterAck() {
+    fun locallyCommittedCreateKeepsItsRetryIdentityInTheQueueNotTheEditingDraft() {
         val drafts = MemoryDrafts()
         val workspace = FakeWorkspace().apply { offline = true }
-        val first = controller(workspace, drafts, ids = ArrayDeque(listOf("create-key", "unused")))
+        val first = controller(workspace, drafts, ids = ArrayDeque(listOf("create-key")))
         first.login("identity-token")
         first.createProject("New project")
 
         val recreated = controller(workspace, drafts, ids = ArrayDeque(listOf("different-key")))
         recreated.login("identity-token")
-        recreated.createProject("New project")
 
-        assertEquals(listOf("create-key", "create-key"), workspace.operationIds)
-        assertEquals("New project", recreated.state.drafts.projectName)
-        workspace.offline = false
-        recreated.synchronize()
+        assertEquals(listOf("create-key"), workspace.operationIds)
+        assertEquals(listOf("create-key"), workspace.cache.commands.map { it.operationId })
         assertEquals("", recreated.state.drafts.projectName)
         assertTrue(recreated.state.drafts.pendingMutations.isEmpty())
+        workspace.offline = false
+        recreated.synchronize()
+        assertTrue(workspace.cache.commands.isEmpty())
     }
 
     @Test
-    fun explicitCreateDraftDiscardRemovesItsQueuedOperationAndDraft() {
+    fun explicitCreateDraftDiscardKeepsTheAlreadyCommittedLocalProjectOperation() {
         val drafts = MemoryDrafts()
         val workspace = FakeWorkspace().apply { offline = true }
         val controller = controller(workspace, drafts, ids = ArrayDeque(listOf("create-operation")))
@@ -138,8 +136,8 @@ class ProjectPresentationControllerTest {
 
         assertEquals("", controller.state.drafts.projectName)
         assertTrue(controller.state.drafts.pendingMutations.isEmpty())
-        assertTrue(workspace.cache.commands.isEmpty())
-        assertTrue("create-operation" in workspace.cache.retiredOperationIds)
+        assertEquals(listOf("create-operation"), workspace.cache.commands.map { it.operationId })
+        assertFalse("create-operation" in workspace.cache.retiredOperationIds)
     }
 
     @Test
@@ -154,8 +152,10 @@ class ProjectPresentationControllerTest {
         controller.saveNotes("Keep my edit")
 
         assertTrue(controller.state.reconciliationRequired)
-        assertEquals("Keep my edit", controller.state.drafts.projectNotes[PROJECT_ID])
-        assertTrue(controller.state.status.orEmpty().contains("retained"))
+        assertTrue(controller.state.pendingChanges)
+        assertTrue(controller.state.drafts.projectNotes.isEmpty())
+        assertEquals("Keep my edit", controller.state.conflict?.localNotes)
+        assertEquals(null, controller.state.status)
     }
 
     @Test
@@ -193,9 +193,11 @@ class ProjectPresentationControllerTest {
         controller.addParking("Shelf", "Open notebook", "Cable")
         assertEquals(listOf("parking"), workspace.mutations)
         assertNull(workspace.lastSupersedesId)
-        assertEquals("Shelf", controller.state.drafts.projectParking[PROJECT_ID]?.location)
-        assertEquals("Open notebook", controller.state.drafts.projectParking[PROJECT_ID]?.nextAction)
-        assertEquals("Cable", controller.state.drafts.projectParking[PROJECT_ID]?.mustNotForget)
+        assertTrue(controller.state.drafts.projectParking.isEmpty())
+        assertEquals("Shelf", workspace.cache.commands.single().parking?.location)
+        assertEquals("Open notebook", workspace.cache.commands.single().parking?.nextAction)
+        assertEquals("Cable", workspace.cache.commands.single().parking?.mustNotForget)
+        assertFalse(controller.state.showParkingForm)
     }
 
     @Test
@@ -211,6 +213,35 @@ class ProjectPresentationControllerTest {
 
         controller.reopenProject(controller.state.archivedProjects.single())
         assertEquals(listOf(ProjectLifecycle.ACTIVE), controller.state.activeProjects.map { it.lifecycle })
+    }
+
+    @Test
+    fun dashboardViewArchiveModeAndParkDraftSurviveControllerRecreation() {
+        val drafts = MemoryDrafts()
+        val workspace = FakeWorkspace().apply {
+            cache = cache.copy(
+                archivedProjects = listOf(
+                    project().copy(name = "Archived", lifecycle = ProjectLifecycle.ARCHIVED),
+                ),
+            )
+        }
+        val first = controller(workspace, drafts)
+        first.login("identity-token")
+        first.toggleDashboardView()
+        first.showArchive()
+        first.openProject(PROJECT_ID)
+        first.showParkingForm()
+        first.updateParking(ParkingDraft("Shelf", "Open notebook", "Bring cable"))
+        first.hideParkingForm()
+
+        val restored = controller(workspace, drafts)
+        restored.login("restored-token")
+
+        assertEquals(DashboardView.TILES, restored.state.dashboardView)
+        assertTrue(restored.state.archiveMode)
+        restored.openProject(PROJECT_ID)
+        assertTrue(restored.state.showParkingForm)
+        assertEquals("Shelf", restored.state.drafts.projectParking[PROJECT_ID]?.location)
     }
 
     @Test
@@ -252,7 +283,6 @@ class ProjectPresentationControllerTest {
     ) = ProjectPresentationController(
         authenticator = SessionAuthenticator { Session(TENANT_ID, it) },
         workspace = workspace.apply { draftStore = drafts },
-        draftStore = drafts,
         newOperationId = { ids.removeFirst() },
     )
 
@@ -285,9 +315,22 @@ class ProjectPresentationControllerTest {
         val clearedTenants = mutableListOf<String>()
         var lastSupersedesId: String? = "not-called"
         val conflictRetries = mutableListOf<Pair<String, String>>()
+        var preferences = ProjectUiPreferences()
 
         override fun activate(session: Session) = Unit
         override fun snapshot(session: Session) = result()
+        override fun projectDrafts(session: Session) = draftStore.load(session.tenantId)
+        override fun updateProjectDrafts(
+            session: Session,
+            update: (FormDrafts) -> FormDrafts,
+        ): FormDrafts = update(draftStore.load(session.tenantId)).also {
+            draftStore.save(session.tenantId, it)
+        }
+        override fun uiPreferences(session: Session) = preferences
+        override fun updateUiPreferences(
+            session: Session,
+            update: (ProjectUiPreferences) -> ProjectUiPreferences,
+        ) = update(preferences).also { preferences = it }
         override fun archivedProjects(session: Session) = cache.archivedProjects
         override fun projectPage(session: Session, projectId: String): ProjectPage {
             pageCalls += 1
@@ -306,7 +349,8 @@ class ProjectPresentationControllerTest {
             session: Session,
             name: String,
             operationId: String,
-        ) = queue("create", operationId, ProjectMutationType.CREATE_PROJECT, operationId, projectName = name)
+            clientId: String,
+        ) = queue("create", operationId, ProjectMutationType.CREATE_PROJECT, clientId, projectName = name)
 
         override fun queueRenameProject(
             session: Session,
@@ -362,6 +406,7 @@ class ProjectPresentationControllerTest {
             parking: ParkingDraft,
             supersedesId: String?,
             operationId: String,
+            clientId: String,
         ): BackgroundSyncResult {
             lastSupersedesId = supersedesId
             return queue("parking", operationId, ProjectMutationType.ADD_PARKING, projectId, parking = parking)
@@ -435,12 +480,21 @@ class ProjectPresentationControllerTest {
                     ),
                 )
             }
+            cleanDraft(cache.commands.first { it.operationId == operationId })
             onQueue?.invoke()
             if (!offline && !conflict) acknowledge(cache.commands.first { it.operationId == operationId })
             return result()
         }
 
         private fun acknowledge(command: ProjectMutation) {
+            cleanDraft(command)
+            cache = cache.copy(
+                commands = cache.commands.filterNot { it.operationId == command.operationId },
+                retiredOperationIds = cache.retiredOperationIds + command.operationId,
+            )
+        }
+
+        private fun cleanDraft(command: ProjectMutation) {
             val drafts = draftStore.load(TENANT_ID)
             val cleaned = when (command.type) {
                 ProjectMutationType.CREATE_PROJECT -> drafts.copy(
@@ -469,10 +523,13 @@ class ProjectPresentationControllerTest {
                 )
                 else -> drafts
             }
-            draftStore.save(TENANT_ID, cleaned)
-            cache = cache.copy(
-                commands = cache.commands.filterNot { it.operationId == command.operationId },
-                retiredOperationIds = cache.retiredOperationIds + command.operationId,
+            draftStore.save(
+                TENANT_ID,
+                cleaned.copy(
+                    pendingMutations = cleaned.pendingMutations.filterValues {
+                        it.idempotencyKey != command.operationId
+                    },
+                ),
             )
         }
 

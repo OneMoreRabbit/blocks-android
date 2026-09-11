@@ -4,8 +4,9 @@ import com.google.gson.Gson
 import dev.blocks.android.api.generated.v02.model.CloseWithContinuation
 import dev.blocks.android.api.generated.v02.model.EventEnvelopeOut
 import dev.blocks.android.api.generated.v02.model.ReentryOut
-import dev.blocks.android.api.generated.v03.model.ProjectPageOut
-import dev.blocks.android.api.generated.v03.model.ProjectParkIn
+import dev.blocks.android.api.generated.v04.model.ProjectIn
+import dev.blocks.android.api.generated.v04.model.ProjectPageOut
+import dev.blocks.android.api.generated.v04.model.ProjectParkIn
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -85,7 +86,7 @@ class GeneratedContractModelsTest {
     }
 
     @Test
-    fun decodesTheGeneratedApi03ProjectPageAsOneRead() {
+    fun decodesTheGeneratedApi04ProjectPageAsOneRead() {
         val page = json.fromJson(
             """
             {
@@ -117,15 +118,23 @@ class GeneratedContractModelsTest {
     }
 
     @Test
-    fun generatedApi03ParkingRequestContainsExactlyThreeAnswersByDefault() {
+    fun generatedApi04RequestsCarryClientResourceIdentityAndAuthoredParkingTime() {
+        val clientId = java.util.UUID.fromString("00000000-0000-0000-0000-000000000099")
+        val project = ProjectIn(name = "Local project", clientId = clientId)
         val request = ProjectParkIn(
             whereIAm = "At the boundary",
             nextPhysicalAction = "Open the test",
             mustNotForget = "Keep the retry key",
+            clientId = clientId,
+            occurredAt = "2026-09-11T12:00:00Z",
         )
 
         assertEquals(
-            setOf("where_i_am", "next_physical_action", "must_not_forget"),
+            setOf("name", "client_id"),
+            JSONObject(json.toJson(project)).keys().asSequence().toSet(),
+        )
+        assertEquals(
+            setOf("where_i_am", "next_physical_action", "must_not_forget", "client_id", "occurred_at"),
             JSONObject(json.toJson(request)).keys().asSequence().toSet(),
         )
     }

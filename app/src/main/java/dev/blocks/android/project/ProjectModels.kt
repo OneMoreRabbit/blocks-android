@@ -1,6 +1,7 @@
 package dev.blocks.android.project
 
 import dev.blocks.android.mvp.ChangePage
+import dev.blocks.android.mvp.FormDrafts
 import dev.blocks.android.mvp.ParkingDraft
 import dev.blocks.android.mvp.Session
 import java.util.UUID
@@ -19,6 +20,7 @@ data class ProjectSummary(
     val createdAt: String,
     val updatedAt: String,
     val archivedAt: String? = null,
+    val clientId: String? = null,
 )
 
 data class ProjectNotes(
@@ -36,6 +38,8 @@ data class ProjectParking(
     val mustNotForget: String,
     val authoredByUserId: String,
     val createdAt: String,
+    val occurredAt: String = createdAt,
+    val clientId: String? = null,
     val deviceId: String? = null,
     val supersedesId: String? = null,
 )
@@ -84,22 +88,39 @@ enum class ProjectMutationType {
 
 enum class ProjectMutationStatus { PENDING, REQUIRES_RECONCILIATION }
 
-/** A complete, immutable retry description for one API 0.3 operation. */
+enum class DashboardView { LIST, TILES }
+
+data class ProjectUiPreferences(
+    val dashboardView: DashboardView = DashboardView.LIST,
+    val archiveMode: Boolean = false,
+)
+
+/** A complete, immutable retry description for one Android-owned synchronization operation. */
 data class ProjectMutation(
     val operationId: String,
     val type: ProjectMutationType,
     val targetId: String,
     val projectId: String? = null,
     val idempotencyKey: String? = null,
+    val clientResourceId: String? = null,
     val ifMatch: Int? = null,
     val projectName: String? = null,
     val notesBody: String? = null,
     val parking: ParkingDraft? = null,
     val supersedesId: String? = null,
+    val dependsOnOperationId: String? = null,
+    val localCreatedAt: String? = null,
     val status: ProjectMutationStatus = ProjectMutationStatus.PENDING,
     val deliveryUncertain: Boolean = false,
     val failureMessage: String? = null,
     val authoritativeStateConfirmed: Boolean = false,
+    val authoritativePage: ProjectPage? = null,
+    val contractVersion: String = "0.4",
+)
+
+data class ProjectIdentityMapping(
+    val provisionalId: String,
+    val serverId: String,
 )
 
 data class ProjectCacheState(
@@ -113,6 +134,9 @@ data class ProjectCacheState(
     val blocksLoaded: Boolean = false,
     val commands: List<ProjectMutation> = emptyList(),
     val retiredOperationIds: List<String> = emptyList(),
+    val provisionalProjectIds: List<String> = emptyList(),
+    val projectIdMappings: List<ProjectIdentityMapping> = emptyList(),
+    val projectsAwaitingNotesBaseline: List<String> = emptyList(),
 )
 
 data class BackgroundSyncResult(
@@ -144,7 +168,12 @@ data class ProjectConflict(
 
 interface ProjectService {
     fun listProjects(session: Session, lifecycle: ProjectLifecycle): List<ProjectSummary>
-    fun createProject(session: Session, name: String, idempotencyKey: String): ProjectSummary
+    fun createProject(
+        session: Session,
+        name: String,
+        clientId: String?,
+        idempotencyKey: String,
+    ): ProjectSummary
     fun projectPage(session: Session, projectId: String): ProjectPage
     fun renameProject(session: Session, projectId: String, rowVersion: Int, name: String): ProjectSummary
     fun archiveProject(session: Session, projectId: String, rowVersion: Int): ProjectSummary
@@ -156,6 +185,8 @@ interface ProjectService {
         projectId: String,
         parking: ParkingDraft,
         supersedesId: String?,
+        clientId: String?,
+        occurredAt: String?,
         idempotencyKey: String,
     ): ProjectParking
     fun parking(session: Session, projectId: String): List<ProjectParking>
@@ -179,6 +210,13 @@ fun interface SessionAuthenticator {
 interface ProjectWorkspace {
     fun activate(session: Session)
     fun snapshot(session: Session): BackgroundSyncResult
+    fun projectDrafts(session: Session): FormDrafts
+    fun updateProjectDrafts(session: Session, update: (FormDrafts) -> FormDrafts): FormDrafts
+    fun uiPreferences(session: Session): ProjectUiPreferences
+    fun updateUiPreferences(
+        session: Session,
+        update: (ProjectUiPreferences) -> ProjectUiPreferences,
+    ): ProjectUiPreferences
     fun archivedProjects(session: Session): List<ProjectSummary>
     fun projectPage(session: Session, projectId: String): ProjectPage
     fun backgroundSync(session: Session): BackgroundSyncResult
@@ -186,6 +224,7 @@ interface ProjectWorkspace {
         session: Session,
         name: String,
         operationId: String = newOperationIdentity(),
+        clientId: String = operationId,
     ): BackgroundSyncResult
     fun queueRenameProject(
         session: Session,
@@ -219,6 +258,7 @@ interface ProjectWorkspace {
         parking: ParkingDraft,
         supersedesId: String? = null,
         operationId: String = newOperationIdentity(),
+        clientId: String = operationId,
     ): BackgroundSyncResult
     fun discardConflict(session: Session, operationId: String): BackgroundSyncResult
     fun retryConflict(

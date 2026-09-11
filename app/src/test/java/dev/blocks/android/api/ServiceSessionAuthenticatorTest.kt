@@ -7,7 +7,7 @@ import org.junit.Test
 
 class ServiceSessionAuthenticatorTest {
     @Test
-    fun decodesTheGeneratedApi03SessionWithoutPersistingOrChangingTheCredential() {
+    fun decodesTheGeneratedApi04SessionWithoutPersistingOrChangingTheCredential() {
         val authenticator = ServiceSessionAuthenticator(SessionTransport {
             assertEquals("google-identity", it)
             ApiResponse.Success(

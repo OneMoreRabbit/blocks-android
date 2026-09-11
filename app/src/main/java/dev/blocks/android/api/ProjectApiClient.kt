@@ -3,7 +3,7 @@ package dev.blocks.android.api
 import java.net.HttpURLConnection
 import java.net.URI
 
-/** API 0.3 transport. It intentionally exposes no retired session or map route. */
+/** API 0.4 transport. It intentionally exposes no retired session or map route. */
 interface ProjectTransport {
     fun listProjects(identityToken: String, tenantId: String, status: String): ApiResponse
     fun createProject(
@@ -59,7 +59,7 @@ interface ProjectTransport {
 
 class ProjectApiClient(
     private val baseUri: URI,
-    private val clientVersion: String = "0.3",
+    private val clientVersion: String = "0.4",
 ) : ProjectTransport {
     override fun listProjects(identityToken: String, tenantId: String, status: String) = request(
         "GET",

@@ -303,6 +303,19 @@
       "ProjectIn": {
         "additionalProperties": false,
         "properties": {
+          "client_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "**Optional client identifier, unique within your tenant.** A local-first client mints this at local commit and always supplies it, so a create replayed after any offline period cannot duplicate. It is **not** the canonical id: Service still generates that and returns both. Two tenants may use the same value for unrelated projects, and neither can learn anything about the other. Omit it to keep API 0.3 behaviour.",
+            "title": "Client Id"
+          },
           "name": {
             "maxLength": 200,
             "minLength": 1,
@@ -317,7 +330,6 @@
         "type": "object"
       },
       "ProjectOut": {
-        "description": "A superset of the 0.2 project shape, deliberately.\n\n0.2 published `{id, tenant_id, name}` on the same path. Serving a *narrower*\nbody here would break an installed 0.2 client during its compatibility\nwindow, so `tenant_id` is retained and everything else is additive \u2014 and the\ncontract's own rule is that unknown additive fields are ignored safely.\n\nOne behavioural difference a 0.2 client will see: the list now returns active\nprojects only. Archiving did not exist in 0.2, so nothing it created can\ndisappear; a project only leaves the list once someone archives it in 0.3,\nwhich is what archiving means.",
         "properties": {
           "archived_at": {
             "anyOf": [
@@ -330,6 +342,19 @@
               }
             ],
             "title": "Archived At"
+          },
+          "client_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Your identifier for this project, if you supplied one.",
+            "title": "Client Id"
           },
           "created_at": {
             "format": "date-time",
@@ -414,6 +439,19 @@
         "additionalProperties": false,
         "description": "The three answers, all required. A correction supersedes rather than edits.",
         "properties": {
+          "client_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional client identifier, unique within your tenant. Not the canonical id.",
+            "title": "Client Id"
+          },
           "device_id": {
             "anyOf": [
               {
@@ -437,6 +475,19 @@
             "minLength": 1,
             "title": "Next Physical Action",
             "type": "string"
+          },
+          "occurred_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "When the user committed this park locally, normalized UTC. Supplied by a local-first client; omitted by older clients, which get the server's acceptance time. Recorded as given and never silently rewritten \u2014 ordering by it is what stops delayed delivery reordering the user's own history.",
+            "title": "Occurred At"
           },
           "supersedes_id": {
             "anyOf": [
@@ -467,12 +518,24 @@
         "type": "object"
       },
       "ProjectParkingOut": {
-        "description": "Named apart from 0.2's `ParkingOut` on purpose.\n\nA model-name collision makes the generator mangle BOTH into\nmodule-qualified names, which would rename a published 0.2 schema out from\nunder a client still inside its compatibility window.",
         "properties": {
           "authored_by_user_id": {
             "format": "uuid",
             "title": "Authored By User Id",
             "type": "string"
+          },
+          "client_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Your identifier for this record, if you supplied one.",
+            "title": "Client Id"
           },
           "created_at": {
             "format": "date-time",
@@ -504,6 +567,12 @@
             "title": "Next Physical Action",
             "type": "string"
           },
+          "occurred_at": {
+            "description": "When the user committed it. Always present from 0.4.",
+            "format": "date-time",
+            "title": "Occurred At",
+            "type": "string"
+          },
           "project_id": {
             "format": "uuid",
             "title": "Project Id",
@@ -527,6 +596,7 @@
           }
         },
         "required": [
+          "occurred_at",
           "id",
           "project_id",
           "where_i_am",
@@ -677,7 +747,7 @@
   "info": {
     "summary": "Authoritative domain, tenancy, and device-coordination API for Blocks.",
     "title": "Blocks Service API",
-    "version": "0.3.0"
+    "version": "0.4.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -1595,10 +1665,11 @@
         },
         "summary": "The dashboard \u2014 active projects, or archived on request",
         "tags": [
-          "projects-0.3"
+          "projects"
         ]
       },
       "post": {
+        "description": "`201` on first creation, and on a replay while the idempotency result is retained \u2014 that response carries the **original stored bytes**. `200` on a resource replay after the result expired, carrying the resource's **current state**. `409` if the same `client_id` names a different operation in this tenant.",
         "operationId": "create_project_v1_tenants__tenant_id__projects_post",
         "parameters": [
           {
@@ -1659,6 +1730,36 @@
           "required": true
         },
         "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectOut"
+                }
+              }
+            },
+            "description": "Resource replay. The ordinary idempotency result had expired, so the request was recognised by tenant-scoped client identity instead. The body is the resource's CURRENT state, not the original stored response, and nothing was created.",
+            "headers": {
+              "Idempotent-Replay": {
+                "description": "`true` when this response was replayed from a previously stored outcome rather than executed.",
+                "schema": {
+                  "enum": [
+                    "true"
+                  ],
+                  "type": "string"
+                }
+              },
+              "Idempotent-Replay-Source": {
+                "description": "`resource` \u2014 recognised by client identity after the stored result expired. Absent on a retained-result replay, which returns 201 with the original bytes.",
+                "schema": {
+                  "enum": [
+                    "resource"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
           "201": {
             "content": {
               "application/json": {
@@ -1733,7 +1834,7 @@
         },
         "summary": "Create a project",
         "tags": [
-          "projects-0.3"
+          "projects"
         ]
       }
     },
@@ -1845,7 +1946,7 @@
         },
         "summary": "The project page \u2014 opening it changes nothing",
         "tags": [
-          "projects-0.3"
+          "projects"
         ]
       },
       "patch": {
@@ -1985,7 +2086,7 @@
         },
         "summary": "Rename a project",
         "tags": [
-          "projects-0.3"
+          "projects"
         ]
       }
     },
@@ -2117,7 +2218,7 @@
         },
         "summary": "Archive \u2014 hide from the dashboard, never delete",
         "tags": [
-          "projects-0.3"
+          "projects"
         ]
       }
     },
@@ -2228,7 +2329,7 @@
         },
         "summary": "Read the project's notes",
         "tags": [
-          "projects-0.3"
+          "projects"
         ]
       },
       "put": {
@@ -2369,7 +2470,7 @@
         },
         "summary": "Save the project's notes",
         "tags": [
-          "projects-0.3"
+          "projects"
         ]
       }
     },
@@ -2485,10 +2586,11 @@
         },
         "summary": "Park messages, newest first",
         "tags": [
-          "projects-0.3"
+          "projects"
         ]
       },
       "post": {
+        "description": "`201` on first append and on a retained-result replay (original bytes). `200` on a resource replay after expiry (current state). `409` if the same `client_id` names a different operation in this tenant.",
         "operationId": "add_parking_v1_tenants__tenant_id__projects__project_id__parking_post",
         "parameters": [
           {
@@ -2559,6 +2661,36 @@
           "required": true
         },
         "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectParkingOut"
+                }
+              }
+            },
+            "description": "Resource replay. The ordinary idempotency result had expired, so the request was recognised by tenant-scoped client identity instead. The body is the resource's CURRENT state, not the original stored response, and nothing was created.",
+            "headers": {
+              "Idempotent-Replay": {
+                "description": "`true` when this response was replayed from a previously stored outcome rather than executed.",
+                "schema": {
+                  "enum": [
+                    "true"
+                  ],
+                  "type": "string"
+                }
+              },
+              "Idempotent-Replay-Source": {
+                "description": "`resource` \u2014 recognised by client identity after the stored result expired. Absent on a retained-result replay, which returns 201 with the original bytes.",
+                "schema": {
+                  "enum": [
+                    "resource"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
           "201": {
             "content": {
               "application/json": {
@@ -2643,7 +2775,7 @@
         },
         "summary": "Add a park message",
         "tags": [
-          "projects-0.3"
+          "projects"
         ]
       }
     },
@@ -2775,7 +2907,7 @@
         },
         "summary": "Reopen \u2014 restore to the dashboard",
         "tags": [
-          "projects-0.3"
+          "projects"
         ]
       }
     }
