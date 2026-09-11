@@ -2,6 +2,7 @@ package dev.blocks.android.state
 
 import com.google.gson.Gson
 import dev.blocks.android.mvp.OfflineOperation
+import dev.blocks.android.mvp.FormDrafts
 import dev.blocks.android.mvp.OutcomeTier
 import dev.blocks.android.mvp.Project
 import dev.blocks.android.mvp.QueuedCommand
@@ -9,10 +10,13 @@ import dev.blocks.android.mvp.TenantSyncState
 import dev.blocks.android.mvp.WorkSession
 import dev.blocks.android.mvp.WorkSessionState
 import dev.blocks.android.project.ProjectCacheState
+import dev.blocks.android.project.ProjectIdentityMapping
 import dev.blocks.android.project.ProjectLifecycle
 import dev.blocks.android.project.ProjectMutation
 import dev.blocks.android.project.ProjectMutationType
 import dev.blocks.android.project.ProjectSummary
+import dev.blocks.android.project.DashboardView
+import dev.blocks.android.project.ProjectUiPreferences
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -46,12 +50,13 @@ class SyncStateStorageCodecTest {
             ),
             changeCursor = "41",
             retiredIdempotencyKeys = listOf("old-key"),
+            projectUiPreferences = ProjectUiPreferences(DashboardView.TILES, archiveMode = true),
         )
 
         val rows = SyncStateRowCodec().encode(state)
         val decoded = SyncStateRowCodec().decode(rows)
 
-        assertEquals(3, rows.schemaVersion)
+        assertEquals(5, rows.schemaVersion)
         assertEquals(1, rows.projects.size)
         assertEquals(1, rows.commands.size)
         assertEquals(1, rows.retiredIdempotencyKeys.size)
@@ -113,7 +118,7 @@ class SyncStateStorageCodecTest {
 
     @Test
     fun rejectsAnUnknownDatabaseRowSchemaWithoutDiscardingIt() {
-        val rows = SyncStateRowCodec().encode(TenantSyncState()).copy(schemaVersion = 4)
+        val rows = SyncStateRowCodec().encode(TenantSyncState()).copy(schemaVersion = 6)
 
         val error = runCatching { SyncStateRowCodec().decode(rows) }.exceptionOrNull()
 
@@ -153,7 +158,11 @@ class SyncStateStorageCodecTest {
                 activeProjects = listOf(project),
                 activeProjectsLoaded = true,
                 commands = listOf(command),
+                projectIdMappings = listOf(ProjectIdentityMapping("local-project", project.id)),
+                projectsAwaitingNotesBaseline = listOf(project.id),
             ),
+            projectDrafts = FormDrafts(projectNotes = mapOf(project.id to "Unsent notes")),
+            projectDraftsMigrated = true,
         )
 
         assertEquals(state, SyncStateRowCodec().decode(SyncStateRowCodec().encode(state)))

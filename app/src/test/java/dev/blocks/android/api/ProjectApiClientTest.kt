@@ -12,7 +12,7 @@ import org.junit.Test
 
 class ProjectApiClientTest {
     @Test
-    fun sendsApi03NotesAndParkingToTenantScopedProjectRoutes() {
+    fun sendsApi04NotesAndParkingToTenantScopedProjectRoutes() {
         val captured = mutableListOf<Request>()
         val server = server(captured::add)
         try {
@@ -38,7 +38,7 @@ class ProjectApiClientTest {
             assertEquals("POST", captured[1].method)
             assertEquals("/v1/tenants/$tenant/projects/$project/parking", captured[1].path)
             assertEquals("parking-key", captured[1].idempotencyKey)
-            assertEquals(listOf("0.3", "0.3"), captured.map { it.clientVersion })
+            assertEquals(listOf("0.4", "0.4"), captured.map { it.clientVersion })
             assertTrue(captured.all { it.authorization == "Bearer token" })
         } finally {
             server.stop(0)

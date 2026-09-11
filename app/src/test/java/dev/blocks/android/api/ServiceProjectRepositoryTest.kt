@@ -42,7 +42,7 @@ class ServiceProjectRepositoryTest {
         val transport = FakeProjectTransport()
         val repository = ServiceProjectRepository(transport)
 
-        assertEquals("Created", repository.createProject(SESSION, "Created", "create-key").name)
+        assertEquals("Created", repository.createProject(SESSION, "Created", CLIENT_ID, "create-key").name)
         assertEquals("Renamed", repository.renameProject(SESSION, PROJECT_ID, 3, "Renamed").name)
         assertEquals(ProjectLifecycle.ARCHIVED, repository.archiveProject(SESSION, PROJECT_ID, 4).lifecycle)
         assertEquals(ProjectLifecycle.ACTIVE, repository.reopenProject(SESSION, PROJECT_ID, 5).lifecycle)
@@ -54,6 +54,8 @@ class ServiceProjectRepositoryTest {
                 PROJECT_ID,
                 ParkingDraft("Here", "Next", "Remember"),
                 supersedesId = null,
+                clientId = CLIENT_ID,
+                occurredAt = NOW,
                 idempotencyKey = "park-key",
             ).mustNotForget,
         )
@@ -62,15 +64,18 @@ class ServiceProjectRepositoryTest {
 
         assertEquals("create-key", transport.createKey)
         assertEquals("Created", JSONObject(transport.createBody).getString("name"))
+        assertEquals(CLIENT_ID, JSONObject(transport.createBody).getString("client_id"))
         assertEquals(3, transport.renameVersion)
         assertEquals("Renamed", JSONObject(transport.renameBody).getString("name"))
         assertEquals(4, transport.notesVersion)
         assertEquals("Edited", JSONObject(transport.notesBody).getString("body"))
         assertEquals("park-key", transport.parkingKey)
         assertEquals(
-            setOf("where_i_am", "next_physical_action", "must_not_forget"),
+            setOf("where_i_am", "next_physical_action", "must_not_forget", "client_id", "occurred_at"),
             JSONObject(transport.parkingBody).keys().asSequence().toSet(),
         )
+        assertEquals(CLIENT_ID, JSONObject(transport.parkingBody).getString("client_id"))
+        assertEquals(NOW, JSONObject(transport.parkingBody).getString("occurred_at"))
         assertTrue(transport.unbound)
     }
 
@@ -93,13 +98,39 @@ class ServiceProjectRepositoryTest {
         )
     }
 
-    @Test(expected = IllegalStateException::class)
+    @Test
+    fun recognizesAnOldRouteProjectShapeAsDeferredApiIncompatibility() {
+        val repository = ServiceProjectRepository(FakeProjectTransport(oldCreateResponse = true))
+
+        val error = runCatching {
+            repository.createProject(SESSION, "Offline-compatible", CLIENT_ID, "stable-create-key")
+        }.exceptionOrNull()
+
+        assertTrue(error is IncompatibleServiceApiException)
+    }
+
+    @Test
+    fun readOnlyCompatibilityProbeRecognizesTheOldProjectListBeforeAnyMutation() {
+        val repository = ServiceProjectRepository(FakeProjectTransport(oldListResponse = true))
+
+        val error = runCatching {
+            repository.listProjects(SESSION, ProjectLifecycle.ACTIVE)
+        }.exceptionOrNull()
+
+        assertTrue(error is IncompatibleServiceApiException)
+    }
+
+    @Test(expected = IncompatibleServiceApiException::class)
     fun rejectsAProjectPageFromAnotherTenant() {
         val repository = ServiceProjectRepository(FakeProjectTransport(pageTenant = OTHER_TENANT))
         repository.projectPage(SESSION, PROJECT_ID)
     }
 
-    private class FakeProjectTransport(private val pageTenant: String = TENANT_ID) : ProjectTransport {
+    private class FakeProjectTransport(
+        private val pageTenant: String = TENANT_ID,
+        private val oldCreateResponse: Boolean = false,
+        private val oldListResponse: Boolean = false,
+    ) : ProjectTransport {
         var requestedStatus: String? = null
         var createKey: String? = null
         var createBody: String = ""
@@ -116,6 +147,7 @@ class ServiceProjectRepositoryTest {
 
         override fun listProjects(identityToken: String, tenantId: String, status: String): ApiResponse {
             requestedStatus = status
+            if (oldListResponse) return success("""[{"id":"$PROJECT_ID","name":"Old project"}]""")
             return success("[${projectJson(status = status)}]")
         }
 
@@ -127,7 +159,16 @@ class ServiceProjectRepositoryTest {
         ): ApiResponse {
             createBody = body
             createKey = idempotencyKey
-            return success(projectJson(name = JSONObject(body).getString("name")))
+            return if (oldCreateResponse) {
+                success("""{"id":"$PROJECT_ID","name":"${JSONObject(body).getString("name")}"}""")
+            } else {
+                success(
+                    projectJson(
+                        name = JSONObject(body).getString("name"),
+                        clientId = JSONObject(body).optString("client_id").ifEmpty { null },
+                    ),
+                )
+            }
         }
 
         override fun projectPage(identityToken: String, tenantId: String, projectId: String) = success(
@@ -242,6 +283,7 @@ class ServiceProjectRepositoryTest {
             rowVersion: Int = 3,
             tenant: String = TENANT_ID,
             archivedAt: String? = null,
+            clientId: String? = null,
         ) = """
             {
               "archived_at":${archivedAt?.let { "\"$it\"" } ?: "null"},
@@ -252,6 +294,7 @@ class ServiceProjectRepositoryTest {
               "status":"$status",
               "tenant_id":"$tenant",
               "updated_at":"$NOW"
+              ,"client_id":${clientId?.let { "\"$it\"" } ?: "null"}
             }
         """.trimIndent()
 
@@ -259,6 +302,8 @@ class ServiceProjectRepositoryTest {
             """{"project_id":"$PROJECT_ID","body":"$body","row_version":$rowVersion,"updated_at":"$NOW"}"""
 
         private fun parkingJson() =
-            """{"id":"$PARKING_ID","project_id":"$PROJECT_ID","where_i_am":"Here","next_physical_action":"Next","must_not_forget":"Remember","authored_by_user_id":"$USER_ID","device_id":null,"supersedes_id":null,"created_at":"$NOW"}"""
+            """{"id":"$PARKING_ID","project_id":"$PROJECT_ID","where_i_am":"Here","next_physical_action":"Next","must_not_forget":"Remember","authored_by_user_id":"$USER_ID","device_id":null,"supersedes_id":null,"created_at":"$NOW","occurred_at":"$NOW","client_id":"$CLIENT_ID"}"""
+
+        private const val CLIENT_ID = "00000000-0000-0000-0000-000000000098"
     }
 }

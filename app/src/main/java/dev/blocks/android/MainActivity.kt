@@ -10,8 +10,10 @@ import android.text.InputType
 import android.text.TextWatcher
 import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
+import android.widget.GridLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -30,6 +32,7 @@ import dev.blocks.android.auth.GoogleIdentityClient
 import dev.blocks.android.auth.IdentityProvider
 import dev.blocks.android.mvp.ParkingDraft
 import dev.blocks.android.project.ProjectFormField
+import dev.blocks.android.project.DashboardView
 import dev.blocks.android.project.ProjectMutationType
 import dev.blocks.android.project.ProjectPresentationController
 import dev.blocks.android.project.ProjectScreen
@@ -64,8 +67,6 @@ internal object ProjectUiIds {
     const val SCREEN_PROJECT = 1003
     const val PROJECT_NAME = 1010
     const val CREATE_PROJECT = 1011
-    const val OPEN_ARCHIVE = 1012
-    const val ACCOUNT = 1013
     const val BACK = 1020
     const val NOTES = 1021
     const val SAVE_NOTES = 1022
@@ -77,6 +78,15 @@ internal object ProjectUiIds {
     const val PROJECT_ACTIONS = 1028
     const val REAUTHENTICATE = 1029
     const val RESOLVE_CONFLICT = 1030
+    const val SETTINGS = 1031
+    const val MAIN = 1032
+    const val PARK = 1033
+    const val PROJECT_SETTINGS = 1034
+    const val PENDING_CHANGES = 1035
+    const val ARCHIVE_MAIN = 1036
+    const val PROJECT_LIST = 1037
+    const val PROJECT_TILES = 1038
+    const val PARK_SHEET = 1039
 }
 
 class MainActivity : ComponentActivity() {
@@ -107,9 +117,11 @@ class MainActivity : ComponentActivity() {
             this,
             object : OnBackPressedCallback(true) {
                 override fun handleOnBackPressed() {
-                    if (controller.state.screen == ProjectScreen.PROJECT) {
-                        controller.backToDashboard()
+                    if (controller.state.screen == ProjectScreen.PROJECT && controller.state.showParkingForm) {
+                        controller.hideParkingForm()
                         render()
+                    } else if (controller.state.screen == ProjectScreen.PROJECT) {
+                        runRepositoryAction { controller.backToDashboard() }
                     } else {
                         isEnabled = false
                         onBackPressedDispatcher.onBackPressed()
@@ -160,7 +172,7 @@ class MainActivity : ComponentActivity() {
             syncStore,
         )
         return ProjectAppDependencies(
-            controller = ProjectPresentationController(sessionAuthenticator, workspace, draftStore),
+            controller = ProjectPresentationController(sessionAuthenticator, workspace),
             identity = GoogleIdentityClient(BuildConfig.BLOCKS_GOOGLE_SERVER_CLIENT_ID),
             continuity = SessionContinuityStore(this),
             acceptedTenantStore = AndroidEncryptedAcceptedTenantContinuityStore(this),
@@ -169,9 +181,12 @@ class MainActivity : ComponentActivity() {
 
     private fun render() {
         content.removeAllViews()
-        content.addView(label("Blocks", 28f, Color.rgb(32, 48, 42)))
+        if (controller.state.screen == ProjectScreen.PROJECT && controller.state.showParkingForm) {
+            renderParkingSheet()
+            return
+        }
+        renderTopBar()
         controller.state.error?.let { content.addView(label(it, 14f, Color.rgb(150, 40, 40))) }
-        controller.state.status?.let { content.addView(label(it, 14f, Color.rgb(53, 104, 89))) }
         if (controller.state.authenticationRequired) {
             content.addView(button("Reconnect Google account") { reauthenticate() }.apply {
                 id = ProjectUiIds.REAUTHENTICATE
@@ -189,6 +204,38 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun renderTopBar() {
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        bar.addView(
+            label("Blocks", 28f, Color.rgb(32, 48, 42)),
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
+        )
+        if (controller.state.pendingChanges) {
+            bar.addView(label("●", 16f, Color.rgb(96, 104, 100)).apply {
+                id = ProjectUiIds.PENDING_CHANGES
+                contentDescription = "Changes pending"
+            })
+        }
+        if (controller.state.screen == ProjectScreen.DASHBOARD) {
+            bar.addView(button("Settings") { showSettings() }.apply { id = ProjectUiIds.SETTINGS })
+        } else if (controller.state.screen == ProjectScreen.PROJECT) {
+            bar.addView(button("Main") {
+                runRepositoryAction { controller.backToDashboard() }
+            }.apply { id = ProjectUiIds.MAIN })
+            bar.addView(button("Park") {
+                controller.showParkingForm()
+                render()
+            }.apply { id = ProjectUiIds.PARK })
+            bar.addView(button("Settings") { showProjectSettings() }.apply {
+                id = ProjectUiIds.PROJECT_SETTINGS
+            })
+        }
+        content.addView(bar)
+    }
+
     private fun renderLogin() {
         content.tag = ProjectUiIds.SCREEN_LOGIN
         content.addView(label("Sign in to see your projects", 20f))
@@ -198,38 +245,79 @@ class MainActivity : ComponentActivity() {
 
     private fun renderDashboard() {
         content.tag = ProjectUiIds.SCREEN_DASHBOARD
-        content.addView(label("Projects", 22f))
-        if (controller.state.activeProjects.isEmpty()) {
-            content.addView(label("No active projects yet.", 15f))
+        val archiveMode = controller.state.archiveMode
+        val projects = if (archiveMode) controller.state.archivedProjects else controller.state.activeProjects
+        content.addView(label(if (archiveMode) "Archive" else "Projects", 22f))
+        if (projects.isEmpty()) {
+            content.addView(label(if (archiveMode) "No archived projects." else "No active projects yet.", 15f))
         }
-        controller.state.activeProjects.forEach { project ->
-            content.addView(button(project.name) { runRepositoryAction { controller.openProject(project.id) } })
+        val projectContainer: ViewGroup = if (controller.state.dashboardView == DashboardView.TILES) {
+            GridLayout(this).apply {
+                id = ProjectUiIds.PROJECT_TILES
+                columnCount = 2
+            }
+        } else {
+            LinearLayout(this).apply {
+                id = ProjectUiIds.PROJECT_LIST
+                orientation = LinearLayout.VERTICAL
+            }
         }
+        projects.forEach { project ->
+            projectContainer.addView(
+                button(project.name) {
+                    if (archiveMode) confirmReopen(project) else runRepositoryAction {
+                        controller.openProject(project.id)
+                    }
+                },
+            )
+        }
+        content.addView(projectContainer)
 
-        content.addView(button("Create project") { showCreateProject() }.apply {
-            id = ProjectUiIds.CREATE_PROJECT
-        })
-        content.addView(button("Archive") { showArchive() }.apply { id = ProjectUiIds.OPEN_ARCHIVE })
-        content.addView(button("Account") { showAccountActions() }.apply { id = ProjectUiIds.ACCOUNT })
+        if (archiveMode) {
+            content.addView(button("Main") {
+                runRepositoryAction { controller.showMainDashboard() }
+            }.apply { id = ProjectUiIds.ARCHIVE_MAIN })
+        } else {
+            content.addView(button("Create project") { showCreateProject() }.apply {
+                id = ProjectUiIds.CREATE_PROJECT
+            })
+        }
+    }
+
+    private fun showSettings() {
+        val viewChoice = if (controller.state.dashboardView == DashboardView.LIST) "Tile view" else "List view"
+        val dialog = AlertDialog.Builder(this).setTitle("Settings")
+            .setItems(arrayOf("Archive", viewChoice, "Switch account", "Sign out")) { _, which ->
+                when (which) {
+                    0 -> openArchiveMode()
+                    1 -> {
+                        runRepositoryAction { controller.toggleDashboardView() }
+                    }
+                    2 -> switchAccount()
+                    else -> signOut()
+                }
+            }
+            .setNegativeButton("Done", null)
+            .create()
+        showManagedDialog(dialog)
     }
 
     private fun renderProject() {
         content.tag = ProjectUiIds.SCREEN_PROJECT
         val page = requireNotNull(controller.state.projectPage)
-        content.addView(button("Back to projects") {
-            controller.backToDashboard()
-            render()
-        }.apply { id = ProjectUiIds.BACK })
         content.addView(label(page.project.name, 22f))
 
-        page.newestParking?.let { parking ->
+        val newestParking = page.newestParking
+        if (newestParking == null) {
+            content.addView(label("No park message yet.", 16f, Color.rgb(53, 104, 89)))
+        } else {
             content.addView(label("Latest park message", 17f, Color.rgb(53, 104, 89)))
             content.addView(label("Where I am", 12f, Color.GRAY))
-            content.addView(label(parking.location, 16f))
+            content.addView(label(newestParking.location, 16f))
             content.addView(label("Next physical action", 12f, Color.GRAY))
-            content.addView(label(parking.nextAction, 16f))
+            content.addView(label(newestParking.nextAction, 16f))
             content.addView(label("Must not forget", 12f, Color.GRAY))
-            content.addView(label(parking.mustNotForget, 16f))
+            content.addView(label(newestParking.mustNotForget, 16f))
         }
 
         content.addView(label("Notes", 17f))
@@ -242,24 +330,28 @@ class MainActivity : ComponentActivity() {
         notes.markInvalid(ProjectFormField.NOTES)
         content.addView(notes)
         content.addView(button("Save notes") {
-            runRepositoryAction { controller.saveNotes(notes.text.toString()) }
+            runRepositoryAction(syncAfter = true) { controller.saveNotes(notes.text.toString()) }
         }.apply { id = ProjectUiIds.SAVE_NOTES })
 
-        if (controller.state.showParkingForm) {
-            renderParkingForm(page.project.id)
-        } else {
-            content.addView(button("Add park message") {
-                controller.showParkingForm()
-                render()
-            }.apply { id = ProjectUiIds.ADD_PARKING })
-        }
-        content.addView(button("Project actions") { showProjectActions() }.apply {
-            id = ProjectUiIds.PROJECT_ACTIONS
-        })
     }
 
-    private fun renderParkingForm(projectId: String) {
-        content.addView(label("Add park message", 17f))
+    private fun renderParkingSheet() {
+        content.tag = ProjectUiIds.SCREEN_PROJECT
+        val projectId = requireNotNull(controller.state.projectPage).project.id
+        val heading = LinearLayout(this).apply {
+            id = ProjectUiIds.PARK_SHEET
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        heading.addView(
+            label("Park", 24f, Color.rgb(32, 48, 42)),
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
+        )
+        heading.addView(button("Back") {
+            controller.hideParkingForm()
+            render()
+        }.apply { id = ProjectUiIds.BACK })
+        content.addView(heading)
         val draft = controller.state.drafts.projectParking[projectId] ?: ParkingDraft()
         var locationValue = draft.location
         var nextActionValue = draft.nextAction
@@ -283,7 +375,7 @@ class MainActivity : ComponentActivity() {
         content.addView(nextAction)
         content.addView(mustNotForget)
         content.addView(button("Save park message") {
-            runRepositoryAction {
+            runRepositoryAction(syncAfter = true) {
                 controller.addParking(
                     location.text.toString(),
                     nextAction.text.toString(),
@@ -293,19 +385,8 @@ class MainActivity : ComponentActivity() {
         }.apply { id = ProjectUiIds.SAVE_PARKING })
     }
 
-    private fun showArchive() {
-        runRepositoryAction(afterRender = false, complete = {
-            val projects = controller.state.archivedProjects
-            if (projects.isEmpty()) {
-                AlertDialog.Builder(this).setTitle("Archive").setMessage("No archived projects.")
-                    .setPositiveButton("Done", null).show()
-            } else {
-                val names = projects.map { it.name }.toTypedArray()
-                AlertDialog.Builder(this).setTitle("Archive").setItems(names) { _, index ->
-                    confirmReopen(projects[index])
-                }.setNegativeButton("Done", null).show()
-            }
-        }, action = controller::loadArchive)
+    private fun openArchiveMode() {
+        runRepositoryAction { controller.showArchive() }
     }
 
     private fun showCreateProject() {
@@ -331,7 +412,7 @@ class MainActivity : ComponentActivity() {
                 return@setOnClickListener
             }
             dialog.dismiss()
-            runRepositoryAction { controller.createProject(value) }
+            runRepositoryAction(syncAfter = true) { controller.createProject(value) }
         }
         dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
             dialog.dismiss()
@@ -340,16 +421,20 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun confirmReopen(project: ProjectSummary) {
-        AlertDialog.Builder(this).setTitle(project.name).setMessage("Return this project to the dashboard?")
-            .setPositiveButton("Reopen") { _, _ -> runRepositoryAction { controller.reopenProject(project) } }
-            .setNegativeButton("Cancel", null).show()
+        val dialog = AlertDialog.Builder(this).setTitle(project.name).setMessage("Return this project to the dashboard?")
+            .setPositiveButton("Reopen") { _, _ ->
+                runRepositoryAction(syncAfter = true) { controller.reopenProject(project) }
+            }
+            .setNegativeButton("Cancel", null).create()
+        showManagedDialog(dialog)
     }
 
-    private fun showProjectActions() {
-        AlertDialog.Builder(this).setTitle("Project actions")
+    private fun showProjectSettings() {
+        val dialog = AlertDialog.Builder(this).setTitle("Project settings")
             .setItems(arrayOf("Rename", "Archive")) { _, which ->
                 if (which == 0) showRename() else confirmArchive()
-            }.setNegativeButton("Cancel", null).show()
+            }.setNegativeButton("Cancel", null).create()
+        showManagedDialog(dialog)
     }
 
     private fun showConflictResolution() {
@@ -377,12 +462,12 @@ class MainActivity : ComponentActivity() {
             .setTitle("Resolve saved change")
             .setMessage("Your saved attempt:\n$local\n\nCurrent service value:\n$authoritative")
             .setNegativeButton("Discard saved change") { _, _ ->
-                runRepositoryAction { controller.discardConflict() }
+                runRepositoryAction(syncAfter = true) { controller.discardConflict() }
             }
             .setNeutralButton("Cancel", null)
         if (conflict.canRetry) {
             builder.setPositiveButton("Retry with latest") { _, _ ->
-                runRepositoryAction { controller.retryConflict() }
+                runRepositoryAction(syncAfter = true) { controller.retryConflict() }
             }
         }
         showManagedDialog(builder.create())
@@ -408,25 +493,21 @@ class MainActivity : ComponentActivity() {
                     return@setOnClickListener
                 }
                 dialog.dismiss()
-                runRepositoryAction { controller.renameProject(value) }
+                runRepositoryAction(syncAfter = true) { controller.renameProject(value) }
             }
         }
-        dialog.show()
+        showManagedDialog(dialog)
     }
 
     private fun confirmArchive() {
         val name = requireNotNull(controller.state.projectPage).project.name
-        AlertDialog.Builder(this).setTitle("Archive $name?")
+        val dialog = AlertDialog.Builder(this).setTitle("Archive $name?")
             .setMessage("You can reopen it from the dashboard Archive list.")
-            .setPositiveButton("Archive") { _, _ -> runRepositoryAction { controller.archiveProject() } }
-            .setNegativeButton("Cancel", null).show()
-    }
-
-    private fun showAccountActions() {
-        AlertDialog.Builder(this).setTitle("Account")
-            .setItems(arrayOf("Switch account", "Sign out")) { _, which ->
-                if (which == 0) switchAccount() else signOut()
-            }.setNegativeButton("Cancel", null).show()
+            .setPositiveButton("Archive") { _, _ ->
+                runRepositoryAction(syncAfter = true) { controller.archiveProject() }
+            }
+            .setNegativeButton("Cancel", null).create()
+        showManagedDialog(dialog)
     }
 
     private fun label(text: String, size: Float, color: Int = Color.DKGRAY) = TextView(this).apply {
@@ -643,6 +724,7 @@ class MainActivity : ComponentActivity() {
 
     private fun runRepositoryAction(
         afterRender: Boolean = true,
+        syncAfter: Boolean = false,
         complete: (() -> Unit)? = null,
         action: () -> Unit,
     ) {
@@ -654,6 +736,7 @@ class MainActivity : ComponentActivity() {
             }
             if (afterRender) render()
             complete?.invoke()
+            if (syncAfter) synchronizeAutomatically()
         }
     }
 

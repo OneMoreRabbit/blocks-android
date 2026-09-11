@@ -1,13 +1,14 @@
 package dev.blocks.android.project
 
+import dev.blocks.android.api.IncompatibleServiceApiException
 import dev.blocks.android.api.ServiceException
 import dev.blocks.android.auth.AcceptedTenantMismatchException
-import dev.blocks.android.mvp.DraftStore
 import dev.blocks.android.mvp.FormDrafts
 import dev.blocks.android.mvp.MembershipRevokedException
 import dev.blocks.android.mvp.ParkingDraft
 import dev.blocks.android.mvp.PendingMutation
 import dev.blocks.android.mvp.Session
+import java.io.IOException
 import java.security.MessageDigest
 
 enum class ProjectScreen { LOGIN, DASHBOARD, PROJECT }
@@ -29,6 +30,9 @@ data class ProjectPresentationState(
     val drafts: FormDrafts = FormDrafts(),
     val invalidField: ProjectFormField? = null,
     val showParkingForm: Boolean = false,
+    val dashboardView: DashboardView = DashboardView.LIST,
+    val archiveMode: Boolean = false,
+    val pendingChanges: Boolean = false,
     val syncing: Boolean = false,
     val reconciliationRequired: Boolean = false,
     val conflict: ProjectConflict? = null,
@@ -38,11 +42,10 @@ data class ProjectPresentationState(
     val error: String? = null,
 )
 
-/** UI state machine for the API 0.3 dashboard and project-page product surface. */
+/** UI state machine for the standalone Dashboard and Project product surface. */
 class ProjectPresentationController(
     private val authenticator: SessionAuthenticator,
     private val workspace: ProjectWorkspace,
-    private val draftStore: DraftStore,
     private val newOperationId: () -> String = ::newOperationIdentity,
 ) {
     var state = ProjectPresentationState()
@@ -60,9 +63,12 @@ class ProjectPresentationController(
         workspace.activate(authenticated)
         val continuingTenant = session?.tenantId == authenticated.tenantId
         session = authenticated
+        val preferences = workspace.uiPreferences(authenticated)
         state = if (continuingTenant) {
             state.copy(
-                drafts = draftStore.load(authenticated.tenantId),
+                drafts = workspace.projectDrafts(authenticated),
+                dashboardView = preferences.dashboardView,
+                archiveMode = preferences.archiveMode,
                 authenticationRequired = false,
                 sessionConfirmationRequired = false,
                 error = null,
@@ -70,10 +76,12 @@ class ProjectPresentationController(
         } else {
             ProjectPresentationState(
                 screen = ProjectScreen.DASHBOARD,
-                drafts = draftStore.load(authenticated.tenantId),
+                drafts = workspace.projectDrafts(authenticated),
+                dashboardView = preferences.dashboardView,
+                archiveMode = preferences.archiveMode,
             )
         }
-        applyResult(workspace.snapshot(authenticated), synced = false)
+        applyResult(workspace.snapshot(authenticated))
         return authenticated
     }
 
@@ -84,15 +92,18 @@ class ProjectPresentationController(
         val cachedSession = Session(tenantId)
         workspace.activate(cachedSession)
         session = cachedSession
+        val preferences = workspace.uiPreferences(cachedSession)
         state = ProjectPresentationState(
             screen = ProjectScreen.DASHBOARD,
-            drafts = draftStore.load(tenantId),
+            drafts = workspace.projectDrafts(cachedSession),
+            dashboardView = preferences.dashboardView,
+            archiveMode = preferences.archiveMode,
             sessionConfirmationRequired = true,
         )
-        applyResult(workspace.snapshot(cachedSession), synced = false)
+        applyResult(workspace.snapshot(cachedSession))
         state = state.copy(
             sessionConfirmationRequired = true,
-            status = "Showing saved projects. Reconnecting in the background.",
+            status = null,
         )
     }
 
@@ -130,19 +141,14 @@ class ProjectPresentationController(
     fun synchronize() {
         val active = activeSession()
         state = state.copy(syncing = true, error = null)
-        applyResult(workspace.backgroundSync(active), synced = true)
+        applyResult(workspace.backgroundSync(active))
     }
 
     @Synchronized
     fun openProject(projectId: String) {
         val active = activeSession()
-        val page = if (state.sessionConfirmationRequired) {
-            workspace.snapshot(active).cache.pages.firstOrNull { it.project.id == projectId }
-                ?: throw IllegalStateException("This project is not available in the saved offline data.")
-        } else {
-            workspace.projectPage(active, projectId)
-        }
-        val drafts = draftStore.load(active.tenantId)
+        val page = workspace.projectPage(active, projectId)
+        val drafts = workspace.projectDrafts(active)
         state = state.copy(
             screen = ProjectScreen.PROJECT,
             projectPage = page,
@@ -155,29 +161,71 @@ class ProjectPresentationController(
 
     @Synchronized
     fun backToDashboard() {
+        val active = activeSession()
+        val preferences = workspace.updateUiPreferences(active) { it.copy(archiveMode = false) }
         state = state.copy(
             screen = ProjectScreen.DASHBOARD,
             projectPage = null,
             showParkingForm = false,
+            archiveMode = preferences.archiveMode,
             invalidField = null,
             error = null,
         )
     }
 
     @Synchronized
-    fun loadArchive() {
+    fun showArchive() {
         val active = activeSession()
         val archived = if (state.sessionConfirmationRequired) {
             workspace.snapshot(active).cache.archivedProjects
         } else {
             workspace.archivedProjects(active)
         }
-        state = state.copy(archivedProjects = archived, error = null)
+        val preferences = workspace.updateUiPreferences(active) { it.copy(archiveMode = true) }
+        state = state.copy(
+            screen = ProjectScreen.DASHBOARD,
+            projectPage = null,
+            archivedProjects = archived,
+            archiveMode = preferences.archiveMode,
+            error = null,
+        )
+    }
+
+    @Synchronized
+    fun showMainDashboard() {
+        val active = activeSession()
+        val preferences = workspace.updateUiPreferences(active) { it.copy(archiveMode = false) }
+        state = state.copy(
+            screen = ProjectScreen.DASHBOARD,
+            projectPage = null,
+            archiveMode = preferences.archiveMode,
+            error = null,
+        )
+    }
+
+    @Synchronized
+    fun toggleDashboardView() {
+        val active = activeSession()
+        val preferences = workspace.updateUiPreferences(active) {
+            it.copy(
+                dashboardView = if (it.dashboardView == DashboardView.LIST) {
+                    DashboardView.TILES
+                } else {
+                    DashboardView.LIST
+                },
+            )
+        }
+        state = state.copy(dashboardView = preferences.dashboardView, error = null)
     }
 
     @Synchronized
     fun showParkingForm() {
         state = state.copy(showParkingForm = true, invalidField = null, error = null)
+    }
+
+    @Synchronized
+    fun hideParkingForm() {
+        state = state.copy(showParkingForm = false, invalidField = null, error = null)
     }
 
     @Synchronized
@@ -226,16 +274,12 @@ class ProjectPresentationController(
     @Synchronized
     fun discardCreateProjectDraft() {
         val active = activeSession()
-        val drafts = draftStore.load(active.tenantId)
-        drafts.pendingMutations[CREATE_SLOT]?.let { pending ->
-            applyResult(workspace.discardPendingOperation(active, pending.idempotencyKey))
-        }
-        val current = draftStore.load(active.tenantId)
+        val current = workspace.projectDrafts(active)
         val cleared = current.copy(
             projectName = "",
             pendingMutations = current.pendingMutations - CREATE_SLOT,
         )
-        draftStore.save(active.tenantId, cleared)
+        workspace.updateProjectDrafts(active) { cleared }
         state = state.copy(drafts = cleared, invalidField = null, error = null)
     }
 
@@ -322,6 +366,7 @@ class ProjectPresentationController(
                 operationId = operation.idempotencyKey,
             ),
         )
+        state = state.copy(showParkingForm = false)
     }
 
     @Synchronized
@@ -378,14 +423,16 @@ class ProjectPresentationController(
             state = ProjectPresentationState(error = "Project access changed. Sign in again to continue.")
             return true
         }
-        val message = when {
-            error is ServiceException && error.status == 401 -> "Sign in again when you are online. Saved changes are retained."
-            else -> "Blocks could not refresh just now. Saved changes are retained."
-        }
         state = state.copy(
             syncing = false,
             authenticationRequired = error is ServiceException && error.status == 401,
-            error = message,
+            error = if (
+                error is IOException || error is IncompatibleServiceApiException || error is ServiceException
+            ) {
+                null
+            } else {
+                "Blocks could not save that change on this device."
+            },
         )
         return false
     }
@@ -395,40 +442,31 @@ class ProjectPresentationController(
         state = state.copy(syncing = false, error = message)
     }
 
-    private fun applyResult(
-        result: BackgroundSyncResult,
-        synced: Boolean = true,
-    ) {
+    private fun applyResult(result: BackgroundSyncResult) {
         val active = activeSession()
-        var drafts = draftStore.load(active.tenantId)
-        val unresolvedIdentities = drafts.pendingMutations.filterValues {
-            it.idempotencyKey !in result.cache.retiredOperationIds
-        }
-        if (unresolvedIdentities != drafts.pendingMutations) {
-            drafts = drafts.copy(pendingMutations = unresolvedIdentities)
-            draftStore.save(active.tenantId, drafts)
-        }
+        val drafts = workspace.projectDrafts(active)
         val selectedId = state.projectPage?.project?.id
-        val updatedPage = selectedId?.let { id -> result.cache.pages.firstOrNull { it.project.id == id } }
+        val resolvedSelectedId = selectedId?.let { id ->
+            result.cache.projectIdMappings.firstOrNull { it.provisionalId == id }?.serverId ?: id
+        }
+        val updatedPage = resolvedSelectedId?.let { id -> result.cache.pages.firstOrNull { it.project.id == id } }
             ?: state.projectPage
         val pending = result.pendingLegacyOperations + result.pendingProjectOperations
-        val status = when {
-            result.reconciliationRequired -> "The service has a newer version. Your edit is retained for reconciliation."
-            pending > 0 -> "Saved on this device. It will retry automatically."
-            synced -> "Up to date."
-            else -> null
-        }
+        val preferences = workspace.uiPreferences(active)
         state = state.copy(
             activeProjects = result.cache.activeProjects.sortedBy { it.name.lowercase() },
             archivedProjects = result.cache.archivedProjects.sortedBy { it.name.lowercase() },
             projectPage = updatedPage,
             drafts = drafts,
+            dashboardView = preferences.dashboardView,
+            archiveMode = preferences.archiveMode,
+            pendingChanges = pending > 0,
             invalidField = null,
             syncing = false,
             reconciliationRequired = result.reconciliationRequired,
             conflict = result.conflict,
             authenticationRequired = false,
-            status = status,
+            status = null,
             error = null,
         )
     }
@@ -448,21 +486,21 @@ class ProjectPresentationController(
 
     private fun persistDraft(update: (FormDrafts) -> FormDrafts) {
         val active = activeSession()
-        val updated = update(draftStore.load(active.tenantId))
-        draftStore.save(active.tenantId, updated)
+        val updated = workspace.updateProjectDrafts(active, update)
         state = state.copy(drafts = updated)
     }
 
     private fun mutation(slot: String, operation: String, targetId: String, payload: String): PendingMutation {
         val active = activeSession()
-        val drafts = draftStore.load(active.tenantId)
         val payloadDigest = digest(payload)
-        val existing = drafts.pendingMutations[slot]?.takeIf {
-            it.operation == operation && it.targetId == targetId && it.payloadDigest == payloadDigest
+        lateinit var pending: PendingMutation
+        val updated = workspace.updateProjectDrafts(active) { drafts ->
+            val existing = drafts.pendingMutations[slot]?.takeIf {
+                it.operation == operation && it.targetId == targetId && it.payloadDigest == payloadDigest
+            }
+            pending = existing ?: PendingMutation(operation, targetId, payloadDigest, newOperationId())
+            drafts.copy(pendingMutations = drafts.pendingMutations + (slot to pending))
         }
-        val pending = existing ?: PendingMutation(operation, targetId, payloadDigest, newOperationId())
-        val updated = drafts.copy(pendingMutations = drafts.pendingMutations + (slot to pending))
-        draftStore.save(active.tenantId, updated)
         state = state.copy(drafts = updated, invalidField = null, error = null)
         return pending
     }
