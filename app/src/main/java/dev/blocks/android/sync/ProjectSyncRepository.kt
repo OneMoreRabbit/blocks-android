@@ -49,12 +49,13 @@ class ProjectSyncRepository(
 
     @Synchronized
     override fun activate(session: Session) {
-        activeTenantId?.takeIf { it != session.tenantId }?.let { departedTenant ->
-            activeTenantId = null
-            purge(departedTenant)
-        }
         activeTenantId = session.tenantId
         migrateProjectDrafts(session)
+    }
+
+    @Synchronized
+    override fun deactivate(session: Session) {
+        if (activeTenantId == session.tenantId) activeTenantId = null
     }
 
     @Synchronized

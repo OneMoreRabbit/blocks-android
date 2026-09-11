@@ -19,18 +19,22 @@ import android.widget.ScrollView
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import dev.blocks.android.api.BlocksApiClient
 import dev.blocks.android.api.ProjectApiClient
 import dev.blocks.android.api.ServiceBlocksRepository
 import dev.blocks.android.api.ServiceProjectRepository
 import dev.blocks.android.api.ServiceSessionAuthenticator
+import dev.blocks.android.auth.AcceptedAccountBindingException
 import dev.blocks.android.auth.AcceptedTenantContinuity
 import dev.blocks.android.auth.AcceptedTenantContinuityStore
-import dev.blocks.android.auth.AcceptedTenantMismatchException
 import dev.blocks.android.auth.AndroidEncryptedAcceptedTenantContinuityStore
 import dev.blocks.android.auth.GoogleIdentityClient
 import dev.blocks.android.auth.IdentityProvider
 import dev.blocks.android.mvp.ParkingDraft
+import dev.blocks.android.mvp.Session
 import dev.blocks.android.project.ProjectFormField
 import dev.blocks.android.project.DashboardView
 import dev.blocks.android.project.ProjectMutationType
@@ -62,6 +66,7 @@ internal data class ProjectAppDependencies(
 )
 
 internal object ProjectUiIds {
+    const val CONTENT = 1000
     const val SCREEN_LOGIN = 1001
     const val SCREEN_DASHBOARD = 1002
     const val SCREEN_PROJECT = 1003
@@ -76,7 +81,6 @@ internal object ProjectUiIds {
     const val PARKING_MUST_NOT_FORGET = 1026
     const val SAVE_PARKING = 1027
     const val PROJECT_ACTIONS = 1028
-    const val REAUTHENTICATE = 1029
     const val RESOLVE_CONFLICT = 1030
     const val SETTINGS = 1031
     const val MAIN = 1032
@@ -105,14 +109,22 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
         restoreProjectId = savedInstanceState?.getString(STATE_PROJECT_ID)
         content = LinearLayout(this).apply {
+            id = ProjectUiIds.CONTENT
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.TOP
             setPadding(dp(24), dp(24), dp(24), dp(24))
             setBackgroundColor(Color.rgb(246, 243, 234))
         }
+        ViewCompat.setOnApplyWindowInsetsListener(content) { view, insets ->
+            val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            view.setPadding(dp(24), systemBars.top + dp(24), dp(24), systemBars.bottom + dp(24))
+            insets
+        }
         setContentView(ScrollView(this).apply { addView(content) })
+        ViewCompat.requestApplyInsets(content)
         onBackPressedDispatcher.addCallback(
             this,
             object : OnBackPressedCallback(true) {
@@ -187,11 +199,6 @@ class MainActivity : ComponentActivity() {
         }
         renderTopBar()
         controller.state.error?.let { content.addView(label(it, 14f, Color.rgb(150, 40, 40))) }
-        if (controller.state.authenticationRequired) {
-            content.addView(button("Reconnect Google account") { reauthenticate() }.apply {
-                id = ProjectUiIds.REAUTHENTICATE
-            })
-        }
         controller.state.conflict?.let {
             content.addView(button("Resolve saved change") { showConflictResolution() }.apply {
                 id = ProjectUiIds.RESOLVE_CONFLICT
@@ -286,18 +293,53 @@ class MainActivity : ComponentActivity() {
 
     private fun showSettings() {
         val viewChoice = if (controller.state.dashboardView == DashboardView.LIST) "Tile view" else "List view"
+        val items = buildList {
+            add("Archive")
+            add(viewChoice)
+            add("About")
+            if (controller.state.authenticationRequired) add("Reconnect Google account")
+            add("Switch account")
+            add("Sign out")
+            add("Remove local data")
+        }
         val dialog = AlertDialog.Builder(this).setTitle("Settings")
-            .setItems(arrayOf("Archive", viewChoice, "Switch account", "Sign out")) { _, which ->
-                when (which) {
-                    0 -> openArchiveMode()
-                    1 -> {
-                        runRepositoryAction { controller.toggleDashboardView() }
-                    }
-                    2 -> switchAccount()
-                    else -> signOut()
+            .setItems(items.toTypedArray()) { _, which ->
+                when (items[which]) {
+                    "Archive" -> openArchiveMode()
+                    viewChoice -> runRepositoryAction { controller.toggleDashboardView() }
+                    "About" -> showAbout()
+                    "Reconnect Google account" -> reauthenticate()
+                    "Switch account" -> switchAccount()
+                    "Sign out" -> signOut()
+                    "Remove local data" -> confirmRemoveLocalData()
                 }
             }
             .setNegativeButton("Done", null)
+            .create()
+        showManagedDialog(dialog)
+    }
+
+    private fun showAbout() {
+        val message = "Version ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})\n" +
+            "Build identity: ${BuildConfig.APPLICATION_ID}/${BuildConfig.BUILD_TYPE}"
+        showManagedDialog(
+            AlertDialog.Builder(this)
+                .setTitle("Blocks Android")
+                .setMessage(message)
+                .setPositiveButton("Done", null)
+                .create(),
+        )
+    }
+
+    private fun confirmRemoveLocalData() {
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Remove local data?")
+            .setMessage(
+                "This permanently removes this account's projects, notes, park messages, " +
+                    "drafts, and pending changes from this device.",
+            )
+            .setPositiveButton("Remove local data") { _, _ -> removeActiveLocalData() }
+            .setNegativeButton("Cancel", null)
             .create()
         showManagedDialog(dialog)
     }
@@ -564,7 +606,10 @@ class MainActivity : ComponentActivity() {
             try {
                 val acceptedTenant = withContext(Dispatchers.IO) { acceptedTenantStore.load() }
                 if (acceptedTenant == null) {
-                    authenticate(identity.restore(this@MainActivity))
+                    continuity.shouldRestore = false
+                    controller.lock()
+                    render()
+                    return@launch
                 } else {
                     withContext(Dispatchers.IO) {
                         controller.restoreCached(acceptedTenant.tenantId)
@@ -583,7 +628,7 @@ class MainActivity : ComponentActivity() {
                     handleRepositoryError(error)
                 } else {
                     continuity.shouldRestore = false
-                    controller.reportError("Please sign in again to continue.")
+                    controller.reportError("Blocks could not reopen local data safely. Sign in again to continue.")
                 }
                 render()
             }
@@ -605,52 +650,36 @@ class MainActivity : ComponentActivity() {
     }
 
     private suspend fun authenticate(token: String) {
-        val acceptedTenant = withContext(Dispatchers.IO) { acceptedTenantStore.load() }
-        val session = try {
-            withContext(Dispatchers.IO) {
-                when {
-                    controller.isAuthenticated -> controller.confirmSession(token)
-                    acceptedTenant != null -> {
-                        controller.restoreCached(acceptedTenant.tenantId)
-                        controller.confirmSession(token)
-                    }
-                    else -> controller.login(token)
-                }
-            }
-        } catch (error: AcceptedTenantMismatchException) {
-            withContext(Dispatchers.IO) { acceptedTenantStore.clear() }
-            continuity.shouldRestore = false
-            throw error
-        }
         try {
-            withContext(Dispatchers.IO) {
-                acceptedTenantStore.save(AcceptedTenantContinuity(session.tenantId))
-            }
-        } catch (error: Exception) {
-            runCatching { withContext(Dispatchers.IO) { controller.logout() } }
-            continuity.shouldRestore = false
-            throw error
+            acceptServiceValidatedToken(token)
+            render()
+            synchronizeAutomatically()
+        } catch (error: AcceptedAccountBindingException) {
+            failClosedAccountBinding()
         }
-        withContext(Dispatchers.IO) {
-            restoreProjectId?.let { projectId ->
-                controller.openProject(projectId)
-                restoreProjectId = null
-            }
-        }
-        continuity.shouldRestore = true
-        render()
-        synchronizeAutomatically()
     }
 
     private suspend fun reconcileAcceptedTenant(acceptedTenant: AcceptedTenantContinuity) {
+        val token = try {
+            identity.restore(this@MainActivity)
+        } catch (_: CancellationException) {
+            return
+        } catch (_: Exception) {
+            controller.pauseSynchronizationForAuthentication()
+            render()
+            return
+        }
         try {
-            val token = identity.restore(this@MainActivity)
+            val priorTenantId = acceptedTenant.tenantId
             withContext(Dispatchers.IO) {
-                controller.confirmSession(token)
+                val session = acceptServiceValidatedToken(token)
+                if (session.tenantId != priorTenantId) restoreProjectId = null
                 controller.synchronize()
             }
-        } catch (_: AcceptedTenantMismatchException) {
-            rejectAcceptedTenant(acceptedTenant)
+        } catch (_: CancellationException) {
+            return
+        } catch (error: AcceptedAccountBindingException) {
+            failClosedAccountBinding()
             return
         } catch (error: Exception) {
             handleRepositoryError(error)
@@ -658,19 +687,40 @@ class MainActivity : ComponentActivity() {
         render()
     }
 
-    private suspend fun rejectAcceptedTenant(acceptedTenant: AcceptedTenantContinuity) {
+    private suspend fun acceptServiceValidatedToken(token: String): Session {
+        val priorTenantId = controller.activeTenantId
+        val authenticated = withContext(Dispatchers.IO) { controller.authenticate(token) }
+        val accountIdentity = requireNotNull(authenticated.accountIdentity) {
+            "Service accepted a session without a stable account identity"
+        }
+        withContext(Dispatchers.IO) {
+            acceptedTenantStore.save(AcceptedTenantContinuity(authenticated.tenantId, accountIdentity))
+            controller.activateAuthenticated(authenticated)
+            if (priorTenantId == authenticated.tenantId) {
+                restoreProjectId?.let(controller::openProject)
+            }
+            restoreProjectId = null
+        }
+        continuity.shouldRestore = true
+        return authenticated
+    }
+
+    private suspend fun failClosedAccountBinding() {
         continuity.shouldRestore = false
-        val erased = runCatching {
+        syncJob?.cancel()
+        syncJob = null
+        restoreProjectId = null
+        val locked = runCatching {
             withContext(Dispatchers.IO) {
-                controller.eraseAcceptedTenantCache(acceptedTenant.tenantId)
-                acceptedTenantStore.clear()
+                controller.lock()
+                acceptedTenantStore.lock()
             }
         }
         controller.reportError(
-            if (erased.isSuccess) {
-                "The restored Google account does not match this saved Blocks account. Sign in again."
+            if (locked.isSuccess) {
+                "This account could not be matched to retained Blocks data. Sign in again."
             } else {
-                "Blocks could not safely erase the previous account data. Sign-in remains locked."
+                "Blocks could not safely lock the previous account. Sign-in remains blocked."
             },
         )
         render()
@@ -682,37 +732,80 @@ class MainActivity : ComponentActivity() {
 
     private fun clearAccount(switch: Boolean) {
         uiScope.launch {
+            syncJob?.cancel()
+            syncJob = null
             continuity.shouldRestore = false
-            runCatching { identity.clear(this@MainActivity) }
-            val cleared = runCatching {
+            restoreProjectId = null
+            val locked = runCatching {
                 withContext(Dispatchers.IO) {
-                    val localFailure = runCatching { controller.logout() }.exceptionOrNull()
-                    val continuityFailure = runCatching { acceptedTenantStore.clear() }.exceptionOrNull()
-                    (localFailure ?: continuityFailure)?.let { failure ->
-                        if (localFailure != null && continuityFailure != null) {
-                            failure.addSuppressed(continuityFailure)
-                        }
-                        throw failure
-                    }
+                    controller.lock()
+                    acceptedTenantStore.lock()
                 }
             }
-            if (cleared.isFailure) {
-                controller.reportError("Sign-out could not finish clearing local data. Try again.")
+            val credentialCleared = runCatching { identity.clear(this@MainActivity) }
+            if (locked.isFailure || credentialCleared.isFailure) {
+                controller.reportError("Sign-out could not finish safely. Local data remains locked.")
             }
             render()
-            if (switch && cleared.isSuccess) signIn()
+            if (switch && locked.isSuccess && credentialCleared.isSuccess) {
+                try {
+                    authenticate(identity.signIn(this@MainActivity))
+                } catch (_: CancellationException) {
+                    return@launch
+                } catch (error: Exception) {
+                    handleRepositoryError(error)
+                    render()
+                }
+            }
+        }
+    }
+
+    private fun removeActiveLocalData() {
+        uiScope.launch {
+            val tenantId = controller.activeTenantId ?: withContext(Dispatchers.IO) {
+                acceptedTenantStore.load()?.tenantId
+            } ?: return@launch
+            syncJob?.cancel()
+            syncJob = null
+            continuity.shouldRestore = false
+            restoreProjectId = null
+            val removed = runCatching {
+                withContext(Dispatchers.IO) {
+                    controller.eraseAcceptedTenantCache(tenantId)
+                    acceptedTenantStore.remove(tenantId)
+                }
+            }
+            runCatching { identity.clear(this@MainActivity) }
+            if (removed.isFailure) {
+                controller.reportError("Blocks could not safely remove all local data. Sign-in remains locked.")
+            }
+            render()
         }
     }
 
     private fun synchronizeAutomatically(refreshCredential: Boolean = false) {
         if (!controller.isAuthenticated || syncJob?.isActive == true) return
         syncJob = uiScope.launch {
+            val refreshedToken = if (refreshCredential) {
+                try {
+                    identity.restore(this@MainActivity)
+                } catch (_: CancellationException) {
+                    return@launch
+                } catch (_: Exception) {
+                    controller.pauseSynchronizationForAuthentication()
+                    render()
+                    return@launch
+                }
+            } else {
+                null
+            }
             try {
-                val refreshedToken = if (refreshCredential) identity.restore(this@MainActivity) else null
                 withContext(Dispatchers.IO) {
-                    refreshedToken?.let(controller::confirmSession)
+                    refreshedToken?.let { acceptServiceValidatedToken(it) }
                     controller.synchronize()
                 }
+            } catch (error: AcceptedAccountBindingException) {
+                failClosedAccountBinding()
             } catch (error: Exception) {
                 handleRepositoryError(error)
             }
@@ -768,17 +861,15 @@ class MainActivity : ComponentActivity() {
         dialog.show()
     }
 
-    private fun handleRepositoryError(error: Exception) {
-        if (error is AcceptedTenantMismatchException) {
+    private suspend fun handleRepositoryError(error: Exception) {
+        val revokedTenantId = controller.reportRepositoryError(error)
+        if (revokedTenantId != null) {
+            syncJob?.cancel()
+            syncJob = null
             continuity.shouldRestore = false
-            runCatching { acceptedTenantStore.clear() }
-            controller.reportError("The restored Google account no longer matches this Blocks account. Sign in again.")
-            return
-        }
-        val revoked = controller.reportRepositoryError(error)
-        if (revoked) {
-            continuity.shouldRestore = false
-            runCatching { acceptedTenantStore.clear() }
+            restoreProjectId = null
+            runCatching { withContext(Dispatchers.IO) { acceptedTenantStore.remove(revokedTenantId) } }
+            runCatching { identity.clear(this@MainActivity) }
         }
     }
 

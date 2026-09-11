@@ -7,6 +7,9 @@ import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import androidx.core.graphics.Insets
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.Lifecycle
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -18,8 +21,10 @@ import dev.blocks.android.auth.AcceptedTenantContinuity
 import dev.blocks.android.auth.AcceptedTenantContinuityStore
 import dev.blocks.android.auth.AndroidEncryptedAcceptedTenantContinuityStore
 import dev.blocks.android.auth.IdentityProvider
+import dev.blocks.android.mvp.AccountIdentity
 import dev.blocks.android.mvp.ChangePage
 import dev.blocks.android.mvp.FormDrafts
+import dev.blocks.android.mvp.MembershipRevokedException
 import dev.blocks.android.mvp.ParkingDraft
 import dev.blocks.android.mvp.Session
 import dev.blocks.android.mvp.TenantSyncState
@@ -69,6 +74,7 @@ class MainActivityPresentationTest {
     private var sessionExchangeOffline = false
     @Volatile
     private var authenticatedTenant = TENANT_ID
+    private lateinit var sessionExchanges: AtomicInteger
 
     @Before
     fun setUp() {
@@ -77,16 +83,22 @@ class MainActivityPresentationTest {
         identity = FakeIdentity()
         continuity = MemoryContinuity(true)
         acceptedTenant = MemoryAcceptedTenantContinuityStore(
-            AcceptedTenantContinuity(TENANT_ID),
+            AcceptedTenantContinuity(TENANT_ID, ACCOUNT_A),
         )
         sessionExchangeOffline = false
         authenticatedTenant = TENANT_ID
+        sessionExchanges = AtomicInteger()
         MainActivity.dependencyFactory = { activity ->
             val drafts = AndroidEncryptedDraftStore(activity)
             presentationController = ProjectPresentationController(
                 SessionAuthenticator {
+                    sessionExchanges.incrementAndGet()
                     if (sessionExchangeOffline) throw java.io.IOException("offline")
-                    Session(authenticatedTenant, it)
+                    Session(
+                        tenantId = authenticatedTenant,
+                        identityToken = it,
+                        accountIdentity = if (authenticatedTenant == TENANT_ID) ACCOUNT_A else ACCOUNT_B,
+                    )
                 },
                 workspace,
                 newOperationId = { "ui-operation-${operationIds.incrementAndGet()}" },
@@ -133,6 +145,101 @@ class MainActivityPresentationTest {
     }
 
     @Test
+    fun genuineLoginUsesOneProviderResultAndOneServiceBootstrap() {
+        continuity.shouldRestore = false
+        acceptedTenant.clear()
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_LOGIN }
+            scenario.onActivity { it.button("Sign in with Google").performClick() }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+
+            assertEquals(1, identity.signInCalls)
+            assertEquals(1, sessionExchanges.get())
+            assertEquals(AcceptedTenantContinuity(TENANT_ID, ACCOUNT_A), acceptedTenant.load())
+        }
+    }
+
+    @Test
+    fun signOutLocksThenSameAccountLoginRestoresWithoutErasingLocalData() {
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                activity.selectDialogItem(4)
+            }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_LOGIN }
+
+            assertEquals(null, acceptedTenant.load())
+            assertEquals(AcceptedTenantContinuity(TENANT_ID, ACCOUNT_A), acceptedTenant.find(ACCOUNT_A))
+            assertTrue(workspace.clearedTenants.isEmpty())
+            assertTrue(TENANT_ID in workspace.deactivatedTenants)
+
+            scenario.onActivity { it.button("Sign in with Google").performClick() }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD && it.hasButton("Active project") }
+
+            assertEquals(1, identity.signInCalls)
+            assertEquals(AcceptedTenantContinuity(TENANT_ID, ACCOUNT_A), acceptedTenant.load())
+            assertTrue(workspace.clearedTenants.isEmpty())
+        }
+    }
+
+    @Test
+    fun accountSwitchInBothDirectionsUsesSeparateRetainedPartitions() {
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD && it.hasButton("Active project") }
+
+            authenticatedTenant = OTHER_TENANT_ID
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                activity.selectDialogItem(3)
+            }
+            waitFor(scenario) {
+                it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD &&
+                    !it.hasButton("Active project") &&
+                    it.texts().contains("No active projects yet.")
+            }
+            assertEquals(AcceptedTenantContinuity(TENANT_ID, ACCOUNT_A), acceptedTenant.find(ACCOUNT_A))
+            assertEquals(AcceptedTenantContinuity(OTHER_TENANT_ID, ACCOUNT_B), acceptedTenant.find(ACCOUNT_B))
+
+            authenticatedTenant = TENANT_ID
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                activity.selectDialogItem(3)
+            }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD && it.hasButton("Active project") }
+
+            assertEquals(AcceptedTenantContinuity(TENANT_ID, ACCOUNT_A), acceptedTenant.load())
+            assertTrue(workspace.clearedTenants.isEmpty())
+            assertTrue(workspace.activatedTenants.containsAll(listOf(TENANT_ID, OTHER_TENANT_ID)))
+        }
+    }
+
+    @Test
+    fun failedAndCancelledLoginDoNotEraseOrReplaceRetainedAccount() {
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                activity.selectDialogItem(4)
+            }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_LOGIN }
+
+            identity.signInFailure = java.io.IOException("provider unavailable")
+            scenario.onActivity { it.button("Sign in with Google").performClick() }
+            waitUntil { identity.signInCalls == 1 }
+            assertEquals(AcceptedTenantContinuity(TENANT_ID, ACCOUNT_A), acceptedTenant.find(ACCOUNT_A))
+
+            identity.signInFailure = kotlinx.coroutines.CancellationException("cancelled")
+            scenario.onActivity { it.button("Sign in with Google").performClick() }
+            waitUntil { identity.signInCalls == 2 }
+            assertEquals(AcceptedTenantContinuity(TENANT_ID, ACCOUNT_A), acceptedTenant.find(ACCOUNT_A))
+            assertEquals(null, acceptedTenant.load())
+            assertTrue(workspace.clearedTenants.isEmpty())
+        }
+    }
+
+    @Test
     fun dashboardBodyHasOneSettingsEntryInsteadOfArchiveAndAccountActions() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
@@ -144,9 +251,39 @@ class MainActivityPresentationTest {
                 activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
                 val items = activity.activeDialog?.listView?.adapter ?: error("Settings menu is missing")
                 assertEquals(
-                    listOf("Archive", "Tile view", "Switch account", "Sign out"),
+                    listOf("Archive", "Tile view", "About", "Switch account", "Sign out", "Remove local data"),
                     (0 until items.count).map { items.getItem(it).toString() },
                 )
+            }
+        }
+    }
+
+    @Test
+    fun systemBarInsetAddsTopSpacingAndAboutShowsOnlyReleaseIdentity() {
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { activity ->
+                val content = activity.findViewById<LinearLayout>(ProjectUiIds.CONTENT)
+                val topInset = 37
+                ViewCompat.dispatchApplyWindowInsets(
+                    content,
+                    WindowInsetsCompat.Builder()
+                        .setInsets(WindowInsetsCompat.Type.systemBars(), Insets.of(0, topInset, 0, 11))
+                        .build(),
+                )
+                val comfortableSpacing = (24 * activity.resources.displayMetrics.density).toInt()
+                assertEquals(topInset + comfortableSpacing, content.paddingTop)
+
+                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                activity.selectDialogItem(2)
+                val about = activity.dialogTexts().joinToString("\n")
+                assertTrue(about.contains("Blocks Android"))
+                assertTrue(about.contains("Version 0.5.1 (6)"))
+                assertTrue(about.contains("dev.blocks.android/debug"))
+                assertFalse(about.contains("tenant", ignoreCase = true))
+                assertFalse(about.contains("token", ignoreCase = true))
+                assertFalse(about.contains("http", ignoreCase = true))
+                assertFalse(about.contains("sync", ignoreCase = true))
             }
         }
     }
@@ -242,6 +379,25 @@ class MainActivityPresentationTest {
     }
 
     @Test
+    fun expiredOrUnavailableProviderRestoreLeavesCachedWorkOpenAndQuiet() {
+        identity.restoreFailure = java.io.IOException("credential unavailable")
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) {
+                it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD &&
+                    presentationController.state.authenticationRequired
+            }
+            scenario.onActivity { activity ->
+                assertTrue(activity.hasButton("Active project"))
+                assertFalse(activity.hasButton("Reconnect Google account"))
+                assertFalse(activity.texts().any { it.contains("credential", ignoreCase = true) })
+            }
+            assertEquals(AcceptedTenantContinuity(TENANT_ID, ACCOUNT_A), acceptedTenant.load())
+            assertTrue(workspace.clearedTenants.isEmpty())
+        }
+    }
+
+    @Test
     fun processStyleOfflineRestartReadsRealEncryptedDatabaseAndKeystoreContinuityThenReconciles() {
         val syncStore = AndroidEncryptedSyncStateStore(context)
         syncStore.clearSyncState(TENANT_ID)
@@ -271,7 +427,7 @@ class MainActivityPresentationTest {
                     SessionAuthenticator {
                         exchanges.incrementAndGet()
                         if (!exchangeOnline.get()) throw java.io.IOException("service unavailable")
-                        Session(TENANT_ID, "service-session")
+                        Session(TENANT_ID, "service-session", ACCOUNT_A)
                     },
                     ProjectSyncRepository(service, NoOpLegacyQueueReplay, drafts, persisted),
                 ),
@@ -320,7 +476,7 @@ class MainActivityPresentationTest {
                 AndroidEncryptedSyncStateStore(activity),
             )
             presentationController = ProjectPresentationController(
-                SessionAuthenticator { Session(TENANT_ID, it) },
+                SessionAuthenticator { Session(TENANT_ID, it, ACCOUNT_A) },
                 repository,
                 newOperationId = { "offline-ui-${operationIds.incrementAndGet()}" },
             )
@@ -442,19 +598,56 @@ class MainActivityPresentationTest {
     }
 
     @Test
-    fun serviceConfirmedTenantMismatchErasesAcceptedTenantAndFailsClosed() {
+    fun backgroundServiceConfirmationOfAnotherAccountSwitchesPartitionWithoutErasingEitherAccount() {
         authenticatedTenant = OTHER_TENANT_ID
 
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_LOGIN }
-            waitUntil { workspace.cache.activeProjects.isEmpty() }
-
-            assertFalse(continuity.shouldRestore)
-            assertTrue(acceptedTenant.load() == null)
-            scenario.onActivity { activity ->
-                assertFalse(activity.hasButton("Active project"))
-                assertTrue(activity.texts().any { it.contains("does not match") })
+            waitFor(scenario) {
+                it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD &&
+                    it.texts().contains("No active projects yet.")
             }
+
+            assertTrue(continuity.shouldRestore)
+            assertEquals(AcceptedTenantContinuity(OTHER_TENANT_ID, ACCOUNT_B), acceptedTenant.load())
+            assertEquals(AcceptedTenantContinuity(TENANT_ID, ACCOUNT_A), acceptedTenant.find(ACCOUNT_A))
+            assertTrue(workspace.clearedTenants.isEmpty())
+        }
+    }
+
+    @Test
+    fun confirmedMembershipRevocationErasesOnlyTheAffectedPartition() {
+        acceptedTenant.save(AcceptedTenantContinuity(OTHER_TENANT_ID, ACCOUNT_B))
+        acceptedTenant.save(AcceptedTenantContinuity(TENANT_ID, ACCOUNT_A))
+        workspace.membershipRevoked = true
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_LOGIN }
+
+            assertEquals(null, acceptedTenant.find(ACCOUNT_A))
+            assertEquals(AcceptedTenantContinuity(OTHER_TENANT_ID, ACCOUNT_B), acceptedTenant.find(ACCOUNT_B))
+            assertEquals(listOf(TENANT_ID), workspace.clearedTenants)
+            assertFalse(continuity.shouldRestore)
+        }
+    }
+
+    @Test
+    fun explicitRemoveLocalDataErasesOnlyTheSelectedTenantAfterConfirmation() {
+        acceptedTenant.save(AcceptedTenantContinuity(OTHER_TENANT_ID, ACCOUNT_B))
+        acceptedTenant.save(AcceptedTenantContinuity(TENANT_ID, ACCOUNT_A))
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                activity.selectDialogItem(5)
+                assertTrue(activity.dialogTexts().any { it.contains("permanently removes") })
+                activity.dialogButton("Remove local data").callOnClick()
+            }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_LOGIN }
+
+            assertEquals(null, acceptedTenant.find(ACCOUNT_A))
+            assertEquals(AcceptedTenantContinuity(OTHER_TENANT_ID, ACCOUNT_B), acceptedTenant.find(ACCOUNT_B))
+            assertEquals(listOf(TENANT_ID), workspace.clearedTenants)
         }
     }
 
@@ -467,7 +660,7 @@ class MainActivityPresentationTest {
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
 
             scenario.onActivity { activity -> assertTrue(activity.hasButton("Active project")) }
-            assertEquals(AcceptedTenantContinuity(TENANT_ID), acceptedTenant.load())
+            assertEquals(AcceptedTenantContinuity(TENANT_ID, ACCOUNT_A), acceptedTenant.load())
             assertEquals(listOf(TENANT_ID), workspace.activatedTenants.distinct())
             assertTrue(continuity.shouldRestore)
         }
@@ -645,16 +838,17 @@ class MainActivityPresentationTest {
     fun rejectedCredentialOffersOneControlledForegroundReauthenticationJourney() {
         workspace.rejectAuthentication = true
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-            waitFor(scenario) { activity ->
-                activity.findViewById<Button>(ProjectUiIds.REAUTHENTICATE) != null
-            }
+            waitUntil { presentationController.state.authenticationRequired }
             workspace.rejectAuthentication = false
             scenario.onActivity { activity ->
-                activity.findViewById<Button>(ProjectUiIds.REAUTHENTICATE).performClick()
+                assertFalse(activity.hasButton("Reconnect Google account"))
+                assertTrue(activity.hasButton("Active project"))
+                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                activity.selectDialogItem("Reconnect Google account")
             }
             waitFor(scenario) { activity ->
                 activity.screenTag() == ProjectUiIds.SCREEN_DASHBOARD &&
-                    activity.findViewById<Button>(ProjectUiIds.REAUTHENTICATE) == null
+                    !presentationController.state.authenticationRequired
             }
             assertEquals(1, identity.signInCalls)
         }
@@ -708,6 +902,12 @@ class MainActivityPresentationTest {
         list.performItemClick(list.getChildAt(index), index, list.adapter.getItemId(index))
     }
 
+    private fun MainActivity.selectDialogItem(text: String) {
+        val list = requireNotNull(activeDialog).listView
+        val index = (0 until list.adapter.count).single { list.adapter.getItem(it).toString() == text }
+        list.performItemClick(list.getChildAt(index), index, list.adapter.getItemId(index))
+    }
+
     private fun MainActivity.dialogTexts() = requireNotNull(activeDialog)
         .window?.decorView?.descendants().orEmpty()
         .mapNotNull { (it as? android.widget.TextView)?.text?.toString() }
@@ -722,42 +922,76 @@ class MainActivityPresentationTest {
     private class FakeIdentity : IdentityProvider {
         var restoreCalls = 0
         var signInCalls = 0
+        var clearCalls = 0
         var restoredToken = "restored-token"
+        var signInFailure: Exception? = null
+        var restoreFailure: Exception? = null
         override suspend fun signIn(activity: Activity): String {
             signInCalls += 1
+            signInFailure?.let { throw it }
             return "identity-token"
         }
         override suspend fun restore(activity: Activity): String {
             restoreCalls += 1
+            restoreFailure?.let { throw it }
             return restoredToken
         }
-        override suspend fun clear(activity: Activity) = Unit
+        override suspend fun clear(activity: Activity) {
+            clearCalls += 1
+        }
     }
 
     private data class MemoryContinuity(override var shouldRestore: Boolean) : SessionContinuity
 
-    private class MemoryAcceptedTenantContinuityStore(
-        private var continuity: AcceptedTenantContinuity?,
-    ) : AcceptedTenantContinuityStore {
-        override fun load() = continuity
+    private class MemoryAcceptedTenantContinuityStore(initial: AcceptedTenantContinuity?) :
+        AcceptedTenantContinuityStore {
+        private var activeTenantId = initial?.tenantId
+        private val bindings = initial?.let { mutableListOf(it) } ?: mutableListOf()
+
+        @Synchronized
+        override fun load() = bindings.firstOrNull { it.tenantId == activeTenantId }
+        @Synchronized
+        override fun find(accountIdentity: AccountIdentity) =
+            bindings.firstOrNull { it.accountIdentity == accountIdentity }
+        @Synchronized
         override fun save(continuity: AcceptedTenantContinuity) {
-            this.continuity = continuity
+            bindings.removeAll { it.tenantId == continuity.tenantId }
+            bindings += continuity
+            activeTenantId = continuity.tenantId
         }
+        @Synchronized
+        override fun lock() {
+            activeTenantId = null
+        }
+        @Synchronized
+        override fun remove(tenantId: String) {
+            bindings.removeAll { it.tenantId == tenantId }
+            if (activeTenantId == tenantId) activeTenantId = null
+        }
+        @Synchronized
         override fun clear() {
-            continuity = null
+            activeTenantId = null
+            bindings.clear()
         }
     }
 
     private class FakeWorkspace : ProjectWorkspace {
-        private var drafts = FormDrafts()
-        private var preferences = ProjectUiPreferences()
-        @Volatile
-        var cache = ProjectCacheState(
-            activeProjects = listOf(project()),
-            activeProjectsLoaded = true,
-            archivedProjectsLoaded = true,
-            pages = listOf(page()),
+        private var activeTenantId = TENANT_ID
+        private val draftsByTenant = mutableMapOf<String, FormDrafts>()
+        private val preferencesByTenant = mutableMapOf<String, ProjectUiPreferences>()
+        private val caches = mutableMapOf(
+            TENANT_ID to ProjectCacheState(
+                activeProjects = listOf(project()),
+                activeProjectsLoaded = true,
+                archivedProjectsLoaded = true,
+                pages = listOf(page()),
+            ),
         )
+        var cache: ProjectCacheState
+            get() = caches.getOrPut(activeTenantId, ::emptyCache)
+            set(value) {
+                caches[activeTenantId] = value
+            }
         @Volatile
         var offline = false
         @Volatile
@@ -765,26 +999,35 @@ class MainActivityPresentationTest {
         @Volatile
         var rejectAuthentication = false
         @Volatile
+        var membershipRevoked = false
+        @Volatile
         var syncCalls = 0
         @Volatile
         var pageCalls = 0
         val activatedTenants = mutableListOf<String>()
+        val deactivatedTenants = mutableListOf<String>()
+        val clearedTenants = mutableListOf<String>()
         val mutations = mutableListOf<String>()
 
         override fun activate(session: Session) {
+            activeTenantId = session.tenantId
             activatedTenants += session.tenantId
         }
+        override fun deactivate(session: Session) {
+            deactivatedTenants += session.tenantId
+        }
         override fun snapshot(session: Session) = result()
-        override fun projectDrafts(session: Session) = drafts
+        override fun projectDrafts(session: Session) = draftsByTenant[session.tenantId] ?: FormDrafts()
         override fun updateProjectDrafts(
             session: Session,
             update: (FormDrafts) -> FormDrafts,
-        ): FormDrafts = update(drafts).also { drafts = it }
-        override fun uiPreferences(session: Session) = preferences
+        ): FormDrafts = update(projectDrafts(session)).also { draftsByTenant[session.tenantId] = it }
+        override fun uiPreferences(session: Session) =
+            preferencesByTenant[session.tenantId] ?: ProjectUiPreferences()
         override fun updateUiPreferences(
             session: Session,
             update: (ProjectUiPreferences) -> ProjectUiPreferences,
-        ) = update(preferences).also { preferences = it }
+        ) = update(uiPreferences(session)).also { preferencesByTenant[session.tenantId] = it }
         override fun archivedProjects(session: Session) = cache.archivedProjects
         override fun projectPage(session: Session, projectId: String): ProjectPage {
             pageCalls += 1
@@ -793,6 +1036,12 @@ class MainActivityPresentationTest {
         @Synchronized
         override fun backgroundSync(session: Session): BackgroundSyncResult {
             syncCalls += 1
+            if (membershipRevoked) {
+                clearLocalState(session)
+                throw MembershipRevokedException(
+                    ServiceException(403, ApiError(ApiErrorCode.UNAUTHORIZED, "Membership revoked")),
+                )
+            }
             if (rejectAuthentication) {
                 throw ServiceException(
                     401,
@@ -898,10 +1147,17 @@ class MainActivityPresentationTest {
             return result()
         }
         override fun clearLocalState(session: Session) {
-            cache = ProjectCacheState()
-            drafts = FormDrafts()
-            preferences = ProjectUiPreferences()
+            clearedTenants += session.tenantId
+            caches.remove(session.tenantId)
+            draftsByTenant.remove(session.tenantId)
+            preferencesByTenant.remove(session.tenantId)
         }
+
+        private fun emptyCache() = ProjectCacheState(
+            activeProjectsLoaded = true,
+            archivedProjectsLoaded = true,
+            blocksLoaded = true,
+        )
 
         @Synchronized
         private fun queue(command: ProjectMutation): BackgroundSyncResult {
@@ -1006,6 +1262,8 @@ class MainActivityPresentationTest {
         private const val OTHER_TENANT_ID = "00000000-0000-0000-0000-000000000099"
         private const val PROJECT_ID = "00000000-0000-0000-0000-000000000012"
         private const val NOW = "2026-09-07T10:00:00Z"
+        private val ACCOUNT_A = AccountIdentity("https://accounts.google.com", "account-a")
+        private val ACCOUNT_B = AccountIdentity("https://accounts.google.com", "account-b")
         private fun project() = ProjectSummary(
             PROJECT_ID,
             TENANT_ID,
