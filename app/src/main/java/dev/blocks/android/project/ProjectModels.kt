@@ -209,6 +209,7 @@ fun interface SessionAuthenticator {
 /** Presentation-facing boundary around the durable project cache and command dispatcher. */
 interface ProjectWorkspace {
     fun activate(session: Session)
+    fun deactivate(session: Session) = Unit
     fun snapshot(session: Session): BackgroundSyncResult
     fun projectDrafts(session: Session): FormDrafts
     fun updateProjectDrafts(session: Session, update: (FormDrafts) -> FormDrafts): FormDrafts

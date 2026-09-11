@@ -1,6 +1,15 @@
 package dev.blocks.android.mvp
 
-data class Session(val tenantId: String, val identityToken: String = "")
+data class AccountIdentity(
+    val issuer: String,
+    val subject: String,
+)
+
+data class Session(
+    val tenantId: String,
+    val identityToken: String = "",
+    val accountIdentity: AccountIdentity? = null,
+)
 data class Project(val id: String, val name: String)
 data class ParkingRecord(
     val location: String,

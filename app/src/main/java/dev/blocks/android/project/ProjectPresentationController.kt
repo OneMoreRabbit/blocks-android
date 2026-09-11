@@ -2,7 +2,6 @@ package dev.blocks.android.project
 
 import dev.blocks.android.api.IncompatibleServiceApiException
 import dev.blocks.android.api.ServiceException
-import dev.blocks.android.auth.AcceptedTenantMismatchException
 import dev.blocks.android.mvp.FormDrafts
 import dev.blocks.android.mvp.MembershipRevokedException
 import dev.blocks.android.mvp.ParkingDraft
@@ -56,10 +55,24 @@ class ProjectPresentationController(
     val isAuthenticated: Boolean
         get() = session != null
 
+    val activeTenantId: String?
+        get() = session?.tenantId
+
+    /** Performs only the online Service validation. It does not expose a tenant cache. */
+    @Synchronized
+    fun authenticate(identityToken: String): Session {
+        require(identityToken.isNotBlank()) { "Google did not return an identity credential." }
+        return authenticator.login(identityToken)
+    }
+
     @Synchronized
     fun login(identityToken: String): Session {
-        require(identityToken.isNotBlank()) { "Google did not return an identity credential." }
-        val authenticated = authenticator.login(identityToken)
+        return activateAuthenticated(authenticate(identityToken))
+    }
+
+    /** Opens a tenant only after the caller has accepted its Service-validated account binding. */
+    @Synchronized
+    fun activateAuthenticated(authenticated: Session): Session {
         workspace.activate(authenticated)
         val continuingTenant = session?.tenantId == authenticated.tenantId
         session = authenticated
@@ -110,22 +123,7 @@ class ProjectPresentationController(
     /** Lets the Service validate a fresh Google credential and confirm the accepted tenant. */
     @Synchronized
     fun confirmSession(identityToken: String): Session {
-        require(identityToken.isNotBlank()) { "Google did not return an identity credential." }
-        val previous = activeSession()
-        val authenticated = authenticator.login(identityToken)
-        if (authenticated.tenantId != previous.tenantId) {
-            session = null
-            state = ProjectPresentationState()
-            workspace.clearLocalState(previous)
-            throw AcceptedTenantMismatchException()
-        }
-        session = authenticated
-        state = state.copy(
-            authenticationRequired = false,
-            sessionConfirmationRequired = false,
-            error = null,
-        )
-        return authenticated
+        return activateAuthenticated(authenticate(identityToken))
     }
 
     @Synchronized
@@ -134,7 +132,11 @@ class ProjectPresentationController(
         session = null
         state = ProjectPresentationState()
         workspace.activate(cached)
-        workspace.clearLocalState(cached)
+        try {
+            workspace.clearLocalState(cached)
+        } finally {
+            workspace.deactivate(cached)
+        }
     }
 
     @Synchronized
@@ -409,19 +411,26 @@ class ProjectPresentationController(
     }
 
     @Synchronized
-    fun logout() {
+    fun lock() {
         val active = session
         session = null
         state = ProjectPresentationState()
-        active?.let(workspace::clearLocalState)
+        active?.let(workspace::deactivate)
     }
 
     @Synchronized
-    fun reportRepositoryError(error: Exception): Boolean {
+    fun logout() {
+        lock()
+    }
+
+    @Synchronized
+    fun reportRepositoryError(error: Exception): String? {
         if (error is MembershipRevokedException) {
+            val revoked = session
             session = null
             state = ProjectPresentationState(error = "Project access changed. Sign in again to continue.")
-            return true
+            revoked?.let(workspace::deactivate)
+            return revoked?.tenantId
         }
         state = state.copy(
             syncing = false,
@@ -434,12 +443,22 @@ class ProjectPresentationController(
                 "Blocks could not save that change on this device."
             },
         )
-        return false
+        return null
     }
 
     @Synchronized
     fun reportError(message: String) {
         state = state.copy(syncing = false, error = message)
+    }
+
+    /** Keeps local work open while background cloud access waits for a fresh credential. */
+    @Synchronized
+    fun pauseSynchronizationForAuthentication() {
+        state = state.copy(
+            syncing = false,
+            authenticationRequired = true,
+            error = null,
+        )
     }
 
     private fun applyResult(result: BackgroundSyncResult) {

@@ -3,7 +3,6 @@ package dev.blocks.android.project
 import dev.blocks.android.api.ApiError
 import dev.blocks.android.api.ApiErrorCode
 import dev.blocks.android.api.ServiceException
-import dev.blocks.android.auth.AcceptedTenantMismatchException
 import dev.blocks.android.mvp.DraftStore
 import dev.blocks.android.mvp.FormDrafts
 import dev.blocks.android.mvp.ParkingDraft
@@ -46,7 +45,7 @@ class ProjectPresentationControllerTest {
     }
 
     @Test
-    fun onlineConfirmationWithADifferentTenantErasesTheBoundTenantAndFailsClosed() {
+    fun onlineConfirmationWithADifferentTenantActivatesItsOwnPartitionWithoutErasingThePreviousTenant() {
         val drafts = MemoryDrafts()
         val workspace = FakeWorkspace().apply { draftStore = drafts }
         val controller = ProjectPresentationController(
@@ -55,12 +54,12 @@ class ProjectPresentationControllerTest {
         )
         controller.restoreCached(TENANT_ID)
 
-        val error = runCatching { controller.confirmSession("fresh-google-token") }.exceptionOrNull()
+        val confirmed = controller.confirmSession("fresh-google-token")
 
-        assertTrue(error is AcceptedTenantMismatchException)
-        assertEquals(listOf(TENANT_ID), workspace.clearedTenants)
-        assertFalse(controller.isAuthenticated)
-        assertEquals(ProjectScreen.LOGIN, controller.state.screen)
+        assertEquals("different-tenant", confirmed.tenantId)
+        assertTrue(controller.isAuthenticated)
+        assertEquals(ProjectScreen.DASHBOARD, controller.state.screen)
+        assertTrue(workspace.clearedTenants.isEmpty())
     }
 
     @Test
@@ -245,14 +244,15 @@ class ProjectPresentationControllerTest {
     }
 
     @Test
-    fun logoutErasesTheTenantAndDropsTheInMemorySession() {
+    fun logoutLocksTheTenantWithoutErasingItsWorkspace() {
         val workspace = FakeWorkspace()
         val controller = controller(workspace)
         controller.login("identity-token")
 
         controller.logout()
 
-        assertEquals(listOf(TENANT_ID), workspace.clearedTenants)
+        assertEquals(listOf(TENANT_ID), workspace.deactivatedTenants)
+        assertTrue(workspace.clearedTenants.isEmpty())
         assertFalse(controller.isAuthenticated)
         assertEquals(ProjectScreen.LOGIN, controller.state.screen)
         assertNull(controller.state.projectPage)
@@ -313,11 +313,15 @@ class ProjectPresentationControllerTest {
         val mutations = mutableListOf<String>()
         val operationIds = mutableListOf<String>()
         val clearedTenants = mutableListOf<String>()
+        val deactivatedTenants = mutableListOf<String>()
         var lastSupersedesId: String? = "not-called"
         val conflictRetries = mutableListOf<Pair<String, String>>()
         var preferences = ProjectUiPreferences()
 
         override fun activate(session: Session) = Unit
+        override fun deactivate(session: Session) {
+            deactivatedTenants += session.tenantId
+        }
         override fun snapshot(session: Session) = result()
         override fun projectDrafts(session: Session) = draftStore.load(session.tenantId)
         override fun updateProjectDrafts(

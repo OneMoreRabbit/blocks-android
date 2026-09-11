@@ -745,7 +745,7 @@ class ProjectSyncRepositoryTest {
     }
 
     @Test
-    fun tenantSwitchAndConfirmedMembershipRevocationEraseOnlyTheDepartedPartition() {
+    fun tenantSwitchRetainsBothPartitionsAndConfirmedMembershipRevocationErasesOnlyTheAffectedOne() {
         val drafts = MemoryDrafts()
         val state = MemoryState()
         state.saveSyncState(TENANT_A, loadedState())
@@ -758,17 +758,24 @@ class ProjectSyncRepositoryTest {
         repository.activate(SESSION_A)
         repository.activate(SESSION_B)
 
-        assertEquals(TenantSyncState(), state.loadSyncState(TENANT_A))
-        assertEquals(FormDrafts(), drafts.load(TENANT_A))
+        assertFalse(state.loadSyncState(TENANT_A) == TenantSyncState())
+        assertEquals("Tenant A", state.loadSyncState(TENANT_A).projectDrafts.projectNotes[PROJECT_ID])
         assertFalse(state.loadSyncState(TENANT_B) == TenantSyncState())
         assertEquals("Tenant B", repository.projectDrafts(SESSION_B).projectNotes[PROJECT_ID])
 
+        repository.deactivate(SESSION_B)
+        repository.activate(SESSION_A)
+        assertEquals("Tenant A", repository.projectDrafts(SESSION_A).projectNotes[PROJECT_ID])
+
         service.membershipRevoked = true
+        repository.activate(SESSION_B)
         val error = runCatching { repository.backgroundSync(SESSION_B) }.exceptionOrNull()
 
         assertTrue(error is MembershipRevokedException)
         assertEquals(TenantSyncState(), state.loadSyncState(TENANT_B))
         assertEquals(FormDrafts(), drafts.load(TENANT_B))
+        assertFalse(state.loadSyncState(TENANT_A) == TenantSyncState())
+        assertEquals("Tenant A", state.loadSyncState(TENANT_A).projectDrafts.projectNotes[PROJECT_ID])
     }
 
     private fun repository(service: FakeProjectService, drafts: MemoryDrafts, state: MemoryState) =
