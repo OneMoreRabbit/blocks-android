@@ -132,18 +132,16 @@ class ProjectSyncRepository(
             notes = ProjectNotes(clientId, "", 0, createdAt),
             newestParking = null,
         )
-        return commitLocal(
-            session,
-            ProjectMutation(
-                operationId = operationId,
-                type = ProjectMutationType.CREATE_PROJECT,
-                targetId = clientId,
-                idempotencyKey = operationId,
-                clientResourceId = clientId,
-                projectName = name,
-                localCreatedAt = createdAt,
-            ),
-        ) { state ->
+        val command = ProjectMutation(
+            operationId = operationId,
+            type = ProjectMutationType.CREATE_PROJECT,
+            targetId = clientId,
+            idempotencyKey = operationId,
+            clientResourceId = clientId,
+            projectName = name,
+            localCreatedAt = createdAt,
+        )
+        return commitLocal(session, command) { state ->
             state.copy(
                 projectCache = state.projectCache.copy(
                     activeProjects = state.projectCache.activeProjects.upsert(project) { it.id },
@@ -151,7 +149,7 @@ class ProjectSyncRepository(
                     pages = state.projectCache.pages.upsert(page) { it.project.id },
                     provisionalProjectIds = (state.projectCache.provisionalProjectIds + clientId).distinct(),
                 ),
-                projectDrafts = state.projectDrafts.copy(projectName = name),
+                projectDrafts = state.projectDrafts.cleanAfter(command),
             )
         }
     }
@@ -167,24 +165,20 @@ class ProjectSyncRepository(
         require(name.isNotBlank())
         val state = activeState(session)
         val dependency = state.projectCache.latestProjectDependency(projectId)
-        return commitLocal(
-            session,
-            ProjectMutation(
-                operationId = operationId,
-                type = ProjectMutationType.RENAME_PROJECT,
-                targetId = projectId,
-                ifMatch = rowVersion.takeIf { dependency == null },
-                projectName = name,
-                dependsOnOperationId = dependency,
-                localCreatedAt = now(),
-            ),
-        ) { current ->
+        val command = ProjectMutation(
+            operationId = operationId,
+            type = ProjectMutationType.RENAME_PROJECT,
+            targetId = projectId,
+            ifMatch = rowVersion.takeIf { dependency == null },
+            projectName = name,
+            dependsOnOperationId = dependency,
+            localCreatedAt = now(),
+        )
+        return commitLocal(session, command) { current ->
             current.updateProject(projectId) {
                 it.copy(name = name, updatedAt = now())
             }.copy(
-                projectDrafts = current.projectDrafts.copy(
-                    projectRenames = current.projectDrafts.projectRenames + (projectId to name),
-                ),
+                projectDrafts = current.projectDrafts.cleanAfter(command),
             ).withProjectedLists()
         }
     }
@@ -229,26 +223,22 @@ class ProjectSyncRepository(
     ): BackgroundSyncResult {
         val state = activeState(session)
         val dependency = state.projectCache.latestProjectDependency(projectId)
-        return commitLocal(
-            session,
-            ProjectMutation(
-                operationId = operationId,
-                type = ProjectMutationType.SAVE_NOTES,
-                targetId = projectId,
-                ifMatch = rowVersion.takeIf {
-                    dependency == null && projectId !in state.projectCache.projectsAwaitingNotesBaseline
-                },
-                notesBody = body,
-                dependsOnOperationId = dependency,
-                localCreatedAt = now(),
-            ),
-        ) { current ->
+        val command = ProjectMutation(
+            operationId = operationId,
+            type = ProjectMutationType.SAVE_NOTES,
+            targetId = projectId,
+            ifMatch = rowVersion.takeIf {
+                dependency == null && projectId !in state.projectCache.projectsAwaitingNotesBaseline
+            },
+            notesBody = body,
+            dependsOnOperationId = dependency,
+            localCreatedAt = now(),
+        )
+        return commitLocal(session, command) { current ->
             current.updatePage(projectId) { page ->
                 page.copy(notes = page.notes.copy(body = body, updatedAt = now()))
             }.copy(
-                projectDrafts = current.projectDrafts.copy(
-                    projectNotes = current.projectDrafts.projectNotes + (projectId to body),
-                ),
+                projectDrafts = current.projectDrafts.cleanAfter(command),
             )
         }
     }
@@ -278,25 +268,21 @@ class ProjectSyncRepository(
             clientId = clientId,
             supersedesId = supersedesId,
         )
-        return commitLocal(
-            session,
-            ProjectMutation(
-                operationId = operationId,
-                type = ProjectMutationType.ADD_PARKING,
-                targetId = projectId,
-                projectId = projectId,
-                idempotencyKey = operationId,
-                clientResourceId = clientId,
-                parking = parking,
-                supersedesId = supersedesId,
-                dependsOnOperationId = dependency,
-                localCreatedAt = createdAt,
-            ),
-        ) { current ->
+        val command = ProjectMutation(
+            operationId = operationId,
+            type = ProjectMutationType.ADD_PARKING,
+            targetId = projectId,
+            projectId = projectId,
+            idempotencyKey = operationId,
+            clientResourceId = clientId,
+            parking = parking,
+            supersedesId = supersedesId,
+            dependsOnOperationId = dependency,
+            localCreatedAt = createdAt,
+        )
+        return commitLocal(session, command) { current ->
             current.updatePage(projectId) { it.copy(newestParking = localParking) }.copy(
-                projectDrafts = current.projectDrafts.copy(
-                    projectParking = current.projectDrafts.projectParking + (projectId to parking),
-                ),
+                projectDrafts = current.projectDrafts.cleanAfter(command),
             )
         }
     }

@@ -105,23 +105,23 @@ class ProjectPresentationControllerTest {
     }
 
     @Test
-    fun retryableCreateReusesPersistedIdentityAcrossRestartAndClearsAfterAck() {
+    fun locallyCommittedCreateKeepsItsRetryIdentityInTheQueueNotTheEditingDraft() {
         val drafts = MemoryDrafts()
         val workspace = FakeWorkspace().apply { offline = true }
-        val first = controller(workspace, drafts, ids = ArrayDeque(listOf("create-key", "unused")))
+        val first = controller(workspace, drafts, ids = ArrayDeque(listOf("create-key")))
         first.login("identity-token")
         first.createProject("New project")
 
         val recreated = controller(workspace, drafts, ids = ArrayDeque(listOf("different-key")))
         recreated.login("identity-token")
-        recreated.createProject("New project")
 
-        assertEquals(listOf("create-key", "create-key"), workspace.operationIds)
-        assertEquals("New project", recreated.state.drafts.projectName)
-        workspace.offline = false
-        recreated.synchronize()
+        assertEquals(listOf("create-key"), workspace.operationIds)
+        assertEquals(listOf("create-key"), workspace.cache.commands.map { it.operationId })
         assertEquals("", recreated.state.drafts.projectName)
         assertTrue(recreated.state.drafts.pendingMutations.isEmpty())
+        workspace.offline = false
+        recreated.synchronize()
+        assertTrue(workspace.cache.commands.isEmpty())
     }
 
     @Test
@@ -153,7 +153,8 @@ class ProjectPresentationControllerTest {
 
         assertTrue(controller.state.reconciliationRequired)
         assertTrue(controller.state.pendingChanges)
-        assertEquals("Keep my edit", controller.state.drafts.projectNotes[PROJECT_ID])
+        assertTrue(controller.state.drafts.projectNotes.isEmpty())
+        assertEquals("Keep my edit", controller.state.conflict?.localNotes)
         assertEquals(null, controller.state.status)
     }
 
@@ -192,9 +193,10 @@ class ProjectPresentationControllerTest {
         controller.addParking("Shelf", "Open notebook", "Cable")
         assertEquals(listOf("parking"), workspace.mutations)
         assertNull(workspace.lastSupersedesId)
-        assertEquals("Shelf", controller.state.drafts.projectParking[PROJECT_ID]?.location)
-        assertEquals("Open notebook", controller.state.drafts.projectParking[PROJECT_ID]?.nextAction)
-        assertEquals("Cable", controller.state.drafts.projectParking[PROJECT_ID]?.mustNotForget)
+        assertTrue(controller.state.drafts.projectParking.isEmpty())
+        assertEquals("Shelf", workspace.cache.commands.single().parking?.location)
+        assertEquals("Open notebook", workspace.cache.commands.single().parking?.nextAction)
+        assertEquals("Cable", workspace.cache.commands.single().parking?.mustNotForget)
         assertFalse(controller.state.showParkingForm)
     }
 
@@ -478,12 +480,21 @@ class ProjectPresentationControllerTest {
                     ),
                 )
             }
+            cleanDraft(cache.commands.first { it.operationId == operationId })
             onQueue?.invoke()
             if (!offline && !conflict) acknowledge(cache.commands.first { it.operationId == operationId })
             return result()
         }
 
         private fun acknowledge(command: ProjectMutation) {
+            cleanDraft(command)
+            cache = cache.copy(
+                commands = cache.commands.filterNot { it.operationId == command.operationId },
+                retiredOperationIds = cache.retiredOperationIds + command.operationId,
+            )
+        }
+
+        private fun cleanDraft(command: ProjectMutation) {
             val drafts = draftStore.load(TENANT_ID)
             val cleaned = when (command.type) {
                 ProjectMutationType.CREATE_PROJECT -> drafts.copy(
@@ -519,10 +530,6 @@ class ProjectPresentationControllerTest {
                         it.idempotencyKey != command.operationId
                     },
                 ),
-            )
-            cache = cache.copy(
-                commands = cache.commands.filterNot { it.operationId == command.operationId },
-                retiredOperationIds = cache.retiredOperationIds + command.operationId,
             )
         }
 

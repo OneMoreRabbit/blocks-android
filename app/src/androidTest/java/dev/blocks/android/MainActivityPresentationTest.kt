@@ -396,6 +396,9 @@ class MainActivityPresentationTest {
                 rename.setText("Renamed offline project")
                 activity.dialogButton("Rename").callOnClick()
             }
+            waitUntil {
+                presentationController.state.projectPage?.project?.name == "Renamed offline project"
+            }
             waitFor(restarted) { it.texts().contains("Renamed offline project") }
             restarted.onActivity { activity ->
                 activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS).performClick()
@@ -543,13 +546,12 @@ class MainActivityPresentationTest {
             }
 
             scenario.recreate()
-            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            waitFor(scenario) {
+                it.screenTag() == ProjectUiIds.SCREEN_PROJECT &&
+                    it.findViewById<View>(ProjectUiIds.PARK_SHEET) != null
+            }
 
             scenario.onActivity { activity ->
-                assertEquals(
-                    "Draft after recreation",
-                    activity.findViewById<EditText>(ProjectUiIds.NOTES).text.toString(),
-                )
                 assertEquals("Shelf", activity.findViewById<EditText>(ProjectUiIds.PARKING_LOCATION).text.toString())
                 assertEquals(
                     "Open notebook",
@@ -558,6 +560,11 @@ class MainActivityPresentationTest {
                 assertEquals(
                     "Bring cable",
                     activity.findViewById<EditText>(ProjectUiIds.PARKING_MUST_NOT_FORGET).text.toString(),
+                )
+                activity.findViewById<Button>(ProjectUiIds.BACK).performClick()
+                assertEquals(
+                    "Draft after recreation",
+                    activity.findViewById<EditText>(ProjectUiIds.NOTES).text.toString(),
                 )
             }
             assertTrue(identity.restoreCalls >= 2)
@@ -566,12 +573,11 @@ class MainActivityPresentationTest {
         ActivityScenario.launch(MainActivity::class.java).use { restarted ->
             waitFor(restarted) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             restarted.onActivity { it.button("Active project").performClick() }
-            waitFor(restarted) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            waitFor(restarted) {
+                it.screenTag() == ProjectUiIds.SCREEN_PROJECT &&
+                    it.findViewById<View>(ProjectUiIds.PARK_SHEET) != null
+            }
             restarted.onActivity { activity ->
-                assertEquals(
-                    "Draft after recreation",
-                    activity.findViewById<EditText>(ProjectUiIds.NOTES).text.toString(),
-                )
                 assertEquals("Shelf", activity.findViewById<EditText>(ProjectUiIds.PARKING_LOCATION).text.toString())
                 assertEquals(
                     "Open notebook",
@@ -580,6 +586,11 @@ class MainActivityPresentationTest {
                 assertEquals(
                     "Bring cable",
                     activity.findViewById<EditText>(ProjectUiIds.PARKING_MUST_NOT_FORGET).text.toString(),
+                )
+                activity.findViewById<Button>(ProjectUiIds.BACK).performClick()
+                assertEquals(
+                    "Draft after recreation",
+                    activity.findViewById<EditText>(ProjectUiIds.NOTES).text.toString(),
                 )
             }
         }
@@ -663,7 +674,7 @@ class MainActivityPresentationTest {
             if (condition()) return
             Thread.sleep(50)
         }
-        error("Timed out waiting for UI state")
+        error("Timed out waiting for UI state: ${presentationController.state}")
     }
 
     private fun Activity.screenTag() = findViewById<ViewGroup>(android.R.id.content)

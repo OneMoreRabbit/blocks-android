@@ -76,6 +76,14 @@ class ProjectSyncRepositoryTest {
             ParkingDraft("Workbench", "Fit bracket", "Bring screws"),
             operationId = "append-parking-key",
         )
+        first.updateProjectDrafts(SESSION_A) {
+            it.copy(
+                projectNotes = mapOf(provisionalId to "Newer notes draft"),
+                projectParking = mapOf(
+                    provisionalId to ParkingDraft("Packing bench", "Label parts", "Keep the receipt"),
+                ),
+            )
+        }
 
         assertTrue(service.calls.isEmpty())
         val local = first.snapshot(SESSION_A)
@@ -118,12 +126,12 @@ class ProjectSyncRepositoryTest {
             it.targetId == PROJECT_ID && (it.projectId == null || it.projectId == PROJECT_ID)
         })
         assertEquals(PROJECT_ID, identityRewrite.projectCache.blocks.single().boundProjectId)
-        assertEquals("Offline notes", identityRewrite.projectDrafts.projectNotes[PROJECT_ID])
-        assertEquals("Workbench", identityRewrite.projectDrafts.projectParking[PROJECT_ID]?.location)
+        assertEquals("Newer notes draft", identityRewrite.projectDrafts.projectNotes[PROJECT_ID])
+        assertEquals("Packing bench", identityRewrite.projectDrafts.projectParking[PROJECT_ID]?.location)
         assertTrue(provisionalId !in identityRewrite.projectDrafts.projectNotes)
         assertTrue(provisionalId !in identityRewrite.projectDrafts.projectParking)
-        assertTrue(restarted.projectDrafts(SESSION_A).projectNotes.isEmpty())
-        assertTrue(restarted.projectDrafts(SESSION_A).projectParking.isEmpty())
+        assertEquals("Newer notes draft", restarted.projectDrafts(SESSION_A).projectNotes[PROJECT_ID])
+        assertEquals("Packing bench", restarted.projectDrafts(SESSION_A).projectParking[PROJECT_ID]?.location)
         assertTrue(
             listOf("create-project-key", "save-notes-key", "append-parking-key")
                 .all { it in converged.cache.retiredOperationIds },
@@ -327,7 +335,7 @@ class ProjectSyncRepositoryTest {
         assertEquals("project-park-key", state.loadSyncState(TENANT_A).projectCache.commands.single().idempotencyKey)
         assertFalse(state.loadSyncState(TENANT_A).projectCache.commands.single().deliveryUncertain)
         assertTrue(service.parkingKeys.isEmpty())
-        assertEquals("Here", first.projectDrafts(SESSION_A).projectParking[PROJECT_ID]?.location)
+        assertTrue(first.projectDrafts(SESSION_A).projectParking.isEmpty())
 
         first.backgroundSync(SESSION_A)
         assertFalse(state.loadSyncState(TENANT_A).projectCache.commands.single().deliveryUncertain)
@@ -495,7 +503,7 @@ class ProjectSyncRepositoryTest {
         assertEquals(ProjectMutationStatus.REQUIRES_RECONCILIATION, command.status)
         assertEquals("Local unsent notes", command.notesBody)
         assertEquals(3, command.ifMatch)
-        assertEquals("Local unsent notes", repository.projectDrafts(SESSION_A).projectNotes[PROJECT_ID])
+        assertTrue(repository.projectDrafts(SESSION_A).projectNotes.isEmpty())
         assertEquals("Local unsent notes", result.cache.pages.single().notes.body)
         assertEquals("Local unsent notes", result.conflict?.localNotes)
         assertEquals(4, result.conflict?.authoritativePage?.notes?.rowVersion)
@@ -674,7 +682,7 @@ class ProjectSyncRepositoryTest {
     }
 
     @Test
-    fun acknowledgingAnOlderNotesWriteDoesNotDiscardTheNewerDraft() {
+    fun remoteAcknowledgementsDoNotDiscardANewerUnsavedDraft() {
         val drafts = MemoryDrafts()
         val state = MemoryState()
         state.saveSyncState(TENANT_A, loadedState())
@@ -684,20 +692,23 @@ class ProjectSyncRepositoryTest {
 
         repository.queueSaveNotes(SESSION_A, PROJECT_ID, 3, "First edit", "notes-one")
         repository.queueSaveNotes(SESSION_A, PROJECT_ID, 4, "Second edit", "notes-two")
+        repository.updateProjectDrafts(SESSION_A) {
+            it.copy(projectNotes = mapOf(PROJECT_ID to "Third unsaved edit"))
+        }
         service.offline = false
         service.notesFailureAfterSuccessfulSaves = 1
 
         val partiallySynced = repository.backgroundSync(SESSION_A)
 
         assertEquals(listOf("First edit"), service.savedNotesBodies)
-        assertEquals("Second edit", repository.projectDrafts(SESSION_A).projectNotes[PROJECT_ID])
+        assertEquals("Third unsaved edit", repository.projectDrafts(SESSION_A).projectNotes[PROJECT_ID])
         assertEquals(listOf("notes-two"), partiallySynced.cache.commands.map { it.operationId })
 
         service.notesFailureAfterSuccessfulSaves = null
         val complete = repository.backgroundSync(SESSION_A)
 
         assertEquals(listOf("First edit", "Second edit"), service.savedNotesBodies)
-        assertTrue(repository.projectDrafts(SESSION_A).projectNotes.isEmpty())
+        assertEquals("Third unsaved edit", repository.projectDrafts(SESSION_A).projectNotes[PROJECT_ID])
         assertTrue(complete.cache.commands.isEmpty())
     }
 
@@ -723,7 +734,7 @@ class ProjectSyncRepositoryTest {
         val deferred = repository.snapshot(SESSION_A)
         assertEquals(listOf("auth-refresh-key"), deferred.cache.commands.map { it.operationId })
         assertFalse(deferred.reconciliationRequired)
-        assertEquals("Keep until sign-in refresh", repository.projectDrafts(SESSION_A).projectNotes[PROJECT_ID])
+        assertTrue(repository.projectDrafts(SESSION_A).projectNotes.isEmpty())
 
         service.authenticationRequired = false
         val completed = repository.backgroundSync(SESSION_A.copy(identityToken = "fresh-token"))

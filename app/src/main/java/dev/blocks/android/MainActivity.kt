@@ -484,19 +484,17 @@ class MainActivity : ComponentActivity() {
             .setPositiveButton("Rename", null)
             .setNegativeButton("Cancel", null)
             .create()
-        dialog.setOnShowListener {
-            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                val value = input.text.toString()
-                if (value.isBlank() || value.length > 200) {
-                    input.error = if (value.isBlank()) "Required" else "Maximum 200 characters"
-                    input.requestFocus()
-                    return@setOnClickListener
-                }
-                dialog.dismiss()
-                runRepositoryAction(syncAfter = true) { controller.renameProject(value) }
-            }
-        }
         showManagedDialog(dialog)
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+            val value = input.text.toString()
+            if (value.isBlank() || value.length > 200) {
+                input.error = if (value.isBlank()) "Required" else "Maximum 200 characters"
+                input.requestFocus()
+                return@setOnClickListener
+            }
+            dialog.dismiss()
+            runRepositoryAction(syncAfter = true) { controller.renameProject(value) }
+        }
     }
 
     private fun confirmArchive() {
