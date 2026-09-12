@@ -30,6 +30,14 @@ import dev.blocks.android.project.ProjectSummary
 import dev.blocks.android.project.ProjectUiPreferences
 import dev.blocks.android.project.ProjectWorkspace
 import dev.blocks.android.project.newOperationIdentity
+import dev.blocks.android.tag.LocalBlockOperation
+import dev.blocks.android.tag.LocalBlockOperationType
+import dev.blocks.android.tag.LocalBlockRecord
+import dev.blocks.android.tag.LocalBlockState
+import dev.blocks.android.tag.LocalTagResolution
+import dev.blocks.android.tag.OpaqueTagToken
+import dev.blocks.android.tag.TagActivationMedium
+import dev.blocks.android.tag.TagProgrammingFailure
 import java.io.IOException
 import java.math.BigInteger
 import java.time.Instant
@@ -125,6 +133,288 @@ class ProjectSyncRepository(
         val records = state.projectCache.parkingRecords.newestFirstFor(resolvedId)
         val visible = records.drop(offset).take(limit)
         return ParkingHistoryPage(visible, offset + visible.size < records.size)
+    }
+
+    @Synchronized
+    override fun localBlocks(session: Session): List<LocalBlockRecord> = activeState(session).projectCache.localBlocks
+
+    @Synchronized
+    override fun beginTagProgramming(
+        session: Session,
+        projectId: String,
+        label: String,
+        clientBlockId: String,
+        token: OpaqueTagToken,
+        registrationOperationId: String,
+        bindingOperationId: String,
+    ): LocalBlockRecord {
+        require(label.isNotBlank()) { "Enter a block label" }
+        require(label.length <= MAX_BLOCK_LABEL) { "Block labels can contain at most 200 characters" }
+        val state = activeState(session)
+        val resolvedProjectId = state.projectCache.resolveProjectId(projectId)
+        require(state.projectCache.pages.any { it.project.id == resolvedProjectId }) {
+            "The selected project is not available in saved local data"
+        }
+        require(state.projectCache.localBlocks.none { it.clientBlockId == clientBlockId }) {
+            "The local block identity already exists"
+        }
+        require(state.projectCache.localBlocks.none { it.token == token }) {
+            "The local tag token already exists"
+        }
+        val block = LocalBlockRecord(
+            clientBlockId = clientBlockId,
+            token = token,
+            label = label,
+            state = LocalBlockState.AWAITING_WRITE,
+            intendedProjectId = resolvedProjectId,
+            registrationOperationId = registrationOperationId,
+            initialBindingOperationId = bindingOperationId,
+            createdAt = now(),
+        )
+        save(
+            session,
+            state.copy(
+                projectCache = state.projectCache.copy(localBlocks = state.projectCache.localBlocks + block),
+            ),
+        )
+        return block
+    }
+
+    @Synchronized
+    override fun markTagWriteAttempt(session: Session, clientBlockId: String): LocalBlockRecord =
+        updateLocalBlock(session, clientBlockId) { block ->
+            require(block.state in PENDING_TAG_STATES) { "This local block is not awaiting programming" }
+            block.copy(state = LocalBlockState.WRITE_UNCERTAIN, failure = TagProgrammingFailure.IO_UNCERTAIN)
+        }
+
+    @Synchronized
+    override fun recordTagProgrammingFailure(
+        session: Session,
+        clientBlockId: String,
+        failure: TagProgrammingFailure,
+    ): LocalBlockRecord = updateLocalBlock(session, clientBlockId) { block ->
+        require(block.state in PENDING_TAG_STATES) { "This local block is not awaiting programming" }
+        block.copy(
+            state = if (failure in UNCERTAIN_TAG_FAILURES) {
+                LocalBlockState.WRITE_UNCERTAIN
+            } else {
+                LocalBlockState.AWAITING_WRITE
+            },
+            failure = failure,
+        )
+    }
+
+    @Synchronized
+    override fun discardPendingTagProgramming(
+        session: Session,
+        clientBlockId: String,
+    ): BackgroundSyncResult {
+        val state = activeState(session)
+        val block = state.projectCache.localBlocks.firstOrNull { it.clientBlockId == clientBlockId }
+            ?: return state.toResult()
+        require(block.state in PENDING_TAG_STATES) { "Only pending tag programming can be discarded" }
+        require(state.projectCache.localBlockOperations.none { it.clientBlockId == clientBlockId }) {
+            "A local block with synchronization intent cannot be discarded"
+        }
+        val updated = state.copy(
+            projectCache = state.projectCache.copy(
+                localBlocks = state.projectCache.localBlocks.filterNot { it.clientBlockId == clientBlockId },
+            ),
+        )
+        save(session, updated)
+        return updated.toResult()
+    }
+
+    @Synchronized
+    override fun authorizeTagReplacement(
+        session: Session,
+        clientBlockId: String,
+        existingToken: OpaqueTagToken,
+    ): LocalBlockRecord = updateLocalBlock(session, clientBlockId) { block ->
+        require(block.state in PENDING_TAG_STATES) { "This local block is not awaiting programming" }
+        block.copy(replacementTokenFingerprint = existingToken.fingerprint(), failure = null)
+    }
+
+    @Synchronized
+    override fun completeTagProgramming(
+        session: Session,
+        clientBlockId: String,
+        verifiedToken: OpaqueTagToken,
+        medium: TagActivationMedium,
+    ): BackgroundSyncResult {
+        val state = activeState(session)
+        val block = state.projectCache.localBlocks.firstOrNull { it.clientBlockId == clientBlockId }
+            ?: throw IllegalArgumentException("The pending local block does not exist")
+        require(block.token == verifiedToken) { "The verified tag does not match the pending local block" }
+        if (block.state == LocalBlockState.ACTIVE) return state.toResult()
+        require(block.state in PENDING_TAG_STATES) { "This local block is not awaiting programming" }
+        val projectId = requireNotNull(block.intendedProjectId) { "The pending block has no intended project" }
+        val registrationId = requireNotNull(block.registrationOperationId) {
+            "The pending block has no registration identity"
+        }
+        val bindingId = requireNotNull(block.initialBindingOperationId) {
+            "The pending block has no binding identity"
+        }
+        val registration = LocalBlockOperation(
+            operationId = registrationId,
+            type = LocalBlockOperationType.REGISTER_BLOCK,
+            clientBlockId = clientBlockId,
+            token = block.token,
+            label = block.label,
+            createdAt = block.createdAt,
+        )
+        val binding = LocalBlockOperation(
+            operationId = bindingId,
+            type = LocalBlockOperationType.BIND_BLOCK,
+            clientBlockId = clientBlockId,
+            projectId = projectId,
+            dependsOnOperationId = registrationId,
+            createdAt = now(),
+        )
+        val active = block.copy(
+            state = LocalBlockState.ACTIVE,
+            boundProjectId = projectId,
+            verifiedAt = now(),
+            activationMedium = medium,
+            replacementTokenFingerprint = null,
+            failure = null,
+        )
+        val operations = (state.projectCache.localBlockOperations + registration + binding)
+            .distinctBy { it.operationId }
+        val updated = state.copy(
+            projectCache = state.projectCache.copy(
+                localBlocks = state.projectCache.localBlocks.replaceBlock(active),
+                localBlockOperations = operations,
+            ),
+        )
+        save(session, updated)
+        return updated.toResult()
+    }
+
+    @Synchronized
+    override fun resolveTagLocally(session: Session, token: OpaqueTagToken): LocalTagResolution {
+        val block = activeState(session).projectCache.localBlocks.firstOrNull { it.token == token }
+            ?: return LocalTagResolution.Unknown(token)
+        return block.toResolution()
+    }
+
+    override fun resolveTagThroughService(session: Session, token: OpaqueTagToken): LocalTagResolution {
+        synchronized(this) {
+            val local = resolveTagLocally(session, token)
+            if (local !is LocalTagResolution.Unknown) return local
+            require(session.identityToken.isNotBlank()) { "Reconnect before looking up an unknown tag" }
+        }
+        val (lookup, page) = try {
+            val found = service.lookupBlock(session, token.encoded)
+            found to found.projectId?.let { service.projectPage(session, it) }
+        } catch (error: Exception) {
+            error.handleMembershipRevocation(session)
+            throw error
+        }
+        return synchronized(this) {
+            val current = activeState(session)
+            current.projectCache.localBlocks.firstOrNull { it.token == token }?.toResolution() ?: run {
+                val imported = LocalBlockRecord(
+                    clientBlockId = newOperationIdentity(),
+                    token = token,
+                    label = lookup.label,
+                    state = if (lookup.projectId == null) LocalBlockState.UNBOUND else LocalBlockState.ACTIVE,
+                    intendedProjectId = lookup.projectId,
+                    boundProjectId = lookup.projectId,
+                    createdAt = now(),
+                    verifiedAt = now(),
+                    serverBlockId = lookup.blockId,
+                )
+                var updated = current.copy(
+                    projectCache = current.projectCache.copy(
+                        localBlocks = current.projectCache.localBlocks + imported,
+                    ),
+                )
+                page?.let { updated = updated.withPage(it) }
+                save(session, updated)
+                imported.toResolution()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun assignLocalBlock(
+        session: Session,
+        clientBlockId: String,
+        projectId: String,
+        operationId: String,
+    ): BackgroundSyncResult {
+        val state = activeState(session)
+        val resolvedProjectId = state.projectCache.resolveProjectId(projectId)
+        require(state.projectCache.pages.any { it.project.id == resolvedProjectId }) {
+            "The selected project is not available in saved local data"
+        }
+        val block = state.projectCache.localBlocks.firstOrNull { it.clientBlockId == clientBlockId }
+            ?: throw IllegalArgumentException("The local block does not exist")
+        require(block.state in setOf(LocalBlockState.ACTIVE, LocalBlockState.UNBOUND)) {
+            "The local block has not been programmed"
+        }
+        if (block.boundProjectId == resolvedProjectId && block.state == LocalBlockState.ACTIVE) return state.toResult()
+        val dependency = state.projectCache.localBlockOperations.lastOrNull {
+            it.clientBlockId == clientBlockId
+        }?.operationId
+        val operation = LocalBlockOperation(
+            operationId = operationId,
+            type = LocalBlockOperationType.BIND_BLOCK,
+            clientBlockId = clientBlockId,
+            projectId = resolvedProjectId,
+            dependsOnOperationId = dependency,
+            createdAt = now(),
+        )
+        val updated = state.copy(
+            projectCache = state.projectCache.copy(
+                localBlocks = state.projectCache.localBlocks.replaceBlock(
+                    block.copy(
+                        state = LocalBlockState.ACTIVE,
+                        intendedProjectId = resolvedProjectId,
+                        boundProjectId = resolvedProjectId,
+                        failure = null,
+                    ),
+                ),
+                localBlockOperations = state.projectCache.localBlockOperations + operation,
+            ),
+        )
+        save(session, updated)
+        return updated.toResult()
+    }
+
+    @Synchronized
+    override fun unbindLocalBlock(
+        session: Session,
+        clientBlockId: String,
+        operationId: String,
+    ): BackgroundSyncResult {
+        val state = activeState(session)
+        val block = state.projectCache.localBlocks.firstOrNull { it.clientBlockId == clientBlockId }
+            ?: throw IllegalArgumentException("The local block does not exist")
+        require(block.state == LocalBlockState.ACTIVE && block.boundProjectId != null) {
+            "The local block is not assigned"
+        }
+        val dependency = state.projectCache.localBlockOperations.lastOrNull {
+            it.clientBlockId == clientBlockId
+        }?.operationId
+        val operation = LocalBlockOperation(
+            operationId = operationId,
+            type = LocalBlockOperationType.UNBIND_BLOCK,
+            clientBlockId = clientBlockId,
+            dependsOnOperationId = dependency,
+            createdAt = now(),
+        )
+        val updated = state.copy(
+            projectCache = state.projectCache.copy(
+                localBlocks = state.projectCache.localBlocks.replaceBlock(
+                    block.copy(state = LocalBlockState.UNBOUND, intendedProjectId = null, boundProjectId = null),
+                ),
+                localBlockOperations = state.projectCache.localBlockOperations + operation,
+            ),
+        )
+        save(session, updated)
+        return updated.toResult()
     }
 
     @Synchronized
@@ -380,7 +670,7 @@ class ProjectSyncRepository(
         return updated.toResult()
     }
 
-    // Registration remains direct-only until the NFC token-write state machine exists.
+    // API 0.4 registration remains direct-only and is not used by the local-first tag operation queue.
     @Synchronized
     fun queueBindBlock(
         session: Session,
@@ -867,6 +1157,12 @@ class ProjectSyncRepository(
                 blocks = projectCache.blocks.map {
                     if (it.boundProjectId == provisionalId) it.copy(boundProjectId = serverId) else it
                 },
+                localBlocks = projectCache.localBlocks.map {
+                    it.remapProject(provisionalId, serverId)
+                },
+                localBlockOperations = projectCache.localBlockOperations.map {
+                    it.remapProject(provisionalId, serverId)
+                },
             ),
             projectDrafts = mappedDrafts,
         ).withProjectedLists()
@@ -1233,6 +1529,7 @@ class ProjectSyncRepository(
                     authoritativePage = command.authoritativePage,
                 )
             },
+            pendingBlockOperations = projectCache.localBlockOperations.size,
         )
     }
 
@@ -1300,6 +1597,26 @@ class ProjectSyncRepository(
             },
             projectCache = proposed.projectCache.copy(
                 commands = commands,
+                localBlocks = if (current.projectCache.localBlocks != baseline.projectCache.localBlocks) {
+                    current.projectCache.localBlocks.map { local ->
+                        mappings.fold(local) { mapped, identity ->
+                            mapped.remapProject(identity.provisionalId, identity.serverId)
+                        }
+                    }
+                } else {
+                    proposed.projectCache.localBlocks
+                },
+                localBlockOperations = if (
+                    current.projectCache.localBlockOperations != baseline.projectCache.localBlockOperations
+                ) {
+                    current.projectCache.localBlockOperations.map { local ->
+                        mappings.fold(local) { mapped, identity ->
+                            mapped.remapProject(identity.provisionalId, identity.serverId)
+                        }
+                    }
+                } else {
+                    proposed.projectCache.localBlockOperations
+                },
                 retiredOperationIds = (
                     proposed.projectCache.retiredOperationIds +
                         (current.projectCache.retiredOperationIds - baseline.projectCache.retiredOperationIds.toSet())
@@ -1351,6 +1668,35 @@ class ProjectSyncRepository(
         },
     )
 
+    private fun LocalBlockRecord.remapProject(provisionalId: String, serverId: String) = copy(
+        intendedProjectId = if (intendedProjectId == provisionalId) serverId else intendedProjectId,
+        boundProjectId = if (boundProjectId == provisionalId) serverId else boundProjectId,
+    )
+
+    private fun LocalBlockOperation.remapProject(provisionalId: String, serverId: String) = copy(
+        projectId = if (projectId == provisionalId) serverId else projectId,
+    )
+
+    private fun updateLocalBlock(
+        session: Session,
+        clientBlockId: String,
+        update: (LocalBlockRecord) -> LocalBlockRecord,
+    ): LocalBlockRecord {
+        val state = activeState(session)
+        val block = state.projectCache.localBlocks.firstOrNull { it.clientBlockId == clientBlockId }
+            ?: throw IllegalArgumentException("The local block does not exist")
+        val updatedBlock = update(block)
+        save(
+            session,
+            state.copy(
+                projectCache = state.projectCache.copy(
+                    localBlocks = state.projectCache.localBlocks.replaceBlock(updatedBlock),
+                ),
+            ),
+        )
+        return updatedBlock
+    }
+
     private fun purge(tenantId: String) {
         val syncFailure = runCatching { syncStore.clearSyncState(tenantId) }.exceptionOrNull()
         val draftFailure = runCatching { legacyDraftStore.clear(tenantId) }.exceptionOrNull()
@@ -1377,6 +1723,18 @@ class ProjectSyncRepository(
             command.type in setOf(ProjectMutationType.CREATE_PROJECT, ProjectMutationType.ADD_PARKING)
 
     private fun <T> List<T>.upsert(value: T, id: (T) -> String): List<T> = filterNot { id(it) == id(value) } + value
+
+    private fun List<LocalBlockRecord>.replaceBlock(value: LocalBlockRecord): List<LocalBlockRecord> =
+        map { if (it.clientBlockId == value.clientBlockId) value else it }
+
+    private fun ProjectCacheState.resolveProjectId(projectId: String): String =
+        projectIdMappings.firstOrNull { it.provisionalId == projectId }?.serverId ?: projectId
+
+    private fun LocalBlockRecord.toResolution(): LocalTagResolution = when {
+        state in PENDING_TAG_STATES -> LocalTagResolution.PendingProgramming(this)
+        state == LocalBlockState.UNBOUND || boundProjectId == null -> LocalTagResolution.Unbound(this)
+        else -> LocalTagResolution.Bound(this, requireNotNull(boundProjectId))
+    }
 
     private fun List<ProjectParking>.upsertParking(value: ProjectParking): List<ProjectParking> =
         filterNot { existing ->
@@ -1409,6 +1767,12 @@ class ProjectSyncRepository(
 
     private companion object {
         const val CHANGE_PAGE_SIZE = 100
+        const val MAX_BLOCK_LABEL = 200
+        val PENDING_TAG_STATES = setOf(LocalBlockState.AWAITING_WRITE, LocalBlockState.WRITE_UNCERTAIN)
+        val UNCERTAIN_TAG_FAILURES = setOf(
+            TagProgrammingFailure.IO_UNCERTAIN,
+            TagProgrammingFailure.VERIFICATION_MISMATCH,
+        )
         val VERSIONED_TYPES = setOf(
             ProjectMutationType.RENAME_PROJECT,
             ProjectMutationType.ARCHIVE_PROJECT,

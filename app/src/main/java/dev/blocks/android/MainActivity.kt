@@ -1,9 +1,11 @@
 package dev.blocks.android
 
 import android.app.AlertDialog
+import android.content.Intent
 import android.graphics.Color
 import android.net.ConnectivityManager
 import android.net.Network
+import android.nfc.NfcAdapter
 import android.os.Bundle
 import android.text.Editable
 import android.text.InputType
@@ -14,6 +16,7 @@ import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
 import android.widget.GridLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -47,6 +50,22 @@ import dev.blocks.android.state.SessionContinuity
 import dev.blocks.android.state.SessionContinuityStore
 import dev.blocks.android.sync.LegacyOperationReplayer
 import dev.blocks.android.sync.ProjectSyncRepository
+import dev.blocks.android.tag.AndroidNfcTagPlatform
+import dev.blocks.android.tag.LocalBlockRecord
+import dev.blocks.android.tag.LocalBlockState
+import dev.blocks.android.tag.LocalTagResolution
+import dev.blocks.android.tag.NdefLocatorCodec
+import dev.blocks.android.tag.NfcProgrammingResult
+import dev.blocks.android.tag.NfcTagHandle
+import dev.blocks.android.tag.NfcTagPlatform
+import dev.blocks.android.tag.OpaqueTagToken
+import dev.blocks.android.tag.TagActivationMedium
+import dev.blocks.android.tag.TagLocator
+import dev.blocks.android.tag.TagProgrammingFailure
+import com.google.zxing.BarcodeFormat
+import com.journeyapps.barcodescanner.BarcodeEncoder
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import java.net.URI
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -67,6 +86,7 @@ internal data class ProjectAppDependencies(
     val continuity: SessionContinuity,
     val acceptedTenantStore: AcceptedTenantContinuityStore,
     val observeConnectivity: Boolean = true,
+    val nfcTagPlatform: NfcTagPlatform? = null,
 )
 
 internal object ProjectUiIds {
@@ -99,6 +119,10 @@ internal object ProjectUiIds {
     const val DASHBOARD_BODY = 1041
     const val PARKING_HISTORY = 1042
     const val LOAD_OLDER_PARKING = 1043
+    const val TAGS = 1050
+    const val SET_TAG = 1051
+    const val SCAN_QR = 1052
+    const val TAG_QR = 1053
 }
 
 class MainActivity : ComponentActivity() {
@@ -107,6 +131,7 @@ class MainActivity : ComponentActivity() {
     private val identity get() = dependencies.identity
     private val continuity get() = dependencies.continuity
     private val acceptedTenantStore get() = dependencies.acceptedTenantStore
+    private val nfcTagPlatform by lazy { dependencies.nfcTagPlatform ?: AndroidNfcTagPlatform(this) }
     private val uiScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val localStateDispatcher = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "blocks-local-state")
@@ -116,12 +141,18 @@ class MainActivity : ComponentActivity() {
     private var syncJob: Job? = null
     private var credentialJob: Job? = null
     private var restoreProjectId: String? = null
+    private var pendingTagLocator: TagLocator? = null
+    private var activeProgrammingBlockId: String? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     internal var activeDialog: AlertDialog? = null
         private set
+    private val qrScanner = registerForActivityResult(ScanContract()) { result ->
+        result.contents?.let(::handleQrText)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        pendingTagLocator = consumeNdefIntent(intent)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         restoreProjectId = savedInstanceState?.getString(STATE_PROJECT_ID)
         content = LinearLayout(this).apply {
@@ -176,7 +207,21 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        activeProgrammingBlockId?.let { startNfcReader(it) }
         if (controller.canSynchronize) synchronizeAutomatically()
+    }
+
+    override fun onPause() {
+        nfcTagPlatform.stopReader()
+        super.onPause()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        consumeNdefIntent(intent)?.let {
+            pendingTagLocator = it
+            resolvePendingTagLocator()
+        }
     }
 
     override fun onStop() {
@@ -207,6 +252,7 @@ class MainActivity : ComponentActivity() {
             identity = GoogleIdentityClient(BuildConfig.BLOCKS_GOOGLE_SERVER_CLIENT_ID),
             continuity = SessionContinuityStore(this),
             acceptedTenantStore = AndroidEncryptedAcceptedTenantContinuityStore(this),
+            nfcTagPlatform = AndroidNfcTagPlatform(this),
         )
     }
 
@@ -359,6 +405,7 @@ class MainActivity : ComponentActivity() {
         val viewChoice = if (controller.state.dashboardView == DashboardView.LIST) "Tile view" else "List view"
         val items = buildList {
             add("Archive")
+            add("Scan QR")
             add(viewChoice)
             add("About")
             if (controller.state.authenticationRequired || controller.state.sessionConfirmationRequired) {
@@ -372,6 +419,7 @@ class MainActivity : ComponentActivity() {
             .setItems(items.toTypedArray()) { _, which ->
                 when (items[which]) {
                     "Archive" -> openArchiveMode()
+                    "Scan QR" -> launchQrScanner()
                     viewChoice -> runRepositoryAction { controller.toggleDashboardView() }
                     "About" -> showAbout()
                     "Reconnect Google account" -> reauthenticate()
@@ -571,11 +619,434 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun showProjectSettings() {
+        val items = arrayOf("Set tag", "Manage tags", "Scan QR", "Rename", "Archive")
         val dialog = AlertDialog.Builder(this).setTitle("Project settings")
-            .setItems(arrayOf("Rename", "Archive")) { _, which ->
-                if (which == 0) showRename() else confirmArchive()
+            .setItems(items) { _, which ->
+                when (items[which]) {
+                    "Set tag" -> showSetTag()
+                    "Manage tags" -> showTagManagement()
+                    "Scan QR" -> launchQrScanner()
+                    "Rename" -> showRename()
+                    "Archive" -> confirmArchive()
+                }
             }.setNegativeButton("Cancel", null).create()
         showManagedDialog(dialog)
+    }
+
+    private fun showSetTag() {
+        val projectId = requireNotNull(controller.state.projectPage).project.id
+        controller.state.localBlocks.firstOrNull {
+            it.intendedProjectId == projectId &&
+                it.state in setOf(LocalBlockState.AWAITING_WRITE, LocalBlockState.WRITE_UNCERTAIN)
+        }?.let { pending ->
+            showManagedDialog(
+                AlertDialog.Builder(this)
+                    .setTitle("Resume unfinished tag")
+                    .setMessage(
+                        "Finish or resume ${pending.label} with its saved locator before creating another tag.",
+                    )
+                    .setPositiveButton("Resume") { _, _ -> showTagProgramming(pending) }
+                    .setNegativeButton("Cancel", null)
+                    .create(),
+            )
+            return
+        }
+        val input = EditText(this).apply {
+            hint = "Block label"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Set tag")
+            .setMessage("Name this physical block, then tap a writable NFC tag or use the QR fallback.")
+            .setView(input)
+            .setPositiveButton("Continue", null)
+            .setNegativeButton("Cancel", null)
+            .create()
+        showManagedDialog(dialog)
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener { source ->
+            val label = input.text.toString().trim()
+            if (label.isBlank() || label.length > 200) {
+                input.error = if (label.isBlank()) "Required" else "Maximum 200 characters"
+                input.requestFocus()
+                return@setOnClickListener
+            }
+            source.isEnabled = false
+            dialog.dismiss()
+            var created: LocalBlockRecord? = null
+            runRepositoryAction(
+                syncAfter = false,
+                complete = { created?.let(::showTagProgramming) },
+            ) {
+                created = controller.beginTagProgramming(label)
+            }
+        }
+    }
+
+    private fun showTagManagement() {
+        val projectId = requireNotNull(controller.state.projectPage).project.id
+        val blocks = controller.state.localBlocks.filter {
+            it.boundProjectId == projectId || it.intendedProjectId == projectId
+        }
+        val actions = buildList<Pair<String, () -> Unit>> {
+            add("Set tag" to ::showSetTag)
+            add("Scan QR" to ::launchQrScanner)
+            blocks.forEach { block ->
+                if (block.state in setOf(LocalBlockState.AWAITING_WRITE, LocalBlockState.WRITE_UNCERTAIN)) {
+                    add("Resume NFC — ${block.label}" to { showTagProgramming(block) })
+                    add("Use QR — ${block.label}" to { completeWithQr(block) })
+                } else {
+                    add("Show QR — ${block.label}" to { showQr(block) })
+                    if (block.boundProjectId == projectId) {
+                        add("Unbind — ${block.label}" to { confirmUnbind(block) })
+                    }
+                }
+            }
+        }
+        showManagedDialog(
+            AlertDialog.Builder(this)
+                .setTitle("Tags")
+                .setMessage(if (blocks.isEmpty()) "No tags are associated with this project yet." else null)
+                .setItems(actions.map { it.first }.toTypedArray()) { _, which -> actions[which].second() }
+                .setNegativeButton("Done", null)
+                .create(),
+        )
+    }
+
+    private fun showTagProgramming(block: LocalBlockRecord) {
+        activeProgrammingBlockId = block.clientBlockId
+        val message = when {
+            !nfcTagPlatform.isAvailable -> "This device has no NFC hardware. Use the QR fallback."
+            !nfcTagPlatform.isEnabled -> "NFC is turned off. Turn it on or use the QR fallback."
+            block.state == LocalBlockState.WRITE_UNCERTAIN -> {
+                "The previous write was not confirmed. Tap the same tag to verify and resume safely."
+            }
+            else -> "Hold a writable NDEF tag to this device. Blocks verifies the exact record before assigning it."
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Set tag — ${block.label}")
+            .setMessage(message)
+            .setPositiveButton("Use QR instead", null)
+            .setNegativeButton("Close", null)
+            .create()
+        dialog.setOnDismissListener {
+            nfcTagPlatform.stopReader()
+            if (activeProgrammingBlockId == block.clientBlockId) activeProgrammingBlockId = null
+            if (activeDialog === dialog) activeDialog = null
+        }
+        activeDialog = dialog
+        dialog.show()
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+            dialog.dismiss()
+            completeWithQr(block)
+        }
+        startNfcReader(block.clientBlockId)
+    }
+
+    private fun startNfcReader(clientBlockId: String) {
+        if (activeProgrammingBlockId != clientBlockId || !nfcTagPlatform.isEnabled) return
+        nfcTagPlatform.startReader { handle -> handleProgrammingTag(clientBlockId, handle) }
+    }
+
+    private fun handleProgrammingTag(clientBlockId: String, handle: NfcTagHandle) {
+        nfcTagPlatform.stopReader()
+        uiScope.launch {
+            val block = try {
+                withContext(NonCancellable + localStateDispatcher) {
+                    controller.markTagWriteAttempt(clientBlockId)
+                }
+            } catch (error: Exception) {
+                handleRepositoryError(error)
+                render()
+                return@launch
+            }
+            val locator = TagLocator.create(block.token)
+            val outcome = withContext(Dispatchers.IO) {
+                nfcTagPlatform.programAndVerify(handle, locator, block.replacementTokenFingerprint)
+            }
+            when (outcome) {
+                NfcProgrammingResult.Verified -> {
+                    withContext(NonCancellable + localStateDispatcher) {
+                        controller.completeTagProgramming(clientBlockId, block.token, TagActivationMedium.NFC)
+                    }
+                    activeDialog?.dismiss()
+                    render()
+                    showMessage("Tag ready", "The verified tag is assigned to this project.")
+                }
+                is NfcProgrammingResult.ExistingBlocksTag -> {
+                    withContext(NonCancellable + localStateDispatcher) {
+                        controller.recordTagProgrammingFailure(
+                            clientBlockId,
+                            TagProgrammingFailure.FOREIGN_CONTENT,
+                        )
+                    }
+                    activeDialog?.dismiss()
+                    handleExistingBlocksTag(block, outcome.locator)
+                }
+                else -> {
+                    val failure = outcome.toProgrammingFailure()
+                    withContext(NonCancellable + localStateDispatcher) {
+                        controller.recordTagProgrammingFailure(clientBlockId, failure)
+                    }
+                    activeDialog?.dismiss()
+                    render()
+                    showMessage("Tag not changed", failure.userMessage())
+                }
+            }
+        }
+    }
+
+    private fun handleExistingBlocksTag(pending: LocalBlockRecord, locator: TagLocator) {
+        uiScope.launch {
+            val local = withContext(localStateDispatcher) { controller.resolveTagLocally(locator.token) }
+            val resolution = if (local is LocalTagResolution.Unknown && controller.canSynchronize) {
+                runCatching { withContext(Dispatchers.IO) { controller.resolveTagThroughService(locator.token) } }
+                    .getOrElse { local }
+            } else {
+                local
+            }
+            when (resolution) {
+                is LocalTagResolution.Unknown -> confirmReplaceUnknownTag(pending, locator.token)
+                is LocalTagResolution.Bound -> confirmUseKnownTag(pending, resolution.block, resolution.projectId)
+                is LocalTagResolution.Unbound -> confirmUseKnownTag(pending, resolution.block, null)
+                is LocalTagResolution.PendingProgramming -> showMessage(
+                    "Tag not changed",
+                    "This is another pending Blocks tag. Resume that saved setup instead.",
+                )
+            }
+        }
+    }
+
+    private fun confirmReplaceUnknownTag(pending: LocalBlockRecord, existingToken: OpaqueTagToken) {
+        showManagedDialog(
+            AlertDialog.Builder(this)
+                .setTitle("Replace unknown Blocks tag?")
+                .setMessage(
+                    "This tag is not available in the current account's saved data. Replacement is destructive " +
+                        "and requires another tap of this same tag.",
+                )
+                .setPositiveButton("Replace on next tap") { _, _ ->
+                    var updated: LocalBlockRecord? = null
+                    runRepositoryAction(complete = { updated?.let(::showTagProgramming) }) {
+                        updated = controller.authorizeTagReplacement(pending.clientBlockId, existingToken)
+                    }
+                }
+                .setNegativeButton("Cancel", null)
+                .create(),
+        )
+    }
+
+    private fun confirmUseKnownTag(
+        pending: LocalBlockRecord,
+        existing: LocalBlockRecord,
+        previousProjectId: String?,
+    ) {
+        val targetProjectId = requireNotNull(controller.state.projectPage).project.id
+        val sameProject = previousProjectId == targetProjectId
+        val title = when {
+            sameProject -> "Tag already assigned"
+            previousProjectId == null -> "Assign known tag?"
+            else -> "Reassign known tag?"
+        }
+        val message = when {
+            sameProject -> "This known tag already opens the current project. It was not overwritten."
+            previousProjectId == null -> "Assign this known, unbound tag to the current project without rewriting it?"
+            else -> "Move this known tag to the current project without changing its payload?"
+        }
+        showManagedDialog(
+            AlertDialog.Builder(this)
+                .setTitle(title)
+                .setMessage(message)
+                .setPositiveButton(if (sameProject) "Use existing" else "Assign") { _, _ ->
+                    runRepositoryAction {
+                        controller.discardPendingTagProgramming(pending.clientBlockId)
+                        if (!sameProject) controller.assignLocalBlock(existing.clientBlockId, targetProjectId)
+                    }
+                }
+                .setNegativeButton("Cancel", null)
+                .create(),
+        )
+    }
+
+    private fun completeWithQr(block: LocalBlockRecord) {
+        runRepositoryAction(complete = {
+            controller.state.localBlocks.firstOrNull { it.clientBlockId == block.clientBlockId }?.let(::showQr)
+        }) {
+            controller.completeTagProgramming(block.clientBlockId, block.token, TagActivationMedium.QR)
+        }
+    }
+
+    private fun showQr(block: LocalBlockRecord) {
+        val size = dp(280).coerceAtLeast(1)
+        val image = ImageView(this).apply {
+            id = ProjectUiIds.TAG_QR
+            contentDescription = "QR code for ${block.label}"
+            adjustViewBounds = true
+            setImageBitmap(BarcodeEncoder().encodeBitmap(TagLocator.create(block.token).encoded, BarcodeFormat.QR_CODE, size, size))
+        }
+        showManagedDialog(
+            AlertDialog.Builder(this)
+                .setTitle(block.label)
+                .setMessage("This QR carries the same opaque Blocks locator as NFC.")
+                .setView(image)
+                .setPositiveButton("Done", null)
+                .create(),
+        )
+    }
+
+    private fun confirmUnbind(block: LocalBlockRecord) {
+        showManagedDialog(
+            AlertDialog.Builder(this)
+                .setTitle("Unbind ${block.label}?")
+                .setMessage("The tag remains valid but will no longer open a project until it is assigned again.")
+                .setPositiveButton("Unbind") { _, _ ->
+                    runRepositoryAction { controller.unbindLocalBlock(block.clientBlockId) }
+                }
+                .setNegativeButton("Cancel", null)
+                .create(),
+        )
+    }
+
+    private fun launchQrScanner() {
+        qrScanner.launch(
+            ScanOptions().apply {
+                setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                setPrompt("Scan a Blocks QR tag")
+                setBeepEnabled(false)
+                setOrientationLocked(false)
+            },
+        )
+    }
+
+    internal fun handleQrText(value: String) {
+        val locator = TagLocator.parse(value)
+        if (locator == null) {
+            showMessage("QR not recognized", "This is not a supported Blocks tag.")
+        } else {
+            pendingTagLocator = locator
+            resolvePendingTagLocator()
+        }
+    }
+
+    private fun consumeNdefIntent(source: Intent?): TagLocator? {
+        val locator = NdefLocatorCodec.fromIntent(source)
+        if (source?.action == NfcAdapter.ACTION_NDEF_DISCOVERED) {
+            setIntent(Intent(this, MainActivity::class.java))
+        }
+        return locator
+    }
+
+    private fun resolvePendingTagLocator() {
+        if (!controller.isAuthenticated) return
+        val locator = pendingTagLocator ?: return
+        pendingTagLocator = null
+        uiScope.launch {
+            val local = try {
+                withContext(localStateDispatcher) { controller.resolveTagLocally(locator.token) }
+            } catch (error: Exception) {
+                handleRepositoryError(error)
+                render()
+                return@launch
+            }
+            val resolution = if (local is LocalTagResolution.Unknown && controller.canSynchronize) {
+                runCatching { withContext(Dispatchers.IO) { controller.resolveTagThroughService(locator.token) } }
+                    .getOrElse { error ->
+                        handleRepositoryError(error as? Exception ?: IllegalStateException("Tag lookup failed"))
+                        local
+                    }
+            } else {
+                local
+            }
+            when (resolution) {
+                is LocalTagResolution.Bound -> {
+                    withContext(localStateDispatcher) { controller.openProject(resolution.projectId) }
+                    render()
+                }
+                is LocalTagResolution.Unbound -> {
+                    render()
+                    showAssignTag(resolution.block)
+                }
+                is LocalTagResolution.PendingProgramming -> {
+                    val projectId = resolution.block.intendedProjectId
+                    if (projectId != null) {
+                        runCatching { withContext(localStateDispatcher) { controller.openProject(projectId) } }
+                    }
+                    render()
+                    showTagProgramming(resolution.block)
+                }
+                is LocalTagResolution.Unknown -> {
+                    render()
+                    showManagedDialog(
+                        AlertDialog.Builder(this@MainActivity)
+                            .setTitle("Tag not available")
+                            .setMessage(
+                                "This tag is not available in the current account. The Dashboard remains usable offline.",
+                            )
+                            .setPositiveButton("Retry") { _, _ ->
+                                pendingTagLocator = TagLocator.create(resolution.token)
+                                resolvePendingTagLocator()
+                            }
+                            .setNegativeButton("Dashboard", null)
+                            .create(),
+                    )
+                }
+            }
+        }
+    }
+
+    private fun showAssignTag(block: LocalBlockRecord) {
+        val projects = (controller.state.activeProjects + controller.state.archivedProjects).distinctBy { it.id }
+        if (projects.isEmpty()) {
+            showMessage("Unassigned tag", "Create or reopen a project, then scan this tag again to assign it.")
+            return
+        }
+        showManagedDialog(
+            AlertDialog.Builder(this)
+                .setTitle("Assign ${block.label}")
+                .setItems(projects.map { it.name }.toTypedArray()) { _, which ->
+                    val project = projects[which]
+                    runRepositoryAction {
+                        controller.assignLocalBlock(block.clientBlockId, project.id)
+                        controller.openProject(project.id)
+                    }
+                }
+                .setNegativeButton("Cancel", null)
+                .create(),
+        )
+    }
+
+    private fun showMessage(title: String, message: String) {
+        showManagedDialog(
+            AlertDialog.Builder(this)
+                .setTitle(title)
+                .setMessage(message)
+                .setPositiveButton("Done", null)
+                .create(),
+        )
+    }
+
+    private fun NfcProgrammingResult.toProgrammingFailure() = when (this) {
+        NfcProgrammingResult.Unsupported -> TagProgrammingFailure.UNSUPPORTED
+        NfcProgrammingResult.ReadOnly -> TagProgrammingFailure.READ_ONLY
+        NfcProgrammingResult.TooSmall -> TagProgrammingFailure.TOO_SMALL
+        NfcProgrammingResult.ForeignContent,
+        is NfcProgrammingResult.ExistingBlocksTag,
+        -> TagProgrammingFailure.FOREIGN_CONTENT
+        NfcProgrammingResult.VerificationMismatch -> TagProgrammingFailure.VERIFICATION_MISMATCH
+        NfcProgrammingResult.WriteUncertain -> TagProgrammingFailure.IO_UNCERTAIN
+        NfcProgrammingResult.Verified -> error("A verified NFC write is not a failure")
+    }
+
+    private fun TagProgrammingFailure.userMessage() = when (this) {
+        TagProgrammingFailure.UNSUPPORTED -> "This tag does not support writable NDEF records."
+        TagProgrammingFailure.READ_ONLY -> "This tag is read-only."
+        TagProgrammingFailure.TOO_SMALL -> "This tag is too small for a Blocks locator."
+        TagProgrammingFailure.FOREIGN_CONTENT -> "The existing tag content was left unchanged."
+        TagProgrammingFailure.VERIFICATION_MISMATCH -> {
+            "The write could not be verified. Tap the same tag to resume with the saved token."
+        }
+        TagProgrammingFailure.IO_UNCERTAIN -> {
+            "The write result is uncertain. Tap the same tag to verify; no replacement token was created."
+        }
     }
 
     private fun showConflictResolution() {
@@ -723,6 +1194,7 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                     render()
+                    resolvePendingTagLocator()
                 }
             } catch (_: CancellationException) {
                 return@launch
@@ -759,6 +1231,7 @@ class MainActivity : ComponentActivity() {
         try {
             acceptServiceValidatedToken(token)
             render()
+            resolvePendingTagLocator()
             synchronizeAutomatically()
         } catch (error: AcceptedAccountBindingException) {
             failClosedAccountBinding()
@@ -957,6 +1430,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        nfcTagPlatform.stopReader()
         uiScope.cancel()
         localStateDispatcher.close()
         super.onDestroy()

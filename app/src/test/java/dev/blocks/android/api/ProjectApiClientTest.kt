@@ -6,6 +6,7 @@ import java.net.InetSocketAddress
 import java.net.URI
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -60,6 +61,26 @@ class ProjectApiClientTest {
         }
     }
 
+    @Test
+    fun sendsOpaqueTagLookupOnlyInTheAuthenticatedTenantScopedPostBody() {
+        val request = AtomicReference<Request>()
+        val server = server(request::set)
+        try {
+            val client = ProjectApiClient(URI("http://127.0.0.1:${server.address.port}"))
+            val token = "secret-opaque-token"
+            client.lookupBlock("identity-token", "tenant-a", """{"tag_token":"$token"}""")
+
+            assertEquals("POST", request.get().method)
+            assertEquals("/v1/tenants/tenant-a/blocks/lookup", request.get().path)
+            assertNull(request.get().query)
+            assertFalse(request.get().path.contains(token))
+            assertEquals("""{"tag_token":"$token"}""", request.get().body)
+            assertEquals("Bearer identity-token", request.get().authorization)
+        } finally {
+            server.stop(0)
+        }
+    }
+
     private fun server(onRequest: (Request) -> Unit): HttpServer = HttpServer.create(
         InetSocketAddress(InetAddress.getLoopbackAddress(), 0),
         0,
@@ -74,6 +95,7 @@ class ProjectApiClientTest {
                     clientVersion = exchange.requestHeaders.getFirst("X-Blocks-Client-Version"),
                     ifMatch = exchange.requestHeaders.getFirst("If-Match"),
                     idempotencyKey = exchange.requestHeaders.getFirst("Idempotency-Key"),
+                    body = exchange.requestBody.bufferedReader().use { it.readText() },
                 ),
             )
             val response = "{}".toByteArray()
@@ -91,5 +113,6 @@ class ProjectApiClientTest {
         val clientVersion: String?,
         val ifMatch: String?,
         val idempotencyKey: String?,
+        val body: String,
     )
 }

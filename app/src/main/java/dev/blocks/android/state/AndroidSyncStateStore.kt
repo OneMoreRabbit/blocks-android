@@ -25,6 +25,11 @@ import dev.blocks.android.project.ProjectPage
 import dev.blocks.android.project.ProjectParking
 import dev.blocks.android.project.ProjectSummary
 import dev.blocks.android.project.ProjectUiPreferences
+import dev.blocks.android.tag.LocalBlockOperation
+import dev.blocks.android.tag.LocalBlockOperationType
+import dev.blocks.android.tag.LocalBlockRecord
+import dev.blocks.android.tag.LocalBlockState
+import dev.blocks.android.tag.OpaqueTagToken
 import java.io.File
 import java.security.KeyStore
 import java.security.MessageDigest
@@ -53,6 +58,8 @@ internal data class EncodedSyncRows(
     val parkingLoadedProjectIds: List<String> = emptyList(),
     val stalePageIds: List<String> = emptyList(),
     val blocks: List<String> = emptyList(),
+    val localBlocks: List<String> = emptyList(),
+    val localBlockOperations: List<String> = emptyList(),
     val projectCommands: List<String> = emptyList(),
     val retiredOperationIds: List<String> = emptyList(),
     val provisionalProjectIds: List<String> = emptyList(),
@@ -92,6 +99,8 @@ internal class SyncStateRowCodec(private val gson: Gson = Gson()) {
             parkingLoadedProjectIds = state.projectCache.parkingLoadedProjectIds.distinct(),
             stalePageIds = state.projectCache.stalePageIds.distinct(),
             blocks = state.projectCache.blocks.map(gson::toJson),
+            localBlocks = state.projectCache.localBlocks.map(gson::toJson),
+            localBlockOperations = state.projectCache.localBlockOperations.map(gson::toJson),
             projectCommands = state.projectCache.commands.map(gson::toJson),
             retiredOperationIds = state.projectCache.retiredOperationIds.distinct(),
             provisionalProjectIds = state.projectCache.provisionalProjectIds.distinct(),
@@ -139,6 +148,16 @@ internal class SyncStateRowCodec(private val gson: Gson = Gson()) {
                 stalePageIds = rows.stalePageIds.distinct(),
                 blocks = rows.blocks.map { gson.fromJson(it, PhysicalBlock::class.java) },
                 blocksLoaded = rows.blocksLoaded,
+                localBlocks = if (rows.schemaVersion >= LOCAL_TAG_SCHEMA_VERSION) {
+                    rows.localBlocks.map { gson.fromJson(it, LocalBlockRecord::class.java) }
+                } else {
+                    emptyList()
+                },
+                localBlockOperations = if (rows.schemaVersion >= LOCAL_TAG_SCHEMA_VERSION) {
+                    rows.localBlockOperations.map { gson.fromJson(it, LocalBlockOperation::class.java) }
+                } else {
+                    emptyList()
+                },
                 commands = rows.projectCommands.map {
                     gson.fromJson(it, ProjectMutation::class.java).migrateFrom(rows.schemaVersion)
                 },
@@ -200,7 +219,8 @@ internal class SyncStateRowCodec(private val gson: Gson = Gson()) {
         const val LOCAL_FIRST_SCHEMA_VERSION = 4
         const val STANDALONE_SCHEMA_VERSION = 5
         const val PARKING_HISTORY_SCHEMA_VERSION = 6
-        const val CURRENT_SCHEMA_VERSION = PARKING_HISTORY_SCHEMA_VERSION
+        const val LOCAL_TAG_SCHEMA_VERSION = 7
+        const val CURRENT_SCHEMA_VERSION = LOCAL_TAG_SCHEMA_VERSION
     }
 }
 
@@ -310,6 +330,70 @@ private fun validateProjectCache(cache: ProjectCacheState) {
     }
     require(cache.blocks.map { it.id }.distinct().size == cache.blocks.size) {
         "Cached block identifiers are not unique"
+    }
+    require(cache.localBlocks.map { it.clientBlockId }.distinct().size == cache.localBlocks.size) {
+        "Local block client identifiers are not unique"
+    }
+    require(cache.localBlocks.map { it.token.encoded }.distinct().size == cache.localBlocks.size) {
+        "Local tag tokens are not unique"
+    }
+    cache.localBlocks.forEach { block ->
+        require(OpaqueTagToken.parse(block.token.encoded) == block.token) { "A local tag token is not canonical" }
+        require(block.clientBlockId.isNotBlank()) { "A local block client identity is missing" }
+        require(block.label.isNotBlank()) { "A local block label is missing" }
+        when (block.state) {
+            LocalBlockState.AWAITING_WRITE,
+            LocalBlockState.WRITE_UNCERTAIN,
+            -> {
+                require(block.intendedProjectId != null && block.boundProjectId == null) {
+                    "A pending local block must retain intent without claiming a binding"
+                }
+                require(!block.registrationOperationId.isNullOrBlank()) {
+                    "A pending local block registration identity is missing"
+                }
+                require(!block.initialBindingOperationId.isNullOrBlank()) {
+                    "A pending local block binding identity is missing"
+                }
+            }
+            LocalBlockState.ACTIVE -> require(block.boundProjectId != null) {
+                "An active local block must be bound"
+            }
+            LocalBlockState.UNBOUND -> require(block.boundProjectId == null) {
+                "An unbound local block cannot retain a binding"
+            }
+        }
+    }
+    require(cache.localBlockOperations.map { it.operationId }.distinct().size == cache.localBlockOperations.size) {
+        "Local block operation identities are not unique"
+    }
+    val localBlockIds = cache.localBlocks.map { it.clientBlockId }.toSet()
+    val localOperationPositions = cache.localBlockOperations.mapIndexed { index, operation ->
+        operation.operationId to index
+    }.toMap()
+    cache.localBlockOperations.forEachIndexed { index, operation ->
+        require(operation.clientBlockId in localBlockIds) { "A local block operation has no local block" }
+        require(operation.contractVersion == "0.5") { "A local block operation has an unexpected contract version" }
+        operation.dependsOnOperationId?.let { dependency ->
+            require(localOperationPositions[dependency]?.let { it < index } == true) {
+                "A local block operation dependency must precede the dependent operation"
+            }
+        }
+        when (operation.type) {
+            LocalBlockOperationType.REGISTER_BLOCK -> {
+                require(operation.token != null && !operation.label.isNullOrBlank()) {
+                    "A local block registration payload is incomplete"
+                }
+                require(operation.projectId == null && operation.dependsOnOperationId == null) {
+                    "A local block registration cannot depend on a binding"
+                }
+            }
+            LocalBlockOperationType.BIND_BLOCK -> require(!operation.projectId.isNullOrBlank()) {
+                "A local block binding project is missing"
+            }
+            LocalBlockOperationType.UNBIND_BLOCK -> require(operation.projectId == null) {
+                "A local block unbind cannot carry a project"
+            }
+        }
     }
     val retired = cache.retiredOperationIds.distinct()
     require(cache.commands.none { it.operationId in retired }) {
@@ -557,6 +641,8 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
             ),
             stalePageIds = readRows(database, tenantId, secretKey, TABLE_STALE_PROJECT_PAGES),
             blocks = readRows(database, tenantId, secretKey, TABLE_BLOCKS),
+            localBlocks = readRows(database, tenantId, secretKey, TABLE_LOCAL_BLOCKS),
+            localBlockOperations = readRows(database, tenantId, secretKey, TABLE_LOCAL_BLOCK_OPERATIONS),
             projectCommands = readRows(database, tenantId, secretKey, TABLE_PROJECT_COMMANDS),
             retiredOperationIds = readRows(database, tenantId, secretKey, TABLE_RETIRED_OPERATIONS),
             provisionalProjectIds = readRows(database, tenantId, secretKey, TABLE_PROVISIONAL_PROJECTS),
@@ -634,6 +720,8 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
         )
         writeRows(database, tenantId, secretKey, TABLE_STALE_PROJECT_PAGES, rows.stalePageIds)
         writeRows(database, tenantId, secretKey, TABLE_BLOCKS, rows.blocks)
+        writeRows(database, tenantId, secretKey, TABLE_LOCAL_BLOCKS, rows.localBlocks)
+        writeRows(database, tenantId, secretKey, TABLE_LOCAL_BLOCK_OPERATIONS, rows.localBlockOperations)
         writeRows(database, tenantId, secretKey, TABLE_PROJECT_COMMANDS, rows.projectCommands)
         writeRows(database, tenantId, secretKey, TABLE_RETIRED_OPERATIONS, rows.retiredOperationIds)
         writeRows(database, tenantId, secretKey, TABLE_PROVISIONAL_PROJECTS, rows.provisionalProjectIds)
@@ -848,6 +936,7 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
             if (oldVersion < 3) LOCAL_FIRST_TABLES.forEach { table -> createPositionTable(database, table) }
             if (oldVersion < 4) STANDALONE_TABLES.forEach { table -> createPositionTable(database, table) }
             if (oldVersion < 5) PARKING_HISTORY_TABLES.forEach { table -> createPositionTable(database, table) }
+            if (oldVersion < 6) LOCAL_TAG_TABLES.forEach { table -> createPositionTable(database, table) }
         }
 
         override fun onDowngrade(database: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -864,7 +953,7 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
     }
 
     private companion object {
-        const val DATABASE_VERSION = 5
+        const val DATABASE_VERSION = 6
         const val DATABASE_PREFIX = "blocks_sync_"
         const val DATABASE_KEY_PREFIX = "blocks-sync-db-v1-"
         const val LEGACY_PREFERENCES_PREFIX = "encrypted_sync_state_v1_"
@@ -883,6 +972,8 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
         const val TABLE_PARKING_LOADED_PROJECTS = "parking_loaded_projects_v6"
         const val TABLE_STALE_PROJECT_PAGES = "stale_project_pages_v3"
         const val TABLE_BLOCKS = "blocks_v3"
+        const val TABLE_LOCAL_BLOCKS = "local_blocks_v7"
+        const val TABLE_LOCAL_BLOCK_OPERATIONS = "local_block_operations_v7"
         const val TABLE_PROJECT_COMMANDS = "pending_project_commands_v3"
         const val TABLE_RETIRED_OPERATIONS = "retired_project_operations_v3"
         const val TABLE_PROVISIONAL_PROJECTS = "provisional_projects_v4"
@@ -919,12 +1010,14 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
         )
         val STANDALONE_TABLES = listOf(TABLE_PROJECT_UI_PREFERENCES)
         val PARKING_HISTORY_TABLES = listOf(TABLE_PARKING_RECORDS, TABLE_PARKING_LOADED_PROJECTS)
+        val LOCAL_TAG_TABLES = listOf(TABLE_LOCAL_BLOCKS, TABLE_LOCAL_BLOCK_OPERATIONS)
         val POSITION_TABLES = listOf(
             TABLE_PROJECTS,
             TABLE_REENTRY,
             TABLE_COMMANDS,
             TABLE_RETIRED_KEYS,
-        ) + PROJECT_MODEL_TABLES + LOCAL_FIRST_TABLES + STANDALONE_TABLES + PARKING_HISTORY_TABLES
+        ) + PROJECT_MODEL_TABLES + LOCAL_FIRST_TABLES + STANDALONE_TABLES +
+            PARKING_HISTORY_TABLES + LOCAL_TAG_TABLES
         val TABLES = listOf(
             TABLE_METADATA,
         ) + POSITION_TABLES

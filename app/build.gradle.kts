@@ -140,8 +140,8 @@ android {
         applicationId = "dev.blocks.android"
         minSdk = 26
         targetSdk = 37
-        versionCode = 7
-        versionName = "0.5.2"
+        versionCode = 8
+        versionName = "0.6.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "BLOCKS_API_BASE_URL", "\"https://api.blocks.onemorerabbit.co.uk\"")
@@ -171,10 +171,12 @@ android {
 
 dependencies {
     implementation("androidx.activity:activity:1.13.0")
+    implementation("androidx.fragment:fragment:1.5.7")
     implementation("androidx.credentials:credentials:1.6.0")
     implementation("androidx.credentials:credentials-play-services-auth:1.6.0")
     implementation("com.google.android.libraries.identity.googleid:googleid:1.2.0")
     implementation("com.google.code.gson:gson:2.14.0")
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("org.json:json:20250517")
 

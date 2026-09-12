@@ -27,6 +27,12 @@ import dev.blocks.android.project.ProjectParking
 import dev.blocks.android.project.ProjectSummary
 import dev.blocks.android.project.DashboardView
 import dev.blocks.android.project.ProjectUiPreferences
+import dev.blocks.android.tag.LocalBlockOperation
+import dev.blocks.android.tag.LocalBlockOperationType
+import dev.blocks.android.tag.LocalBlockRecord
+import dev.blocks.android.tag.LocalBlockState
+import dev.blocks.android.tag.OpaqueTagToken
+import dev.blocks.android.tag.TagActivationMedium
 import java.security.KeyStore
 import java.security.MessageDigest
 import javax.crypto.Cipher
@@ -69,7 +75,7 @@ class AndroidEncryptedSyncStateStoreTest {
 
         val migrated = store.loadSyncState(CURRENT_PILOT_TENANT)
 
-        assertEquals(5, databaseVersion(CURRENT_PILOT_TENANT))
+        assertEquals(6, databaseVersion(CURRENT_PILOT_TENANT))
         assertEquals("current-pilot-operation", migrated.projectCache.commands.single().operationId)
         assertEquals("0.3", migrated.projectCache.commands.single().contractVersion)
         assertNull(migrated.projectCache.commands.single().clientResourceId)
@@ -87,6 +93,7 @@ class AndroidEncryptedSyncStateStoreTest {
             idempotencyKey = "sensitive-retry-key-a",
             pickup = PickupRequest("project-a", "Sensitive outcome A"),
         )
+        val tagToken = OpaqueTagToken.fromBytes(ByteArray(32) { (it + 11).toByte() })
         val tenantAState = TenantSyncState(
             projects = listOf(Project("project-a", "Sensitive project A")),
             projectsLoaded = true,
@@ -140,6 +147,39 @@ class AndroidEncryptedSyncStateStoreTest {
                     ),
                 ),
                 parkingLoadedProjectIds = listOf("sensitive-client-project-a"),
+                localBlocks = listOf(
+                    LocalBlockRecord(
+                        clientBlockId = "sensitive-client-block-a",
+                        token = tagToken,
+                        label = "Sensitive block label A",
+                        state = LocalBlockState.ACTIVE,
+                        intendedProjectId = "sensitive-client-project-a",
+                        boundProjectId = "sensitive-client-project-a",
+                        registrationOperationId = "sensitive-register-operation-a",
+                        initialBindingOperationId = "sensitive-bind-operation-a",
+                        createdAt = "2026-09-11T12:15:00Z",
+                        verifiedAt = "2026-09-11T12:16:00Z",
+                        activationMedium = TagActivationMedium.NFC,
+                    ),
+                ),
+                localBlockOperations = listOf(
+                    LocalBlockOperation(
+                        operationId = "sensitive-register-operation-a",
+                        type = LocalBlockOperationType.REGISTER_BLOCK,
+                        clientBlockId = "sensitive-client-block-a",
+                        token = tagToken,
+                        label = "Sensitive block label A",
+                        createdAt = "2026-09-11T12:15:00Z",
+                    ),
+                    LocalBlockOperation(
+                        operationId = "sensitive-bind-operation-a",
+                        type = LocalBlockOperationType.BIND_BLOCK,
+                        clientBlockId = "sensitive-client-block-a",
+                        projectId = "sensitive-client-project-a",
+                        dependsOnOperationId = "sensitive-register-operation-a",
+                        createdAt = "2026-09-11T12:16:00Z",
+                    ),
+                ),
                 commands = listOf(
                     ProjectMutation(
                         operationId = "sensitive-create-operation-a",
@@ -183,6 +223,9 @@ class AndroidEncryptedSyncStateStoreTest {
         assertFalse(databaseBytes.containsBytes("sensitive-client-project-a".toByteArray()))
         assertFalse(databaseBytes.containsBytes("Sensitive location A".toByteArray()))
         assertFalse(databaseBytes.containsBytes("Sensitive reminder A".toByteArray()))
+        assertFalse(databaseBytes.containsBytes(tagToken.encoded.toByteArray()))
+        assertFalse(databaseBytes.containsBytes("Sensitive block label A".toByteArray()))
+        assertFalse(databaseBytes.containsBytes("sensitive-register-operation-a".toByteArray()))
 
         val invalid = tenantAState.copy(commands = listOf(command, command))
         assertTrue(runCatching { store.saveSyncState(TENANT_A, invalid) }.isFailure)
@@ -269,7 +312,7 @@ class AndroidEncryptedSyncStateStoreTest {
         assertEquals("29", migrated.changeCursor)
         assertEquals(listOf(Project("pilot-project", "Pilot project")), migrated.projects)
         assertEquals(ProjectCacheState(), migrated.projectCache)
-        assertEquals(5, databaseVersion(PILOT_DATABASE_TENANT))
+        assertEquals(6, databaseVersion(PILOT_DATABASE_TENANT))
         assertFalse(databaseFile(PILOT_DATABASE_TENANT).readBytes().containsBytes("Pilot outcome".toByteArray()))
 
         val api03Command = ProjectMutation(

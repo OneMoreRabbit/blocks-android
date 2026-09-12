@@ -38,6 +38,12 @@ import dev.blocks.android.project.ProjectParking
 import dev.blocks.android.project.ProjectService
 import dev.blocks.android.project.ProjectSummary
 import dev.blocks.android.project.RegisteredBlock
+import dev.blocks.android.tag.LocalBlockOperationType
+import dev.blocks.android.tag.LocalBlockState
+import dev.blocks.android.tag.LocalTagResolution
+import dev.blocks.android.tag.OpaqueTagToken
+import dev.blocks.android.tag.TagActivationMedium
+import dev.blocks.android.tag.TagProgrammingFailure
 import java.io.IOException
 import java.net.ConnectException
 import java.net.SocketTimeoutException
@@ -50,6 +56,224 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ProjectSyncRepositoryTest {
+    @Test
+    fun pendingNfcProgrammingSurvivesAmbiguityAndRestartWithoutMintingAnotherToken() {
+        val drafts = MemoryDrafts()
+        val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
+        val service = FakeProjectService()
+        val token = OpaqueTagToken.fromBytes(ByteArray(32) { it.toByte() })
+        val first = repository(service, drafts, state)
+        first.activate(SESSION_A)
+
+        first.beginTagProgramming(
+            SESSION_A,
+            PROJECT_ID,
+            "Desk block",
+            clientBlockId = "client-block",
+            token = token,
+            registrationOperationId = "register-operation",
+            bindingOperationId = "bind-operation",
+        )
+        first.markTagWriteAttempt(SESSION_A, "client-block")
+
+        val restarted = repository(service, drafts, state)
+        restarted.activate(SESSION_A)
+        val pending = restarted.resolveTagLocally(SESSION_A, token)
+        assertTrue(pending is LocalTagResolution.PendingProgramming)
+        assertEquals(LocalBlockState.WRITE_UNCERTAIN, (pending as LocalTagResolution.PendingProgramming).block.state)
+        assertEquals(token, pending.block.token)
+
+        val completed = restarted.completeTagProgramming(
+            SESSION_A,
+            "client-block",
+            token,
+            TagActivationMedium.NFC,
+        )
+
+        assertEquals(LocalBlockState.ACTIVE, completed.cache.localBlocks.single().state)
+        assertEquals(PROJECT_ID, completed.cache.localBlocks.single().boundProjectId)
+        assertEquals(
+            listOf(LocalBlockOperationType.REGISTER_BLOCK, LocalBlockOperationType.BIND_BLOCK),
+            completed.cache.localBlockOperations.map { it.type },
+        )
+        assertEquals(listOf(null, "register-operation"), completed.cache.localBlockOperations.map { it.dependsOnOperationId })
+        assertEquals(2, completed.pendingBlockOperations)
+    }
+
+    @Test
+    fun everyProgrammingFailureRetainsTheFrozenTokenAndOperationIdentitiesUntilVerified() {
+        val drafts = MemoryDrafts()
+        val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
+        val token = OpaqueTagToken.fromBytes(ByteArray(32) { (it + 1).toByte() })
+        val first = repository(FakeProjectService(), drafts, state)
+        first.activate(SESSION_A)
+        first.beginTagProgramming(
+            SESSION_A,
+            PROJECT_ID,
+            "Workshop block",
+            "stable-client-block",
+            token,
+            "stable-register",
+            "stable-bind",
+        )
+
+        listOf(
+            TagProgrammingFailure.UNSUPPORTED,
+            TagProgrammingFailure.READ_ONLY,
+            TagProgrammingFailure.TOO_SMALL,
+            TagProgrammingFailure.FOREIGN_CONTENT,
+        ).forEach { failure ->
+            val retained = first.recordTagProgrammingFailure(SESSION_A, "stable-client-block", failure)
+            assertEquals(LocalBlockState.AWAITING_WRITE, retained.state)
+            assertEquals(token, retained.token)
+            assertEquals("stable-register", retained.registrationOperationId)
+            assertEquals("stable-bind", retained.initialBindingOperationId)
+            assertTrue(state.loadSyncState(TENANT_A).projectCache.localBlockOperations.isEmpty())
+        }
+        first.markTagWriteAttempt(SESSION_A, "stable-client-block")
+        first.recordTagProgrammingFailure(
+            SESSION_A,
+            "stable-client-block",
+            TagProgrammingFailure.VERIFICATION_MISMATCH,
+        )
+
+        val restarted = repository(FakeProjectService(), drafts, state)
+        restarted.activate(SESSION_A)
+        val pending = (restarted.resolveTagLocally(SESSION_A, token) as LocalTagResolution.PendingProgramming).block
+        assertEquals(LocalBlockState.WRITE_UNCERTAIN, pending.state)
+        assertEquals(token, pending.token)
+        assertEquals("stable-register", pending.registrationOperationId)
+        assertEquals("stable-bind", pending.initialBindingOperationId)
+
+        val completed = restarted.completeTagProgramming(
+            SESSION_A,
+            "stable-client-block",
+            token,
+            TagActivationMedium.NFC,
+        )
+        assertEquals(listOf("stable-register", "stable-bind"), completed.cache.localBlockOperations.map { it.operationId })
+    }
+
+    @Test
+    fun localTagResolutionIsTenantPartitionedAndUnbindReassignKeepsOrderedIntent() {
+        val drafts = MemoryDrafts()
+        val state = MemoryState().apply {
+            saveSyncState(TENANT_A, loadedState(TENANT_A))
+            saveSyncState(TENANT_B, loadedState(TENANT_B))
+        }
+        val repository = repository(FakeProjectService(), drafts, state)
+        val token = OpaqueTagToken.fromBytes(ByteArray(32) { (it + 2).toByte() })
+        repository.activate(SESSION_A)
+        repository.beginTagProgramming(
+            SESSION_A,
+            PROJECT_ID,
+            "Portable block",
+            "tenant-a-block",
+            token,
+            "register-a",
+            "bind-a",
+        )
+        repository.completeTagProgramming(SESSION_A, "tenant-a-block", token, TagActivationMedium.QR)
+
+        repository.activate(SESSION_B)
+        assertTrue(repository.resolveTagLocally(SESSION_B, token) is LocalTagResolution.Unknown)
+
+        repository.activate(SESSION_A)
+        assertTrue(repository.resolveTagLocally(SESSION_A, token) is LocalTagResolution.Bound)
+        repository.unbindLocalBlock(SESSION_A, "tenant-a-block", "unbind-a")
+        assertTrue(repository.resolveTagLocally(SESSION_A, token) is LocalTagResolution.Unbound)
+        val reassigned = repository.assignLocalBlock(SESSION_A, "tenant-a-block", PROJECT_ID, "rebind-a")
+
+        assertTrue(repository.resolveTagLocally(SESSION_A, token) is LocalTagResolution.Bound)
+        assertEquals(
+            listOf("register-a", "bind-a", "unbind-a", "rebind-a"),
+            reassigned.cache.localBlockOperations.map { it.operationId },
+        )
+        assertEquals(
+            listOf(null, "register-a", "bind-a", "unbind-a"),
+            reassigned.cache.localBlockOperations.map { it.dependsOnOperationId },
+        )
+        assertFalse(state.loadSyncState(TENANT_B).projectCache.localBlocks.any { it.token == token })
+    }
+
+    @Test
+    fun api04BackgroundSyncNeverTransmitsLocalBlockOperations() {
+        val drafts = MemoryDrafts()
+        val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
+        val service = FakeProjectService()
+        val repository = repository(service, drafts, state)
+        val token = OpaqueTagToken.fromBytes(ByteArray(32) { (it + 3).toByte() })
+        repository.activate(SESSION_A)
+        repository.beginTagProgramming(
+            SESSION_A,
+            PROJECT_ID,
+            "Offline block",
+            "offline-block",
+            token,
+            "offline-register",
+            "offline-bind",
+        )
+        repository.completeTagProgramming(SESSION_A, "offline-block", token, TagActivationMedium.NFC)
+
+        val synced = repository.backgroundSync(SESSION_A)
+
+        assertEquals(2, synced.pendingBlockOperations)
+        assertEquals(listOf("changes"), service.calls)
+        assertEquals(listOf("offline-register", "offline-bind"), synced.cache.localBlockOperations.map { it.operationId })
+    }
+
+    @Test
+    fun authenticatedUnknownLookupCachesTheAuthorizedResultBeforeOfflineReentry() {
+        val drafts = MemoryDrafts()
+        val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
+        val service = FakeProjectService()
+        val repository = repository(service, drafts, state)
+        val token = OpaqueTagToken.fromBytes(ByteArray(32) { (it + 4).toByte() })
+        repository.activate(SESSION_A)
+
+        val online = repository.resolveTagThroughService(SESSION_A, token)
+        service.offline = true
+        val restarted = repository(service, drafts, state)
+        restarted.activate(SESSION_A)
+        val offline = restarted.resolveTagLocally(SESSION_A, token)
+
+        assertTrue(online is LocalTagResolution.Bound)
+        assertTrue(offline is LocalTagResolution.Bound)
+        assertEquals(PROJECT_ID, (offline as LocalTagResolution.Bound).projectId)
+        assertEquals(listOf("lookup", "page"), service.calls)
+        assertEquals("block-id", offline.block.serverBlockId)
+    }
+
+    @Test
+    fun provisionalProjectAcknowledgementAtomicallyRemapsLocalBlockAndBindingIntent() {
+        val drafts = MemoryDrafts()
+        val state = MemoryState()
+        val service = FakeProjectService()
+        val repository = repository(service, drafts, state)
+        val token = OpaqueTagToken.fromBytes(ByteArray(32) { (it + 5).toByte() })
+        repository.activate(SESSION_A)
+        repository.queueCreateProject(SESSION_A, "Local project", "create-project", "local-project")
+        repository.beginTagProgramming(
+            SESSION_A,
+            "local-project",
+            "Project block",
+            "project-block",
+            token,
+            "register-project-block",
+            "bind-project-block",
+        )
+        repository.completeTagProgramming(SESSION_A, "project-block", token, TagActivationMedium.NFC)
+
+        val synced = repository.backgroundSync(SESSION_A)
+
+        assertEquals(PROJECT_ID, synced.cache.localBlocks.single().boundProjectId)
+        assertEquals(PROJECT_ID, synced.cache.localBlocks.single().intendedProjectId)
+        assertEquals(PROJECT_ID, synced.cache.localBlockOperations.single {
+            it.type == LocalBlockOperationType.BIND_BLOCK
+        }.projectId)
+        assertEquals(listOf("list-active", "create", "changes", "list-archived", "blocks"), service.calls)
+    }
+
     @Test
     fun localParkingHistoryIsImmediateRestartSafeAndProgressivelyReadableNewestFirst() {
         val drafts = MemoryDrafts()
@@ -1130,12 +1354,22 @@ class ProjectSyncRepositoryTest {
             failIfNeeded()
             return emptyList()
         }
-        override fun registerBlock(session: Session, label: String, idempotencyKey: String) =
-            RegisteredBlock(PhysicalBlock("block-id", label, "registered"), "tag-token")
-        override fun bindBlock(session: Session, blockId: String, projectId: String, idempotencyKey: String) =
-            BlockBinding("binding-id", blockId, projectId)
-        override fun unbindBlock(session: Session, blockId: String) = Unit
-        override fun lookupBlock(session: Session, tagToken: String) = BlockLookup("block-id", "Block", PROJECT_ID)
+        override fun registerBlock(session: Session, label: String, idempotencyKey: String): RegisteredBlock {
+            calls += "register"
+            return RegisteredBlock(PhysicalBlock("block-id", label, "registered"), "tag-token")
+        }
+        override fun bindBlock(session: Session, blockId: String, projectId: String, idempotencyKey: String): BlockBinding {
+            calls += "bind"
+            return BlockBinding("binding-id", blockId, projectId)
+        }
+        override fun unbindBlock(session: Session, blockId: String) {
+            calls += "unbind"
+        }
+        override fun lookupBlock(session: Session, tagToken: String): BlockLookup {
+            calls += "lookup"
+            failIfNeeded()
+            return BlockLookup("block-id", "Block", PROJECT_ID)
+        }
         override fun changes(session: Session, cursor: String?, limit: Int): ChangePage {
             calls += "changes"
             failIfNeeded()
