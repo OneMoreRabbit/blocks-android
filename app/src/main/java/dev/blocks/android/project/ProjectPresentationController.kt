@@ -7,6 +7,11 @@ import dev.blocks.android.mvp.MembershipRevokedException
 import dev.blocks.android.mvp.ParkingDraft
 import dev.blocks.android.mvp.PendingMutation
 import dev.blocks.android.mvp.Session
+import dev.blocks.android.tag.LocalBlockRecord
+import dev.blocks.android.tag.LocalTagResolution
+import dev.blocks.android.tag.OpaqueTagToken
+import dev.blocks.android.tag.TagActivationMedium
+import dev.blocks.android.tag.TagProgrammingFailure
 import java.io.IOException
 import java.security.MessageDigest
 
@@ -28,6 +33,7 @@ data class ProjectPresentationState(
     val projectPage: ProjectPage? = null,
     val parkingHistory: List<ProjectParking> = emptyList(),
     val parkingHistoryHasMore: Boolean = false,
+    val localBlocks: List<LocalBlockRecord> = emptyList(),
     val drafts: FormDrafts = FormDrafts(),
     val invalidField: ProjectFormField? = null,
     val showParkingForm: Boolean = false,
@@ -264,6 +270,79 @@ class ProjectPresentationController(
             parkingHistoryHasMore = next.hasMore,
             error = null,
         )
+    }
+
+    @Synchronized
+    fun beginTagProgramming(label: String): LocalBlockRecord {
+        val projectId = requireNotNull(state.projectPage).project.id
+        val block = workspace.beginTagProgramming(activeSession(), projectId, label)
+        state = state.copy(localBlocks = workspace.localBlocks(activeSession()), error = null)
+        return block
+    }
+
+    @Synchronized
+    fun markTagWriteAttempt(clientBlockId: String): LocalBlockRecord {
+        val block = workspace.markTagWriteAttempt(activeSession(), clientBlockId)
+        state = state.copy(localBlocks = workspace.localBlocks(activeSession()), error = null)
+        return block
+    }
+
+    @Synchronized
+    fun recordTagProgrammingFailure(
+        clientBlockId: String,
+        failure: TagProgrammingFailure,
+    ): LocalBlockRecord {
+        val block = workspace.recordTagProgrammingFailure(activeSession(), clientBlockId, failure)
+        state = state.copy(localBlocks = workspace.localBlocks(activeSession()), error = null)
+        return block
+    }
+
+    @Synchronized
+    fun discardPendingTagProgramming(clientBlockId: String) {
+        applyResult(workspace.discardPendingTagProgramming(activeSession(), clientBlockId))
+    }
+
+    @Synchronized
+    fun authorizeTagReplacement(clientBlockId: String, existingToken: OpaqueTagToken): LocalBlockRecord {
+        val block = workspace.authorizeTagReplacement(activeSession(), clientBlockId, existingToken)
+        state = state.copy(localBlocks = workspace.localBlocks(activeSession()), error = null)
+        return block
+    }
+
+    @Synchronized
+    fun completeTagProgramming(
+        clientBlockId: String,
+        verifiedToken: OpaqueTagToken,
+        medium: TagActivationMedium,
+    ) {
+        applyResult(
+            workspace.completeTagProgramming(activeSession(), clientBlockId, verifiedToken, medium),
+        )
+    }
+
+    @Synchronized
+    fun resolveTagLocally(token: OpaqueTagToken): LocalTagResolution =
+        workspace.resolveTagLocally(activeSession(), token)
+
+    fun resolveTagThroughService(token: OpaqueTagToken): LocalTagResolution {
+        val active = synchronized(this) { activeSession() }
+        val resolution = workspace.resolveTagThroughService(active, token)
+        synchronized(this) {
+            if (session?.tenantId == active.tenantId) {
+                applyResult(workspace.snapshot(active))
+            }
+        }
+        return resolution
+    }
+
+    @Synchronized
+    fun assignLocalBlock(clientBlockId: String, projectId: String) {
+        applyResult(workspace.assignLocalBlock(activeSession(), clientBlockId, projectId, newOperationId()))
+    }
+
+    @Synchronized
+    fun unbindLocalBlock(clientBlockId: String) {
+        applyResult(workspace.unbindLocalBlock(activeSession(), clientBlockId, newOperationId()))
     }
 
     @Synchronized
@@ -510,7 +589,9 @@ class ProjectPresentationController(
         val history = updatedPage?.let {
             workspace.parkingHistory(active, it.project.id, 0, visibleHistoryCount)
         }
-        val pending = result.pendingLegacyOperations + result.pendingProjectOperations
+        val pending = result.pendingLegacyOperations +
+            result.pendingProjectOperations +
+            result.pendingBlockOperations
         val preferences = workspace.uiPreferences(active)
         state = state.copy(
             activeProjects = result.cache.activeProjects.sortedBy { it.name.lowercase() },
@@ -518,6 +599,7 @@ class ProjectPresentationController(
             projectPage = updatedPage,
             parkingHistory = history?.records.orEmpty(),
             parkingHistoryHasMore = history?.hasMore ?: false,
+            localBlocks = result.cache.localBlocks,
             drafts = drafts,
             dashboardView = preferences.dashboardView,
             archiveMode = preferences.archiveMode,

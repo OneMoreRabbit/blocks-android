@@ -4,6 +4,13 @@ import dev.blocks.android.mvp.ChangePage
 import dev.blocks.android.mvp.FormDrafts
 import dev.blocks.android.mvp.ParkingDraft
 import dev.blocks.android.mvp.Session
+import dev.blocks.android.tag.LocalBlockRecord
+import dev.blocks.android.tag.LocalTagResolution
+import dev.blocks.android.tag.OpaqueTagToken
+import dev.blocks.android.tag.OpaqueTagTokenFactory
+import dev.blocks.android.tag.TagActivationMedium
+import dev.blocks.android.tag.TagProgrammingFailure
+import dev.blocks.android.tag.LocalBlockOperation
 import java.util.UUID
 
 enum class ProjectLifecycle(val wireValue: String) {
@@ -139,6 +146,8 @@ data class ProjectCacheState(
     val stalePageIds: List<String> = emptyList(),
     val blocks: List<PhysicalBlock> = emptyList(),
     val blocksLoaded: Boolean = false,
+    val localBlocks: List<LocalBlockRecord> = emptyList(),
+    val localBlockOperations: List<LocalBlockOperation> = emptyList(),
     val commands: List<ProjectMutation> = emptyList(),
     val retiredOperationIds: List<String> = emptyList(),
     val provisionalProjectIds: List<String> = emptyList(),
@@ -153,6 +162,7 @@ data class BackgroundSyncResult(
     val pendingProjectOperations: Int,
     val reconciliationRequired: Boolean,
     val conflict: ProjectConflict? = null,
+    val pendingBlockOperations: Int = 0,
 )
 
 data class ProjectConflict(
@@ -199,8 +209,8 @@ interface ProjectService {
     fun parking(session: Session, projectId: String): List<ProjectParking>
     fun blocks(session: Session): List<PhysicalBlock>
     /**
-     * Direct-only foundation adapter. A later NFC state machine must custody [RegisteredBlock.tagToken]
-     * before acknowledging registration; the generic background queue deliberately cannot call this.
+     * Legacy API 0.4 direct registration adapter. Android 0.6 local block operations do not call it:
+     * API 0.4 generates its token remotely, while the local-first journey persists its token before I/O.
      */
     fun registerBlock(session: Session, label: String, idempotencyKey: String): RegisteredBlock
     fun bindBlock(session: Session, blockId: String, projectId: String, idempotencyKey: String): BlockBinding
@@ -233,6 +243,51 @@ interface ProjectWorkspace {
         offset: Int,
         limit: Int,
     ): ParkingHistoryPage
+    fun localBlocks(session: Session): List<LocalBlockRecord> = snapshot(session).cache.localBlocks
+    fun beginTagProgramming(
+        session: Session,
+        projectId: String,
+        label: String,
+        clientBlockId: String = newOperationIdentity(),
+        token: OpaqueTagToken = OpaqueTagTokenFactory().create(),
+        registrationOperationId: String = newOperationIdentity(),
+        bindingOperationId: String = newOperationIdentity(),
+    ): LocalBlockRecord = throw UnsupportedOperationException("Local tag programming is unavailable")
+    fun markTagWriteAttempt(session: Session, clientBlockId: String): LocalBlockRecord =
+        throw UnsupportedOperationException("Local tag programming is unavailable")
+    fun recordTagProgrammingFailure(
+        session: Session,
+        clientBlockId: String,
+        failure: TagProgrammingFailure,
+    ): LocalBlockRecord = throw UnsupportedOperationException("Local tag programming is unavailable")
+    fun discardPendingTagProgramming(session: Session, clientBlockId: String): BackgroundSyncResult =
+        throw UnsupportedOperationException("Local tag programming is unavailable")
+    fun authorizeTagReplacement(
+        session: Session,
+        clientBlockId: String,
+        existingToken: OpaqueTagToken,
+    ): LocalBlockRecord = throw UnsupportedOperationException("Local tag programming is unavailable")
+    fun completeTagProgramming(
+        session: Session,
+        clientBlockId: String,
+        verifiedToken: OpaqueTagToken,
+        medium: TagActivationMedium,
+    ): BackgroundSyncResult = throw UnsupportedOperationException("Local tag programming is unavailable")
+    fun resolveTagLocally(session: Session, token: OpaqueTagToken): LocalTagResolution =
+        LocalTagResolution.Unknown(token)
+    fun resolveTagThroughService(session: Session, token: OpaqueTagToken): LocalTagResolution =
+        LocalTagResolution.Unknown(token)
+    fun assignLocalBlock(
+        session: Session,
+        clientBlockId: String,
+        projectId: String,
+        operationId: String = newOperationIdentity(),
+    ): BackgroundSyncResult = throw UnsupportedOperationException("Local tag association is unavailable")
+    fun unbindLocalBlock(
+        session: Session,
+        clientBlockId: String,
+        operationId: String = newOperationIdentity(),
+    ): BackgroundSyncResult = throw UnsupportedOperationException("Local tag association is unavailable")
     fun backgroundSync(session: Session): BackgroundSyncResult
     fun queueCreateProject(
         session: Session,

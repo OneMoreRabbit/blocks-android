@@ -20,6 +20,12 @@ import dev.blocks.android.project.ProjectParking
 import dev.blocks.android.project.ProjectSummary
 import dev.blocks.android.project.DashboardView
 import dev.blocks.android.project.ProjectUiPreferences
+import dev.blocks.android.tag.LocalBlockOperation
+import dev.blocks.android.tag.LocalBlockOperationType
+import dev.blocks.android.tag.LocalBlockRecord
+import dev.blocks.android.tag.LocalBlockState
+import dev.blocks.android.tag.OpaqueTagToken
+import dev.blocks.android.tag.TagActivationMedium
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -59,7 +65,7 @@ class SyncStateStorageCodecTest {
         val rows = SyncStateRowCodec().encode(state)
         val decoded = SyncStateRowCodec().decode(rows)
 
-        assertEquals(6, rows.schemaVersion)
+        assertEquals(7, rows.schemaVersion)
         assertEquals(1, rows.projects.size)
         assertEquals(1, rows.commands.size)
         assertEquals(1, rows.retiredIdempotencyKeys.size)
@@ -121,7 +127,7 @@ class SyncStateStorageCodecTest {
 
     @Test
     fun rejectsAnUnknownDatabaseRowSchemaWithoutDiscardingIt() {
-        val rows = SyncStateRowCodec().encode(TenantSyncState()).copy(schemaVersion = 7)
+        val rows = SyncStateRowCodec().encode(TenantSyncState()).copy(schemaVersion = 8)
 
         val error = runCatching { SyncStateRowCodec().decode(rows) }.exceptionOrNull()
 
@@ -226,6 +232,56 @@ class SyncStateStorageCodecTest {
         )
 
         assertEquals(state, SyncStateRowCodec().decode(SyncStateRowCodec().encode(state)))
+    }
+
+    @Test
+    fun roundTripsEncryptedLocalBlockProgrammingAndFrozenOperationOrder() {
+        val token = OpaqueTagToken.fromBytes(ByteArray(32) { (it + 1).toByte() })
+        val block = LocalBlockRecord(
+            clientBlockId = "client-block",
+            token = token,
+            label = "Workbench",
+            state = LocalBlockState.ACTIVE,
+            intendedProjectId = "project-1",
+            boundProjectId = "project-1",
+            registrationOperationId = "register-operation",
+            initialBindingOperationId = "bind-operation",
+            createdAt = "2026-09-12T08:00:00Z",
+            verifiedAt = "2026-09-12T08:01:00Z",
+            activationMedium = TagActivationMedium.NFC,
+        )
+        val registration = LocalBlockOperation(
+            operationId = "register-operation",
+            type = LocalBlockOperationType.REGISTER_BLOCK,
+            clientBlockId = block.clientBlockId,
+            token = token,
+            label = block.label,
+            createdAt = block.createdAt,
+        )
+        val binding = LocalBlockOperation(
+            operationId = "bind-operation",
+            type = LocalBlockOperationType.BIND_BLOCK,
+            clientBlockId = block.clientBlockId,
+            projectId = "project-1",
+            dependsOnOperationId = registration.operationId,
+            createdAt = "2026-09-12T08:01:00Z",
+        )
+        val state = TenantSyncState(
+            projectCache = ProjectCacheState(
+                localBlocks = listOf(block),
+                localBlockOperations = listOf(registration, binding),
+            ),
+        )
+
+        val rows = SyncStateRowCodec().encode(state)
+        val decoded = SyncStateRowCodec().decode(rows)
+
+        assertEquals(7, rows.schemaVersion)
+        assertEquals(state, decoded)
+        assertEquals(
+            listOf(LocalBlockOperationType.REGISTER_BLOCK, LocalBlockOperationType.BIND_BLOCK),
+            decoded.projectCache.localBlockOperations.map { it.type },
+        )
     }
 
     @Test
