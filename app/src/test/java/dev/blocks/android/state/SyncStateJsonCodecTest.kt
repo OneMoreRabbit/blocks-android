@@ -14,6 +14,9 @@ import dev.blocks.android.project.ProjectIdentityMapping
 import dev.blocks.android.project.ProjectLifecycle
 import dev.blocks.android.project.ProjectMutation
 import dev.blocks.android.project.ProjectMutationType
+import dev.blocks.android.project.ProjectNotes
+import dev.blocks.android.project.ProjectPage
+import dev.blocks.android.project.ProjectParking
 import dev.blocks.android.project.ProjectSummary
 import dev.blocks.android.project.DashboardView
 import dev.blocks.android.project.ProjectUiPreferences
@@ -56,7 +59,7 @@ class SyncStateStorageCodecTest {
         val rows = SyncStateRowCodec().encode(state)
         val decoded = SyncStateRowCodec().decode(rows)
 
-        assertEquals(5, rows.schemaVersion)
+        assertEquals(6, rows.schemaVersion)
         assertEquals(1, rows.projects.size)
         assertEquals(1, rows.commands.size)
         assertEquals(1, rows.retiredIdempotencyKeys.size)
@@ -118,11 +121,54 @@ class SyncStateStorageCodecTest {
 
     @Test
     fun rejectsAnUnknownDatabaseRowSchemaWithoutDiscardingIt() {
-        val rows = SyncStateRowCodec().encode(TenantSyncState()).copy(schemaVersion = 6)
+        val rows = SyncStateRowCodec().encode(TenantSyncState()).copy(schemaVersion = 7)
 
         val error = runCatching { SyncStateRowCodec().decode(rows) }.exceptionOrNull()
 
         assertTrue(error is IllegalArgumentException)
+    }
+
+    @Test
+    fun schemaFiveSeedsParkingHistoryFromTheCachedNewestRecordWithoutClaimingCompleteness() {
+        val project = ProjectSummary(
+            id = "project-5",
+            tenantId = "tenant-5",
+            name = "Pilot project",
+            lifecycle = ProjectLifecycle.ACTIVE,
+            rowVersion = 2,
+            createdAt = "2026-09-07T10:00:00Z",
+            updatedAt = "2026-09-07T10:00:00Z",
+        )
+        val newest = ProjectParking(
+            id = "parking-5",
+            projectId = project.id,
+            location = "Shelf",
+            nextAction = "Open notebook",
+            mustNotForget = "Bring cable",
+            authoredByUserId = "user-5",
+            createdAt = "2026-09-07T10:30:00Z",
+        )
+        val current = SyncStateRowCodec().encode(
+            TenantSyncState(
+                projectCache = ProjectCacheState(
+                    activeProjects = listOf(project),
+                    pages = listOf(
+                        ProjectPage(
+                            project,
+                            ProjectNotes(project.id, "Notes", 1, project.updatedAt),
+                            newest,
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        val migrated = SyncStateRowCodec().decode(
+            current.copy(schemaVersion = 5, parkingRecords = emptyList(), parkingLoadedProjectIds = emptyList()),
+        )
+
+        assertEquals(listOf(newest), migrated.projectCache.parkingRecords)
+        assertTrue(migrated.projectCache.parkingLoadedProjectIds.isEmpty())
     }
 
     @Test
@@ -157,6 +203,20 @@ class SyncStateStorageCodecTest {
             projectCache = ProjectCacheState(
                 activeProjects = listOf(project),
                 activeProjectsLoaded = true,
+                parkingRecords = listOf(
+                    ProjectParking(
+                        id = "parking-3",
+                        projectId = project.id,
+                        location = "Workbench",
+                        nextAction = "Fit bracket",
+                        mustNotForget = "Bring screws",
+                        authoredByUserId = "user-3",
+                        createdAt = "2026-09-07T10:30:00Z",
+                        occurredAt = "2026-09-07T10:25:00Z",
+                        clientId = "parking-client-3",
+                    ),
+                ),
+                parkingLoadedProjectIds = listOf(project.id),
                 commands = listOf(command),
                 projectIdMappings = listOf(ProjectIdentityMapping("local-project", project.id)),
                 projectsAwaitingNotesBaseline = listOf(project.id),

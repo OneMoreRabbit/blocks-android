@@ -22,6 +22,7 @@ import dev.blocks.android.project.ProjectMutation
 import dev.blocks.android.project.ProjectMutationStatus
 import dev.blocks.android.project.ProjectMutationType
 import dev.blocks.android.project.ProjectNotes
+import dev.blocks.android.project.ParkingHistoryPage
 import dev.blocks.android.project.ProjectPage
 import dev.blocks.android.project.ProjectParking
 import dev.blocks.android.project.ProjectService
@@ -45,7 +46,10 @@ class ProjectSyncRepository(
     private val syncStore: SyncStateStore,
     private val now: () -> String = { Instant.now().toString() },
 ) : ProjectWorkspace {
+    @Volatile
     private var activeTenantId: String? = null
+    private val backgroundLock = Any()
+    private val backgroundSaveContext = ThreadLocal<BackgroundSaveContext?>()
 
     @Synchronized
     override fun activate(session: Session) {
@@ -107,6 +111,23 @@ class ProjectSyncRepository(
     }
 
     @Synchronized
+    override fun parkingHistory(
+        session: Session,
+        projectId: String,
+        offset: Int,
+        limit: Int,
+    ): ParkingHistoryPage {
+        require(offset >= 0) { "Parking-history offset cannot be negative" }
+        require(limit > 0) { "Parking-history limit must be positive" }
+        val state = activeState(session)
+        val resolvedId = state.projectCache.projectIdMappings
+            .firstOrNull { it.provisionalId == projectId }?.serverId ?: projectId
+        val records = state.projectCache.parkingRecords.newestFirstFor(resolvedId)
+        val visible = records.drop(offset).take(limit)
+        return ParkingHistoryPage(visible, offset + visible.size < records.size)
+    }
+
+    @Synchronized
     fun blocks(session: Session): List<PhysicalBlock> = activeState(session).projectCache.blocks
 
     @Synchronized
@@ -149,6 +170,7 @@ class ProjectSyncRepository(
                     activeProjectsLoaded = true,
                     pages = state.projectCache.pages.upsert(page) { it.project.id },
                     provisionalProjectIds = (state.projectCache.provisionalProjectIds + clientId).distinct(),
+                    parkingLoadedProjectIds = (state.projectCache.parkingLoadedProjectIds + clientId).distinct(),
                 ),
                 projectDrafts = state.projectDrafts.cleanAfter(command),
             )
@@ -282,7 +304,7 @@ class ProjectSyncRepository(
             localCreatedAt = createdAt,
         )
         return commitLocal(session, command) { current ->
-            current.updatePage(projectId) { it.copy(newestParking = localParking) }.copy(
+            current.withParkingRecord(localParking).copy(
                 projectDrafts = current.projectDrafts.cleanAfter(command),
             )
         }
@@ -392,10 +414,9 @@ class ProjectSyncRepository(
         ),
     ) { it }
 
-    @Synchronized
-    override fun backgroundSync(session: Session): BackgroundSyncResult {
-        checkActive(session)
-        var state = syncStore.loadSyncState(session.tenantId)
+    override fun backgroundSync(session: Session): BackgroundSyncResult = synchronized(backgroundLock) {
+        var state = synchronized(this) { activeState(session) }
+        backgroundSaveContext.set(BackgroundSaveContext(state))
         try {
             state = legacyReplayer.replay(session, state)
             if (state.projectCache.commands.isNotEmpty()) {
@@ -405,12 +426,16 @@ class ProjectSyncRepository(
             state = synchronizeChangesBestEffort(session, state)
             state = legacyReplayer.replay(session, state)
             state = refreshInvalidatedBestEffort(session, state)
-            save(session, state)
+            state = save(session, state)
             return state.toResult()
         } catch (error: Exception) {
             error.handleMembershipRevocation(session)
-            if (error.isDeferredSync()) return syncStore.loadSyncState(session.tenantId).toResult()
+            if (error.isDeferredSync()) {
+                return synchronized(this) { activeState(session) }.toResult()
+            }
             throw error
+        } finally {
+            backgroundSaveContext.remove()
         }
     }
 
@@ -419,10 +444,11 @@ class ProjectSyncRepository(
         session: Session,
         state: TenantSyncState,
     ): TenantSyncState? = try {
-        state.mergeRemoteProjects(
+        val updated = state.mergeRemoteProjects(
             service.listProjects(session, ProjectLifecycle.ACTIVE),
             ProjectLifecycle.ACTIVE,
-        ).also { save(session, it) }
+        )
+        save(session, updated)
     } catch (error: Exception) {
         error.handleMembershipRevocation(session)
         if (!error.isDeferredSync()) throw error
@@ -507,11 +533,11 @@ class ProjectSyncRepository(
                         authoritativePage = refreshed.page,
                     )
                 }
-                save(session, state)
+                state = save(session, state)
                 command = state.projectCache.commands.first { it.operationId == command.operationId }
                 if (command.isSatisfiedByAuthoritativeState()) {
                     state = retireProjectCommand(state, command).reapplyPendingProjection()
-                    save(session, state)
+                    state = save(session, state)
                     continue
                 }
             }
@@ -524,13 +550,13 @@ class ProjectSyncRepository(
                 val outcome = sendProjectCommand(session, command)
                 state = applyOutcome(state, command, outcome)
                 state = retireProjectCommand(state, command).reapplyPendingProjection()
-                save(session, state)
+                state = save(session, state)
             } catch (error: Exception) {
                 if (error is ServiceException && error.status in setOf(401, 403)) throw error
                 if (error.isRecognizedOlderApi(command)) return state
                 if (error.isDeferredSync()) {
                     state = state.updateCommand(command.operationId) { it.copy(deliveryUncertain = true) }
-                    save(session, state)
+                    state = save(session, state)
                     return state
                 }
                 val refreshed = refreshConflictTargetBestEffort(session, state, command)
@@ -542,7 +568,7 @@ class ProjectSyncRepository(
                         authoritativePage = refreshed.page,
                     )
                 }
-                save(session, state)
+                state = save(session, state)
                 return state
             }
         }
@@ -581,7 +607,7 @@ class ProjectSyncRepository(
         }
         val prepared = original.copy(ifMatch = ifMatch)
         state = state.updateCommand(original.operationId) { prepared }
-        save(session, state)
+        state = save(session, state)
         return state to prepared
     }
 
@@ -648,7 +674,7 @@ class ProjectSyncRepository(
                     "Service acknowledged a different parking client identity"
                 }
             }
-            state.updatePage(outcome.value.projectId) { it.copy(newestParking = outcome.value) }
+            state.withParkingAcknowledgement(command, outcome.value)
         }
         is ProjectOutcome.Binding -> state.copy(
             projectCache = state.projectCache.copy(
@@ -682,7 +708,7 @@ class ProjectSyncRepository(
                     }
                 }
                 state = updated.copy(changeCursor = nextCursor)
-                save(session, state)
+                state = save(session, state)
             } while (page.hasMore)
             state
         } catch (error: Exception) {
@@ -705,6 +731,11 @@ class ProjectSyncRepository(
             )
             event.eventType in PROJECT_PAGE_EVENTS && projectId != null -> cache.copy(
                 stalePageIds = (cache.stalePageIds + projectId).distinct(),
+                parkingLoadedProjectIds = if (event.eventType == "project.parked") {
+                    cache.parkingLoadedProjectIds - projectId
+                } else {
+                    cache.parkingLoadedProjectIds
+                },
             )
             event.eventType in BLOCK_EVENTS -> cache.copy(blocksLoaded = false)
             else -> cache
@@ -743,7 +774,17 @@ class ProjectSyncRepository(
                 }
             }
         }
-        save(session, state)
+        val missingParkingHistory = (state.projectCache.activeProjects + state.projectCache.archivedProjects)
+            .map { it.id }
+            .filterNot { it in state.projectCache.provisionalProjectIds }
+            .filterNot { it in state.projectCache.parkingLoadedProjectIds }
+            .distinct()
+        missingParkingHistory.forEach { projectId ->
+            state = bestEffortRefresh(session, state) {
+                it.withParkingHistory(projectId, service.parking(session, projectId))
+            }
+        }
+        state = save(session, state)
         return state
     }
 
@@ -752,7 +793,7 @@ class ProjectSyncRepository(
         state: TenantSyncState,
         refresh: (TenantSyncState) -> TenantSyncState,
     ): TenantSyncState = try {
-        refresh(state).also { save(session, it) }
+        save(session, refresh(state))
     } catch (error: Exception) {
         if (error is ServiceException && error.status == 403) throw error
         if (!error.isDeferredSync()) throw error
@@ -809,6 +850,10 @@ class ProjectSyncRepository(
                 activeProjects = projectCache.activeProjects.filterNot { it.id == provisionalId },
                 archivedProjects = projectCache.archivedProjects.filterNot { it.id == provisionalId },
                 pages = projectCache.pages.filterNot { it.project.id == provisionalId }.upsert(page) { it.project.id },
+                parkingRecords = projectCache.parkingRecords.map {
+                    if (it.projectId == provisionalId) it.copy(projectId = serverId) else it
+                },
+                parkingLoadedProjectIds = projectCache.parkingLoadedProjectIds - provisionalId,
                 commands = commands,
                 provisionalProjectIds = projectCache.provisionalProjectIds - provisionalId,
                 projectIdMappings = (
@@ -849,7 +894,28 @@ class ProjectSyncRepository(
     }
 
     private fun TenantSyncState.applyProjection(command: ProjectMutation): TenantSyncState = when (command.type) {
-        ProjectMutationType.CREATE_PROJECT -> this
+        ProjectMutationType.CREATE_PROJECT -> {
+            val createdAt = command.localCreatedAt ?: now()
+            val project = ProjectSummary(
+                id = command.targetId,
+                tenantId = activeTenantId ?: error("No active tenant for local project projection"),
+                name = requireNotNull(command.projectName),
+                lifecycle = ProjectLifecycle.ACTIVE,
+                rowVersion = 0,
+                createdAt = createdAt,
+                updatedAt = createdAt,
+                clientId = command.clientResourceId,
+            )
+            val page = ProjectPage(project, ProjectNotes(project.id, "", 0, createdAt), null)
+            copy(
+                projectCache = projectCache.copy(
+                    activeProjects = projectCache.activeProjects.upsert(project) { it.id },
+                    pages = projectCache.pages.upsert(page) { it.project.id },
+                    provisionalProjectIds = (projectCache.provisionalProjectIds + project.id).distinct(),
+                    parkingLoadedProjectIds = (projectCache.parkingLoadedProjectIds + project.id).distinct(),
+                ),
+            )
+        }
         ProjectMutationType.RENAME_PROJECT -> updateProject(command.targetId) {
             it.copy(name = requireNotNull(command.projectName))
         }
@@ -862,18 +928,19 @@ class ProjectSyncRepository(
         ProjectMutationType.SAVE_NOTES -> updatePage(command.targetId) { page ->
             page.copy(notes = page.notes.copy(body = requireNotNull(command.notesBody)))
         }
-        ProjectMutationType.ADD_PARKING -> updatePage(command.targetId) { page ->
+        ProjectMutationType.ADD_PARKING -> {
             val parking = requireNotNull(command.parking)
-            page.copy(
-                newestParking = ProjectParking(
-                    id = command.operationId,
+            val project = projectCache.pages.first { it.project.id == command.targetId }.project
+            withParkingRecord(
+                ProjectParking(
+                    id = command.clientResourceId ?: command.operationId,
                     projectId = command.targetId,
                     location = parking.location,
                     nextAction = parking.nextAction,
                     mustNotForget = parking.mustNotForget,
                     authoredByUserId = "local",
-                    createdAt = command.localCreatedAt ?: page.project.updatedAt,
-                    occurredAt = command.localCreatedAt ?: page.project.updatedAt,
+                    createdAt = command.localCreatedAt ?: project.updatedAt,
+                    occurredAt = command.localCreatedAt ?: project.updatedAt,
                     clientId = command.clientResourceId,
                     supersedesId = command.supersedesId,
                 ),
@@ -925,12 +992,67 @@ class ProjectSyncRepository(
         }
     }
 
-    private fun TenantSyncState.withPage(page: ProjectPage): TenantSyncState = copy(
-        projectCache = projectCache.copy(
-            pages = projectCache.pages.upsert(page) { it.project.id },
-            stalePageIds = projectCache.stalePageIds - page.project.id,
-        ),
-    ).withProjectedLists()
+    private fun TenantSyncState.withPage(page: ProjectPage): TenantSyncState {
+        val withPage = copy(
+            projectCache = projectCache.copy(
+                pages = projectCache.pages.upsert(page) { it.project.id },
+                parkingRecords = page.newestParking?.let { newest ->
+                    projectCache.parkingRecords.upsertParking(newest)
+                } ?: projectCache.parkingRecords,
+                stalePageIds = projectCache.stalePageIds - page.project.id,
+            ),
+        )
+        return withPage.withProjectedLists()
+    }
+
+    private fun TenantSyncState.withParkingRecord(record: ProjectParking): TenantSyncState {
+        val records = projectCache.parkingRecords.upsertParking(record)
+        val newest = records.newestFirstFor(record.projectId).firstOrNull()
+        return copy(
+            projectCache = projectCache.copy(
+                parkingRecords = records,
+                pages = projectCache.pages.map { page ->
+                    if (page.project.id == record.projectId) page.copy(newestParking = newest) else page
+                },
+            ),
+        )
+    }
+
+    private fun TenantSyncState.withParkingAcknowledgement(
+        command: ProjectMutation,
+        acknowledged: ProjectParking,
+    ): TenantSyncState {
+        val clientId = command.clientResourceId
+        val withoutProvisional = projectCache.parkingRecords.filterNot {
+            it.id == clientId || clientId != null && it.clientId == clientId
+        }
+        return copy(projectCache = projectCache.copy(parkingRecords = withoutProvisional))
+            .withParkingRecord(acknowledged)
+    }
+
+    private fun TenantSyncState.withParkingHistory(
+        projectId: String,
+        remote: List<ProjectParking>,
+    ): TenantSyncState {
+        val pendingClientIds = projectCache.commands.filter {
+            it.type == ProjectMutationType.ADD_PARKING && it.projectIdOrTarget() == projectId
+        }.mapNotNull { it.clientResourceId }.toSet()
+        val localPending = projectCache.parkingRecords.filter {
+            it.projectId == projectId && (it.clientId ?: it.id) in pendingClientIds
+        }
+        val mergedForProject = (remote + localPending).distinctBy { it.clientId ?: it.id }
+        val records = projectCache.parkingRecords.filterNot { it.projectId == projectId } + mergedForProject
+        val newest = records.newestFirstFor(projectId).firstOrNull()
+        return copy(
+            projectCache = projectCache.copy(
+                parkingRecords = records,
+                parkingLoadedProjectIds = (projectCache.parkingLoadedProjectIds + projectId).distinct(),
+                pages = projectCache.pages.map { page ->
+                    if (page.project.id == projectId) page.copy(newestParking = newest) else page
+                },
+            ),
+        )
+    }
 
     private fun TenantSyncState.updatePage(projectId: String, update: (ProjectPage) -> ProjectPage): TenantSyncState {
         require(projectCache.pages.any { it.project.id == projectId }) { "Unknown local project $projectId" }
@@ -1123,7 +1245,111 @@ class ProjectSyncRepository(
         return syncStore.loadSyncState(session.tenantId)
     }
 
-    private fun save(session: Session, state: TenantSyncState) = syncStore.saveSyncState(session.tenantId, state)
+    private fun save(session: Session, state: TenantSyncState): TenantSyncState {
+        val context = backgroundSaveContext.get()
+        if (context == null) {
+            syncStore.saveSyncState(session.tenantId, state)
+            return state
+        }
+        return synchronized(this) {
+            checkActive(session)
+            val current = syncStore.loadSyncState(session.tenantId)
+            val merged = mergeConcurrentLocalChanges(context.baseline, state, current)
+            syncStore.saveSyncState(session.tenantId, merged)
+            context.baseline = merged
+            merged
+        }
+    }
+
+    /** Keeps local commits made while transport is waiting when a background snapshot is saved. */
+    private fun mergeConcurrentLocalChanges(
+        baseline: TenantSyncState,
+        proposed: TenantSyncState,
+        current: TenantSyncState,
+    ): TenantSyncState {
+        if (current == baseline) return proposed
+
+        val baselineCommands = baseline.projectCache.commands.associateBy { it.operationId }
+        val currentCommands = current.projectCache.commands.associateBy { it.operationId }
+        val locallyRemoved = baselineCommands.keys - currentCommands.keys
+        val mappings = proposed.projectCache.projectIdMappings
+        val locallyChanged = current.projectCache.commands.filter {
+            baselineCommands[it.operationId] != it
+        }.map { command ->
+            mappings.fold(command) { mapped, identity ->
+                mapped.remapProject(identity.provisionalId, identity.serverId)
+            }
+        }
+        val locallyChangedIds = locallyChanged.map { it.operationId }.toSet()
+        val commands = proposed.projectCache.commands.filterNot {
+            it.operationId in locallyRemoved || it.operationId in locallyChangedIds
+        } + locallyChanged
+
+        var merged = proposed.copy(
+            projectDrafts = if (current.projectDrafts != baseline.projectDrafts) {
+                mappings.fold(current.projectDrafts) { drafts, identity ->
+                    drafts.remapProject(identity.provisionalId, identity.serverId)
+                }
+            } else {
+                proposed.projectDrafts
+            },
+            projectUiPreferences = if (current.projectUiPreferences != baseline.projectUiPreferences) {
+                current.projectUiPreferences
+            } else {
+                proposed.projectUiPreferences
+            },
+            projectCache = proposed.projectCache.copy(
+                commands = commands,
+                retiredOperationIds = (
+                    proposed.projectCache.retiredOperationIds +
+                        (current.projectCache.retiredOperationIds - baseline.projectCache.retiredOperationIds.toSet())
+                    ).distinct(),
+                provisionalProjectIds = (
+                    proposed.projectCache.provisionalProjectIds +
+                        (current.projectCache.provisionalProjectIds - baseline.projectCache.provisionalProjectIds.toSet())
+                    ).distinct().filterNot { provisional ->
+                    proposed.projectCache.projectIdMappings.any { it.provisionalId == provisional }
+                },
+                parkingLoadedProjectIds = (
+                    proposed.projectCache.parkingLoadedProjectIds +
+                        (current.projectCache.parkingLoadedProjectIds -
+                            baseline.projectCache.parkingLoadedProjectIds.toSet())
+                    ).distinct().filterNot { projectId ->
+                    mappings.any { it.provisionalId == projectId }
+                },
+            ),
+        )
+
+        val baselineParking = baseline.projectCache.parkingRecords.associateBy { it.clientId ?: it.id }
+        current.projectCache.parkingRecords.filter {
+            baselineParking[it.clientId ?: it.id] != it
+        }.forEach { local ->
+            val resolvedProjectId = proposed.projectCache.projectIdMappings
+                .firstOrNull { it.provisionalId == local.projectId }?.serverId ?: local.projectId
+            merged = merged.withParkingRecord(local.copy(projectId = resolvedProjectId))
+        }
+
+        merged = merged.copy(
+            projectCache = merged.projectCache.copy(commands = commands),
+        ).reapplyPendingProjection()
+        return merged
+    }
+
+    private fun ProjectMutation.remapProject(provisionalId: String, serverId: String) = copy(
+        targetId = if (targetId == provisionalId) serverId else targetId,
+        projectId = if (projectId == provisionalId) serverId else projectId,
+        authoritativePage = authoritativePage?.let { page ->
+            if (page.project.id == provisionalId) {
+                page.copy(
+                    project = page.project.copy(id = serverId),
+                    notes = page.notes.copy(projectId = serverId),
+                    newestParking = page.newestParking?.copy(projectId = serverId),
+                )
+            } else {
+                page
+            }
+        },
+    )
 
     private fun purge(tenantId: String) {
         val syncFailure = runCatching { syncStore.clearSyncState(tenantId) }.exceptionOrNull()
@@ -1152,11 +1378,26 @@ class ProjectSyncRepository(
 
     private fun <T> List<T>.upsert(value: T, id: (T) -> String): List<T> = filterNot { id(it) == id(value) } + value
 
+    private fun List<ProjectParking>.upsertParking(value: ProjectParking): List<ProjectParking> =
+        filterNot { existing ->
+            existing.id == value.id ||
+                value.clientId != null && existing.clientId == value.clientId
+        } + value
+
+    private fun List<ProjectParking>.newestFirstFor(projectId: String): List<ProjectParking> =
+        filter { it.projectId == projectId }.sortedWith(
+            compareByDescending<ProjectParking> { it.occurredAt }
+                .thenByDescending { it.createdAt }
+                .thenByDescending { it.id },
+        )
+
     private data class ConflictRefresh(
         val state: TenantSyncState,
         val confirmed: Boolean,
         val page: ProjectPage?,
     )
+
+    private data class BackgroundSaveContext(var baseline: TenantSyncState)
 
     private sealed interface ProjectOutcome {
         data class Project(val value: ProjectSummary) : ProjectOutcome

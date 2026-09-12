@@ -5,29 +5,31 @@ import androidx.credentials.CredentialManager
 import androidx.credentials.CustomCredential
 import androidx.credentials.GetCredentialRequest
 import androidx.credentials.ClearCredentialStateRequest
-import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
+import androidx.credentials.exceptions.NoCredentialException
 import com.google.android.libraries.identity.googleid.GetGoogleIdOption
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
 
 interface IdentityProvider {
     suspend fun signIn(activity: Activity): String
-    suspend fun restore(activity: Activity): String
     suspend fun clear(activity: Activity)
 }
 
 class GoogleIdentityClient(private val serverClientId: String) : IdentityProvider {
     override suspend fun signIn(activity: Activity): String {
-        val option = GetSignInWithGoogleOption.Builder(serverClientId).build()
-        return credential(activity, GetCredentialRequest.Builder().addCredentialOption(option).build())
+        return try {
+            credential(activity, request(filterByAuthorizedAccounts = true))
+        } catch (_: NoCredentialException) {
+            credential(activity, request(filterByAuthorizedAccounts = false))
+        }
     }
 
-    override suspend fun restore(activity: Activity): String {
+    private fun request(filterByAuthorizedAccounts: Boolean): GetCredentialRequest {
         val option = GetGoogleIdOption.Builder()
             .setServerClientId(serverClientId)
-            .setFilterByAuthorizedAccounts(true)
+            .setFilterByAuthorizedAccounts(filterByAuthorizedAccounts)
             .setAutoSelectEnabled(true)
             .build()
-        return credential(activity, GetCredentialRequest.Builder().addCredentialOption(option).build())
+        return GetCredentialRequest.Builder().addCredentialOption(option).build()
     }
 
     override suspend fun clear(activity: Activity) {

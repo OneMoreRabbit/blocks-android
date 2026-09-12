@@ -22,6 +22,7 @@ import dev.blocks.android.project.ProjectIdentityMapping
 import dev.blocks.android.project.ProjectMutation
 import dev.blocks.android.project.ProjectMutationType
 import dev.blocks.android.project.ProjectPage
+import dev.blocks.android.project.ProjectParking
 import dev.blocks.android.project.ProjectSummary
 import dev.blocks.android.project.ProjectUiPreferences
 import java.io.File
@@ -48,6 +49,8 @@ internal data class EncodedSyncRows(
     val activeProjects: List<String> = emptyList(),
     val archivedProjects: List<String> = emptyList(),
     val projectPages: List<String> = emptyList(),
+    val parkingRecords: List<String> = emptyList(),
+    val parkingLoadedProjectIds: List<String> = emptyList(),
     val stalePageIds: List<String> = emptyList(),
     val blocks: List<String> = emptyList(),
     val projectCommands: List<String> = emptyList(),
@@ -85,6 +88,8 @@ internal class SyncStateRowCodec(private val gson: Gson = Gson()) {
             activeProjects = state.projectCache.activeProjects.map(gson::toJson),
             archivedProjects = state.projectCache.archivedProjects.map(gson::toJson),
             projectPages = state.projectCache.pages.map(gson::toJson),
+            parkingRecords = state.projectCache.parkingRecords.map(gson::toJson),
+            parkingLoadedProjectIds = state.projectCache.parkingLoadedProjectIds.distinct(),
             stalePageIds = state.projectCache.stalePageIds.distinct(),
             blocks = state.projectCache.blocks.map(gson::toJson),
             projectCommands = state.projectCache.commands.map(gson::toJson),
@@ -119,6 +124,18 @@ internal class SyncStateRowCodec(private val gson: Gson = Gson()) {
                 archivedProjects = rows.archivedProjects.map { gson.fromJson(it, ProjectSummary::class.java) },
                 archivedProjectsLoaded = rows.archivedProjectsLoaded,
                 pages = rows.projectPages.map { gson.fromJson(it, ProjectPage::class.java) },
+                parkingRecords = if (rows.schemaVersion >= PARKING_HISTORY_SCHEMA_VERSION) {
+                    rows.parkingRecords.map { gson.fromJson(it, ProjectParking::class.java) }
+                } else {
+                    rows.projectPages.map { gson.fromJson(it, ProjectPage::class.java) }
+                        .mapNotNull { it.newestParking }
+                        .distinctBy { it.id }
+                },
+                parkingLoadedProjectIds = if (rows.schemaVersion >= PARKING_HISTORY_SCHEMA_VERSION) {
+                    rows.parkingLoadedProjectIds.distinct()
+                } else {
+                    emptyList()
+                },
                 stalePageIds = rows.stalePageIds.distinct(),
                 blocks = rows.blocks.map { gson.fromJson(it, PhysicalBlock::class.java) },
                 blocksLoaded = rows.blocksLoaded,
@@ -182,7 +199,8 @@ internal class SyncStateRowCodec(private val gson: Gson = Gson()) {
         const val PILOT_SCHEMA_VERSION = 1
         const val LOCAL_FIRST_SCHEMA_VERSION = 4
         const val STANDALONE_SCHEMA_VERSION = 5
-        const val CURRENT_SCHEMA_VERSION = STANDALONE_SCHEMA_VERSION
+        const val PARKING_HISTORY_SCHEMA_VERSION = 6
+        const val CURRENT_SCHEMA_VERSION = PARKING_HISTORY_SCHEMA_VERSION
     }
 }
 
@@ -280,6 +298,12 @@ private fun validateProjectCache(cache: ProjectCacheState) {
     }
     require(cache.pages.map { it.project.id }.distinct().size == cache.pages.size) {
         "Cached project page identifiers are not unique"
+    }
+    require(cache.parkingRecords.map { it.id }.distinct().size == cache.parkingRecords.size) {
+        "Cached parking-record identifiers are not unique"
+    }
+    require(cache.parkingLoadedProjectIds.distinct().size == cache.parkingLoadedProjectIds.size) {
+        "Projects with loaded parking history are not unique"
     }
     require(cache.stalePageIds.distinct().size == cache.stalePageIds.size) {
         "Stale project page identifiers are not unique"
@@ -524,6 +548,13 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
             activeProjects = readRows(database, tenantId, secretKey, TABLE_ACTIVE_PROJECTS),
             archivedProjects = readRows(database, tenantId, secretKey, TABLE_ARCHIVED_PROJECTS),
             projectPages = readRows(database, tenantId, secretKey, TABLE_PROJECT_PAGES),
+            parkingRecords = readRows(database, tenantId, secretKey, TABLE_PARKING_RECORDS),
+            parkingLoadedProjectIds = readRows(
+                database,
+                tenantId,
+                secretKey,
+                TABLE_PARKING_LOADED_PROJECTS,
+            ),
             stalePageIds = readRows(database, tenantId, secretKey, TABLE_STALE_PROJECT_PAGES),
             blocks = readRows(database, tenantId, secretKey, TABLE_BLOCKS),
             projectCommands = readRows(database, tenantId, secretKey, TABLE_PROJECT_COMMANDS),
@@ -593,6 +624,14 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
         writeRows(database, tenantId, secretKey, TABLE_ACTIVE_PROJECTS, rows.activeProjects)
         writeRows(database, tenantId, secretKey, TABLE_ARCHIVED_PROJECTS, rows.archivedProjects)
         writeRows(database, tenantId, secretKey, TABLE_PROJECT_PAGES, rows.projectPages)
+        writeRows(database, tenantId, secretKey, TABLE_PARKING_RECORDS, rows.parkingRecords)
+        writeRows(
+            database,
+            tenantId,
+            secretKey,
+            TABLE_PARKING_LOADED_PROJECTS,
+            rows.parkingLoadedProjectIds,
+        )
         writeRows(database, tenantId, secretKey, TABLE_STALE_PROJECT_PAGES, rows.stalePageIds)
         writeRows(database, tenantId, secretKey, TABLE_BLOCKS, rows.blocks)
         writeRows(database, tenantId, secretKey, TABLE_PROJECT_COMMANDS, rows.projectCommands)
@@ -808,6 +847,7 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
             if (oldVersion < 2) PROJECT_MODEL_TABLES.forEach { table -> createPositionTable(database, table) }
             if (oldVersion < 3) LOCAL_FIRST_TABLES.forEach { table -> createPositionTable(database, table) }
             if (oldVersion < 4) STANDALONE_TABLES.forEach { table -> createPositionTable(database, table) }
+            if (oldVersion < 5) PARKING_HISTORY_TABLES.forEach { table -> createPositionTable(database, table) }
         }
 
         override fun onDowngrade(database: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -824,7 +864,7 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
     }
 
     private companion object {
-        const val DATABASE_VERSION = 4
+        const val DATABASE_VERSION = 5
         const val DATABASE_PREFIX = "blocks_sync_"
         const val DATABASE_KEY_PREFIX = "blocks-sync-db-v1-"
         const val LEGACY_PREFERENCES_PREFIX = "encrypted_sync_state_v1_"
@@ -839,6 +879,8 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
         const val TABLE_ACTIVE_PROJECTS = "active_projects_v3"
         const val TABLE_ARCHIVED_PROJECTS = "archived_projects_v3"
         const val TABLE_PROJECT_PAGES = "project_pages_v3"
+        const val TABLE_PARKING_RECORDS = "parking_records_v6"
+        const val TABLE_PARKING_LOADED_PROJECTS = "parking_loaded_projects_v6"
         const val TABLE_STALE_PROJECT_PAGES = "stale_project_pages_v3"
         const val TABLE_BLOCKS = "blocks_v3"
         const val TABLE_PROJECT_COMMANDS = "pending_project_commands_v3"
@@ -876,12 +918,13 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
             TABLE_PROJECT_DRAFTS,
         )
         val STANDALONE_TABLES = listOf(TABLE_PROJECT_UI_PREFERENCES)
+        val PARKING_HISTORY_TABLES = listOf(TABLE_PARKING_RECORDS, TABLE_PARKING_LOADED_PROJECTS)
         val POSITION_TABLES = listOf(
             TABLE_PROJECTS,
             TABLE_REENTRY,
             TABLE_COMMANDS,
             TABLE_RETIRED_KEYS,
-        ) + PROJECT_MODEL_TABLES + LOCAL_FIRST_TABLES + STANDALONE_TABLES
+        ) + PROJECT_MODEL_TABLES + LOCAL_FIRST_TABLES + STANDALONE_TABLES + PARKING_HISTORY_TABLES
         val TABLES = listOf(
             TABLE_METADATA,
         ) + POSITION_TABLES

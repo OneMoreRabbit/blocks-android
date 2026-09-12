@@ -26,6 +26,8 @@ data class ProjectPresentationState(
     val activeProjects: List<ProjectSummary> = emptyList(),
     val archivedProjects: List<ProjectSummary> = emptyList(),
     val projectPage: ProjectPage? = null,
+    val parkingHistory: List<ProjectParking> = emptyList(),
+    val parkingHistoryHasMore: Boolean = false,
     val drafts: FormDrafts = FormDrafts(),
     val invalidField: ProjectFormField? = null,
     val showParkingForm: Boolean = false,
@@ -54,6 +56,11 @@ class ProjectPresentationController(
 
     val isAuthenticated: Boolean
         get() = session != null
+
+    /** A cached tenant is locally open, but only an in-memory Service credential may synchronize. */
+    val canSynchronize: Boolean
+        get() = session?.identityToken?.isNotBlank() == true &&
+            !state.authenticationRequired && !state.sessionConfirmationRequired
 
     val activeTenantId: String?
         get() = session?.tenantId
@@ -139,21 +146,28 @@ class ProjectPresentationController(
         }
     }
 
-    @Synchronized
     fun synchronize() {
-        val active = activeSession()
-        state = state.copy(syncing = true, error = null)
-        applyResult(workspace.backgroundSync(active))
+        val active = synchronized(this) {
+            state = state.copy(syncing = true, error = null)
+            activeSession()
+        }
+        val result = workspace.backgroundSync(active)
+        synchronized(this) {
+            if (session?.tenantId == active.tenantId) applyResult(result)
+        }
     }
 
     @Synchronized
     fun openProject(projectId: String) {
         val active = activeSession()
         val page = workspace.projectPage(active, projectId)
+        val history = workspace.parkingHistory(active, page.project.id, 0, PARKING_HISTORY_PAGE_SIZE)
         val drafts = workspace.projectDrafts(active)
         state = state.copy(
             screen = ProjectScreen.PROJECT,
             projectPage = page,
+            parkingHistory = history.records,
+            parkingHistoryHasMore = history.hasMore,
             drafts = drafts,
             showParkingForm = drafts.projectParking[projectId]?.hasContent() == true,
             invalidField = null,
@@ -163,13 +177,14 @@ class ProjectPresentationController(
 
     @Synchronized
     fun backToDashboard() {
-        val active = activeSession()
-        val preferences = workspace.updateUiPreferences(active) { it.copy(archiveMode = false) }
+        activeSession()
         state = state.copy(
             screen = ProjectScreen.DASHBOARD,
             projectPage = null,
+            parkingHistory = emptyList(),
+            parkingHistoryHasMore = false,
             showParkingForm = false,
-            archiveMode = preferences.archiveMode,
+            archiveMode = false,
             invalidField = null,
             error = null,
         )
@@ -187,6 +202,8 @@ class ProjectPresentationController(
         state = state.copy(
             screen = ProjectScreen.DASHBOARD,
             projectPage = null,
+            parkingHistory = emptyList(),
+            parkingHistoryHasMore = false,
             archivedProjects = archived,
             archiveMode = preferences.archiveMode,
             error = null,
@@ -200,6 +217,8 @@ class ProjectPresentationController(
         state = state.copy(
             screen = ProjectScreen.DASHBOARD,
             projectPage = null,
+            parkingHistory = emptyList(),
+            parkingHistoryHasMore = false,
             archiveMode = preferences.archiveMode,
             error = null,
         )
@@ -228,6 +247,23 @@ class ProjectPresentationController(
     @Synchronized
     fun hideParkingForm() {
         state = state.copy(showParkingForm = false, invalidField = null, error = null)
+    }
+
+    @Synchronized
+    fun loadOlderParking() {
+        val active = activeSession()
+        val page = requireNotNull(state.projectPage)
+        val next = workspace.parkingHistory(
+            active,
+            page.project.id,
+            state.parkingHistory.size,
+            PARKING_HISTORY_PAGE_SIZE,
+        )
+        state = state.copy(
+            parkingHistory = (state.parkingHistory + next.records).distinctBy { it.id },
+            parkingHistoryHasMore = next.hasMore,
+            error = null,
+        )
     }
 
     @Synchronized
@@ -470,12 +506,18 @@ class ProjectPresentationController(
         }
         val updatedPage = resolvedSelectedId?.let { id -> result.cache.pages.firstOrNull { it.project.id == id } }
             ?: state.projectPage
+        val visibleHistoryCount = maxOf(state.parkingHistory.size, PARKING_HISTORY_PAGE_SIZE)
+        val history = updatedPage?.let {
+            workspace.parkingHistory(active, it.project.id, 0, visibleHistoryCount)
+        }
         val pending = result.pendingLegacyOperations + result.pendingProjectOperations
         val preferences = workspace.uiPreferences(active)
         state = state.copy(
             activeProjects = result.cache.activeProjects.sortedBy { it.name.lowercase() },
             archivedProjects = result.cache.archivedProjects.sortedBy { it.name.lowercase() },
             projectPage = updatedPage,
+            parkingHistory = history?.records.orEmpty(),
+            parkingHistoryHasMore = history?.hasMore ?: false,
             drafts = drafts,
             dashboardView = preferences.dashboardView,
             archiveMode = preferences.archiveMode,
@@ -554,6 +596,7 @@ class ProjectPresentationController(
         const val MAX_PROJECT_NAME = 200
         const val MAX_NOTES = 100_000
         const val MAX_PARKING_FIELD = 2_000
+        const val PARKING_HISTORY_PAGE_SIZE = 10
         fun renameSlot(projectId: String) = "project-rename:$projectId"
         fun notesSlot(projectId: String) = "project-notes:$projectId"
         fun parkingSlot(projectId: String) = "project-parking:$projectId"
