@@ -2,11 +2,16 @@ package dev.blocks.android
 
 import android.app.Activity
 import android.content.Context
+import android.content.res.Configuration
+import android.os.ParcelFileDescriptor
+import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
+import android.widget.GridLayout
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import androidx.core.graphics.Insets
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
@@ -32,6 +37,7 @@ import dev.blocks.android.project.BackgroundSyncResult
 import dev.blocks.android.project.BlockBinding
 import dev.blocks.android.project.BlockLookup
 import dev.blocks.android.project.PhysicalBlock
+import dev.blocks.android.project.ParkingHistoryPage
 import dev.blocks.android.project.ProjectCacheState
 import dev.blocks.android.project.ProjectLifecycle
 import dev.blocks.android.project.ProjectMutation
@@ -53,6 +59,8 @@ import dev.blocks.android.state.SessionContinuity
 import dev.blocks.android.sync.NoOpLegacyQueueReplay
 import dev.blocks.android.sync.ProjectSyncRepository
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -122,7 +130,7 @@ class MainActivityPresentationTest {
     }
 
     @Test
-    fun authorizedRestartSilentlyOpensCachedDashboardAndReconcilesInBackground() {
+    fun authorizedRestartSilentlyOpensCachedDashboardWithoutProviderOrServiceCalls() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { activity -> activity.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
 
@@ -138,8 +146,9 @@ class MainActivityPresentationTest {
                     },
                 )
             }
-            waitUntil { workspace.syncCalls > 0 }
-            assertEquals(1, identity.restoreCalls)
+            assertTrue(presentationController.state.sessionConfirmationRequired)
+            assertEquals(0, workspace.syncCalls)
+            assertEquals(0, sessionExchanges.get())
             assertEquals(0, identity.signInCalls)
         }
     }
@@ -166,7 +175,7 @@ class MainActivityPresentationTest {
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             scenario.onActivity { activity ->
                 activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
-                activity.selectDialogItem(4)
+                activity.selectDialogItem("Sign out")
             }
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_LOGIN }
 
@@ -192,7 +201,7 @@ class MainActivityPresentationTest {
             authenticatedTenant = OTHER_TENANT_ID
             scenario.onActivity { activity ->
                 activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
-                activity.selectDialogItem(3)
+                activity.selectDialogItem("Switch account")
             }
             waitFor(scenario) {
                 it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD &&
@@ -205,7 +214,7 @@ class MainActivityPresentationTest {
             authenticatedTenant = TENANT_ID
             scenario.onActivity { activity ->
                 activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
-                activity.selectDialogItem(3)
+                activity.selectDialogItem("Switch account")
             }
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD && it.hasButton("Active project") }
 
@@ -221,7 +230,7 @@ class MainActivityPresentationTest {
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             scenario.onActivity { activity ->
                 activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
-                activity.selectDialogItem(4)
+                activity.selectDialogItem("Sign out")
             }
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_LOGIN }
 
@@ -251,7 +260,15 @@ class MainActivityPresentationTest {
                 activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
                 val items = activity.activeDialog?.listView?.adapter ?: error("Settings menu is missing")
                 assertEquals(
-                    listOf("Archive", "Tile view", "About", "Switch account", "Sign out", "Remove local data"),
+                    listOf(
+                        "Archive",
+                        "Tile view",
+                        "About",
+                        "Reconnect Google account",
+                        "Switch account",
+                        "Sign out",
+                        "Remove local data",
+                    ),
                     (0 until items.count).map { items.getItem(it).toString() },
                 )
             }
@@ -278,13 +295,52 @@ class MainActivityPresentationTest {
                 activity.selectDialogItem(2)
                 val about = activity.dialogTexts().joinToString("\n")
                 assertTrue(about.contains("Blocks Android"))
-                assertTrue(about.contains("Version 0.5.1 (6)"))
+                assertTrue(about.contains("Version 0.5.2 (7)"))
                 assertTrue(about.contains("dev.blocks.android/debug"))
                 assertFalse(about.contains("tenant", ignoreCase = true))
                 assertFalse(about.contains("token", ignoreCase = true))
                 assertFalse(about.contains("http", ignoreCase = true))
                 assertFalse(about.contains("sync", ignoreCase = true))
             }
+        }
+    }
+
+    @Test
+    fun rootAndCollectionsUseTheFullPortraitLandscapeAndWideViewport() {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        shell("wm size 1000x1600")
+        shell("wm density 160")
+        try {
+            workspace.cache = workspace.cache.copy(
+                activeProjects = (0 until 12).map { index ->
+                    project().copy(id = "project-$index", name = "Project $index")
+                },
+            )
+            ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+                scenario.onActivity { activity ->
+                    activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                    activity.selectDialogItem("Tile view")
+                }
+                waitFor(scenario) { it.findViewById<GridLayout>(ProjectUiIds.PROJECT_TILES) != null }
+                waitFor(scenario) { it.resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT }
+                scenario.onActivity(::assertResponsiveDashboard)
+
+                shell("wm size 1600x1000")
+                waitFor(scenario) {
+                    it.resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE &&
+                        it.resources.configuration.screenWidthDp >= 600
+                }
+                scenario.onActivity { activity ->
+                    assertResponsiveDashboard(activity)
+                    val grid = activity.findViewById<GridLayout>(ProjectUiIds.PROJECT_TILES)
+                    assertTrue(grid.columnCount >= 3)
+                }
+            }
+        } finally {
+            shell("wm size reset")
+            shell("wm density reset")
+            instrumentation.waitForIdleSync()
         }
     }
 
@@ -357,7 +413,7 @@ class MainActivityPresentationTest {
     }
 
     @Test
-    fun coldOfflineRestartShowsOsSandboxContinuityBeforeSessionExchange() {
+    fun coldOfflineRestartAndResumeStayPromptFreeUntilDeliberateReconnect() {
         sessionExchangeOffline = true
 
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
@@ -367,38 +423,106 @@ class MainActivityPresentationTest {
                 assertFalse(activity.texts().any { it.contains("service", ignoreCase = true) })
             }
             assertEquals(0, workspace.syncCalls)
+            assertEquals(0, sessionExchanges.get())
 
             sessionExchangeOffline = false
             scenario.moveToState(Lifecycle.State.CREATED)
             scenario.moveToState(Lifecycle.State.RESUMED)
-            waitUntil { workspace.syncCalls > 0 }
             scenario.onActivity { activity ->
                 assertTrue(activity.hasButton("Active project"))
+                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                activity.selectDialogItem("Reconnect Google account")
             }
+            waitUntil { workspace.syncCalls > 0 }
+            assertEquals(1, identity.signInCalls)
+            assertEquals(1, sessionExchanges.get())
         }
     }
 
     @Test
-    fun expiredOrUnavailableProviderRestoreLeavesCachedWorkOpenAndQuiet() {
-        identity.restoreFailure = java.io.IOException("credential unavailable")
+    fun slowBackgroundApiDoesNotBlockImmediateEncryptedLocalCreate() {
+        val syncStore = AndroidEncryptedSyncStateStore(context).apply {
+            clearSyncState(TENANT_ID)
+            saveSyncState(
+                TENANT_ID,
+                TenantSyncState(
+                    projectCache = ProjectCacheState(
+                        activeProjectsLoaded = true,
+                        archivedProjectsLoaded = true,
+                        blocksLoaded = true,
+                    ),
+                ),
+            )
+        }
+        val realAccepted = AndroidEncryptedAcceptedTenantContinuityStore(context).apply {
+            clear()
+            save(AcceptedTenantContinuity(TENANT_ID, ACCOUNT_A))
+        }
+        val service = CacheProjectService().apply {
+            changesEntered = CountDownLatch(1)
+            allowChanges = CountDownLatch(1)
+        }
+        MainActivity.dependencyFactory = { activity ->
+            val drafts = AndroidEncryptedDraftStore(activity)
+            presentationController = ProjectPresentationController(
+                SessionAuthenticator { Session(TENANT_ID, it, ACCOUNT_A) },
+                ProjectSyncRepository(service, NoOpLegacyQueueReplay, drafts, AndroidEncryptedSyncStateStore(activity)),
+                newOperationId = { "slow-api-${operationIds.incrementAndGet()}" },
+            )
+            ProjectAppDependencies(
+                presentationController,
+                identity,
+                continuity,
+                realAccepted,
+                observeConnectivity = false,
+            )
+        }
 
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-            waitFor(scenario) {
-                it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD &&
-                    presentationController.state.authenticationRequired
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                activity.selectDialogItem("Reconnect Google account")
             }
+            assertTrue(service.changesEntered.await(2, TimeUnit.SECONDS))
+
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.CREATE_PROJECT).performClick()
+                activity.activeDialog?.findViewById<EditText>(ProjectUiIds.PROJECT_NAME)
+                    ?.setText("Created while Service waits") ?: error("Create-project input is missing")
+                activity.dialogButton("Create").callOnClick()
+            }
+            waitFor(scenario) { it.hasButton("Created while Service waits") }
+            assertEquals(1L, service.allowChanges.count)
+            assertTrue(
+                syncStore.loadSyncState(TENANT_ID).projectCache.activeProjects
+                    .any { it.name == "Created while Service waits" },
+            )
+            service.allowChanges.countDown()
+        }
+    }
+
+    @Test
+    fun unavailableProviderIsNotInvokedDuringOrdinaryCachedReopen() {
+        identity.signInFailure = java.io.IOException("credential unavailable")
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             scenario.onActivity { activity ->
                 assertTrue(activity.hasButton("Active project"))
                 assertFalse(activity.hasButton("Reconnect Google account"))
                 assertFalse(activity.texts().any { it.contains("credential", ignoreCase = true) })
             }
+            assertTrue(presentationController.state.sessionConfirmationRequired)
+            assertEquals(0, identity.signInCalls)
+            assertEquals(0, sessionExchanges.get())
             assertEquals(AcceptedTenantContinuity(TENANT_ID, ACCOUNT_A), acceptedTenant.load())
             assertTrue(workspace.clearedTenants.isEmpty())
         }
     }
 
     @Test
-    fun processStyleOfflineRestartReadsRealEncryptedDatabaseAndKeystoreContinuityThenReconciles() {
+    fun processStyleOfflineRestartReadsRealEncryptedDatabaseThenReconcilesOnlyAfterReconnect() {
         val syncStore = AndroidEncryptedSyncStateStore(context)
         syncStore.clearSyncState(TENANT_ID)
         syncStore.saveSyncState(
@@ -441,19 +565,23 @@ class MainActivityPresentationTest {
         ActivityScenario.launch(MainActivity::class.java).use { first ->
             waitFor(first) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             first.onActivity { assertTrue(it.hasButton("Active project")) }
-            waitUntil { exchanges.get() > 0 }
+            assertEquals(0, exchanges.get())
+            assertEquals(0, identity.signInCalls)
         }
 
         ActivityScenario.launch(MainActivity::class.java).use { restarted ->
             waitFor(restarted) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             restarted.onActivity { assertTrue(it.hasButton("Active project")) }
-            waitUntil { exchanges.get() > 1 }
+            assertEquals(0, exchanges.get())
             assertEquals(0, service.changeCalls)
 
             exchangeOnline.set(true)
-            restarted.moveToState(Lifecycle.State.CREATED)
-            restarted.moveToState(Lifecycle.State.RESUMED)
+            restarted.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                activity.selectDialogItem("Reconnect Google account")
+            }
             waitUntil { service.changeCalls > 0 }
+            assertEquals(1, exchanges.get())
             restarted.onActivity { assertTrue(it.hasButton("Active project")) }
         }
     }
@@ -598,10 +726,15 @@ class MainActivityPresentationTest {
     }
 
     @Test
-    fun backgroundServiceConfirmationOfAnotherAccountSwitchesPartitionWithoutErasingEitherAccount() {
+    fun deliberateAccountSwitchActivatesAnotherPartitionWithoutErasingEitherAccount() {
         authenticatedTenant = OTHER_TENANT_ID
 
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                activity.selectDialogItem("Switch account")
+            }
             waitFor(scenario) {
                 it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD &&
                     it.texts().contains("No active projects yet.")
@@ -621,7 +754,13 @@ class MainActivityPresentationTest {
         workspace.membershipRevoked = true
 
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                activity.selectDialogItem("Reconnect Google account")
+            }
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_LOGIN }
+            waitUntil { acceptedTenant.find(ACCOUNT_A) == null }
 
             assertEquals(null, acceptedTenant.find(ACCOUNT_A))
             assertEquals(AcceptedTenantContinuity(OTHER_TENANT_ID, ACCOUNT_B), acceptedTenant.find(ACCOUNT_B))
@@ -639,7 +778,7 @@ class MainActivityPresentationTest {
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             scenario.onActivity { activity ->
                 activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
-                activity.selectDialogItem(5)
+                activity.selectDialogItem("Remove local data")
                 assertTrue(activity.dialogTexts().any { it.contains("permanently removes") })
                 activity.dialogButton("Remove local data").callOnClick()
             }
@@ -653,7 +792,6 @@ class MainActivityPresentationTest {
 
     @Test
     fun unverifiedTokenClaimsCannotSelectAnotherTenantCache() {
-        identity.restoredToken = "header.eyJ0ZW5hbnRfaWQiOiJvdGhlci10ZW5hbnQifQ.signature"
         sessionExchangeOffline = true
 
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
@@ -760,7 +898,7 @@ class MainActivityPresentationTest {
                     activity.findViewById<EditText>(ProjectUiIds.NOTES).text.toString(),
                 )
             }
-            assertTrue(identity.restoreCalls >= 2)
+            assertEquals(0, identity.signInCalls)
         }
 
         ActivityScenario.launch(MainActivity::class.java).use { restarted ->
@@ -790,10 +928,55 @@ class MainActivityPresentationTest {
     }
 
     @Test
+    fun substantialParkingHistoryIsLocalNewestFirstProgressiveAndRestartSafe() {
+        val records = (0 until 23).map { index -> parking(index) }
+        workspace.cache = workspace.cache.copy(
+            pages = listOf(page().copy(newestParking = records.last())),
+            parkingRecords = records,
+            parkingLoadedProjectIds = listOf(PROJECT_ID),
+        )
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { it.button("Active project").performClick() }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            scenario.onActivity { activity ->
+                val text = activity.texts()
+                assertTrue(text.contains("Place 22"))
+                assertTrue(text.contains("Place 13"))
+                assertFalse(text.contains("Place 12"))
+                activity.findViewById<Button>(ProjectUiIds.LOAD_OLDER_PARKING).performClick()
+            }
+            waitFor(scenario) { it.texts().contains("Place 3") }
+            scenario.onActivity { activity ->
+                assertFalse(activity.texts().contains("Place 2"))
+                activity.findViewById<Button>(ProjectUiIds.LOAD_OLDER_PARKING).performClick()
+            }
+            waitFor(scenario) { it.texts().contains("Place 0") }
+            scenario.onActivity { activity ->
+                assertTrue(activity.findViewById<Button>(ProjectUiIds.LOAD_OLDER_PARKING) == null)
+            }
+
+            scenario.recreate()
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            scenario.onActivity { activity ->
+                assertTrue(activity.texts().contains("Place 22"))
+                assertTrue(activity.findViewById<Button>(ProjectUiIds.LOAD_OLDER_PARKING) != null)
+                assertEquals(0, identity.signInCalls)
+            }
+        }
+    }
+
+    @Test
     fun offlineSaveRetriesAutomaticallyOnResumeAndConflictNeverDropsTheEdit() {
         workspace.offline = true
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                activity.selectDialogItem("Reconnect Google account")
+            }
+            waitUntil { !presentationController.state.sessionConfirmationRequired }
             scenario.onActivity { it.button("Active project").performClick() }
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
             scenario.onActivity { activity ->
@@ -838,6 +1021,11 @@ class MainActivityPresentationTest {
     fun rejectedCredentialOffersOneControlledForegroundReauthenticationJourney() {
         workspace.rejectAuthentication = true
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                activity.selectDialogItem("Reconnect Google account")
+            }
             waitUntil { presentationController.state.authenticationRequired }
             workspace.rejectAuthentication = false
             scenario.onActivity { activity ->
@@ -850,7 +1038,7 @@ class MainActivityPresentationTest {
                 activity.screenTag() == ProjectUiIds.SCREEN_DASHBOARD &&
                     !presentationController.state.authenticationRequired
             }
-            assertEquals(1, identity.signInCalls)
+            assertEquals(2, identity.signInCalls)
         }
     }
 
@@ -869,6 +1057,24 @@ class MainActivityPresentationTest {
             Thread.sleep(50)
         }
         error("Timed out waiting for UI state: ${presentationController.state}")
+    }
+
+    private fun assertResponsiveDashboard(activity: MainActivity) {
+        val windowContent = activity.findViewById<ViewGroup>(android.R.id.content)
+        val root = activity.findViewById<ScrollView>(ProjectUiIds.ROOT_SCROLL)
+        val body = activity.findViewById<LinearLayout>(ProjectUiIds.DASHBOARD_BODY)
+        val grid = activity.findViewById<GridLayout>(ProjectUiIds.PROJECT_TILES)
+        assertEquals(windowContent.width, root.width)
+        assertEquals(windowContent.height, root.height)
+        assertEquals(body.width, grid.width)
+        assertEquals(Gravity.CENTER, body.gravity)
+        assertTrue(root.background != null)
+    }
+
+    private fun shell(command: String) {
+        val descriptor = InstrumentationRegistry.getInstrumentation().uiAutomation.executeShellCommand(command)
+        ParcelFileDescriptor.AutoCloseInputStream(descriptor).use { it.readBytes() }
+        InstrumentationRegistry.getInstrumentation().waitForIdleSync()
     }
 
     private fun Activity.screenTag() = findViewById<ViewGroup>(android.R.id.content)
@@ -920,21 +1126,13 @@ class MainActivityPresentationTest {
     }
 
     private class FakeIdentity : IdentityProvider {
-        var restoreCalls = 0
         var signInCalls = 0
         var clearCalls = 0
-        var restoredToken = "restored-token"
         var signInFailure: Exception? = null
-        var restoreFailure: Exception? = null
         override suspend fun signIn(activity: Activity): String {
             signInCalls += 1
             signInFailure?.let { throw it }
             return "identity-token"
-        }
-        override suspend fun restore(activity: Activity): String {
-            restoreCalls += 1
-            restoreFailure?.let { throw it }
-            return restoredToken
         }
         override suspend fun clear(activity: Activity) {
             clearCalls += 1
@@ -1032,6 +1230,17 @@ class MainActivityPresentationTest {
         override fun projectPage(session: Session, projectId: String): ProjectPage {
             pageCalls += 1
             return cache.pages.single()
+        }
+        override fun parkingHistory(
+            session: Session,
+            projectId: String,
+            offset: Int,
+            limit: Int,
+        ): ParkingHistoryPage {
+            val records = cache.parkingRecords.filter { it.projectId == projectId }
+                .sortedByDescending { it.occurredAt }
+            val visible = records.drop(offset).take(limit)
+            return ParkingHistoryPage(visible, offset + visible.size < records.size)
         }
         @Synchronized
         override fun backgroundSync(session: Session): BackgroundSyncResult {
@@ -1198,6 +1407,8 @@ class MainActivityPresentationTest {
         var changeCalls = 0
         @Volatile
         var offline = false
+        lateinit var changesEntered: CountDownLatch
+        lateinit var allowChanges: CountDownLatch
 
         override fun listProjects(session: Session, lifecycle: ProjectLifecycle): List<ProjectSummary> {
             failIfOffline()
@@ -1248,6 +1459,10 @@ class MainActivityPresentationTest {
         override fun changes(session: Session, cursor: String?, limit: Int): ChangePage {
             changeCalls += 1
             failIfOffline()
+            if (::changesEntered.isInitialized) {
+                changesEntered.countDown()
+                check(allowChanges.await(3, TimeUnit.SECONDS)) { "Timed out waiting to release changes" }
+            }
             return ChangePage(emptyList(), cursor, false)
         }
 
@@ -1274,5 +1489,16 @@ class MainActivityPresentationTest {
             NOW,
         )
         private fun page() = ProjectPage(project(), ProjectNotes(PROJECT_ID, "Server notes", 2, NOW), null)
+
+        private fun parking(index: Int) = ProjectParking(
+            id = "parking-$index",
+            projectId = PROJECT_ID,
+            location = "Place $index",
+            nextAction = "Action $index",
+            mustNotForget = "Remember $index",
+            authoredByUserId = "user",
+            createdAt = "2026-09-07T10:${index.toString().padStart(2, '0')}:00Z",
+            occurredAt = "2026-09-07T10:${index.toString().padStart(2, '0')}:00Z",
+        )
     }
 }

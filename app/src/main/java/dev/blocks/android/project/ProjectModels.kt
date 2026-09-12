@@ -50,6 +50,11 @@ data class ProjectPage(
     val newestParking: ProjectParking?,
 )
 
+data class ParkingHistoryPage(
+    val records: List<ProjectParking>,
+    val hasMore: Boolean,
+)
+
 data class PhysicalBlock(
     val id: String,
     val label: String,
@@ -129,6 +134,8 @@ data class ProjectCacheState(
     val archivedProjects: List<ProjectSummary> = emptyList(),
     val archivedProjectsLoaded: Boolean = false,
     val pages: List<ProjectPage> = emptyList(),
+    val parkingRecords: List<ProjectParking> = emptyList(),
+    val parkingLoadedProjectIds: List<String> = emptyList(),
     val stalePageIds: List<String> = emptyList(),
     val blocks: List<PhysicalBlock> = emptyList(),
     val blocksLoaded: Boolean = false,
@@ -220,6 +227,12 @@ interface ProjectWorkspace {
     ): ProjectUiPreferences
     fun archivedProjects(session: Session): List<ProjectSummary>
     fun projectPage(session: Session, projectId: String): ProjectPage
+    fun parkingHistory(
+        session: Session,
+        projectId: String,
+        offset: Int,
+        limit: Int,
+    ): ParkingHistoryPage
     fun backgroundSync(session: Session): BackgroundSyncResult
     fun queueCreateProject(
         session: Session,

@@ -23,6 +23,7 @@ import dev.blocks.android.project.ProjectMutation
 import dev.blocks.android.project.ProjectMutationType
 import dev.blocks.android.project.ProjectNotes
 import dev.blocks.android.project.ProjectPage
+import dev.blocks.android.project.ProjectParking
 import dev.blocks.android.project.ProjectSummary
 import dev.blocks.android.project.DashboardView
 import dev.blocks.android.project.ProjectUiPreferences
@@ -68,7 +69,7 @@ class AndroidEncryptedSyncStateStoreTest {
 
         val migrated = store.loadSyncState(CURRENT_PILOT_TENANT)
 
-        assertEquals(4, databaseVersion(CURRENT_PILOT_TENANT))
+        assertEquals(5, databaseVersion(CURRENT_PILOT_TENANT))
         assertEquals("current-pilot-operation", migrated.projectCache.commands.single().operationId)
         assertEquals("0.3", migrated.projectCache.commands.single().contractVersion)
         assertNull(migrated.projectCache.commands.single().clientResourceId)
@@ -126,6 +127,19 @@ class AndroidEncryptedSyncStateStoreTest {
                         newestParking = null,
                     ),
                 ),
+                parkingRecords = listOf(
+                    ProjectParking(
+                        id = "sensitive-parking-a",
+                        projectId = "sensitive-client-project-a",
+                        location = "Sensitive location A",
+                        nextAction = "Sensitive next action A",
+                        mustNotForget = "Sensitive reminder A",
+                        authoredByUserId = "sensitive-user-a",
+                        createdAt = "2026-09-11T12:10:00Z",
+                        occurredAt = "2026-09-11T12:09:00Z",
+                    ),
+                ),
+                parkingLoadedProjectIds = listOf("sensitive-client-project-a"),
                 commands = listOf(
                     ProjectMutation(
                         operationId = "sensitive-create-operation-a",
@@ -167,6 +181,8 @@ class AndroidEncryptedSyncStateStoreTest {
         assertFalse(databaseBytes.containsBytes("Sensitive draft A".toByteArray()))
         assertFalse(databaseBytes.containsBytes("sensitive-create-operation-a".toByteArray()))
         assertFalse(databaseBytes.containsBytes("sensitive-client-project-a".toByteArray()))
+        assertFalse(databaseBytes.containsBytes("Sensitive location A".toByteArray()))
+        assertFalse(databaseBytes.containsBytes("Sensitive reminder A".toByteArray()))
 
         val invalid = tenantAState.copy(commands = listOf(command, command))
         assertTrue(runCatching { store.saveSyncState(TENANT_A, invalid) }.isFailure)
@@ -253,7 +269,7 @@ class AndroidEncryptedSyncStateStoreTest {
         assertEquals("29", migrated.changeCursor)
         assertEquals(listOf(Project("pilot-project", "Pilot project")), migrated.projects)
         assertEquals(ProjectCacheState(), migrated.projectCache)
-        assertEquals(4, databaseVersion(PILOT_DATABASE_TENANT))
+        assertEquals(5, databaseVersion(PILOT_DATABASE_TENANT))
         assertFalse(databaseFile(PILOT_DATABASE_TENANT).readBytes().containsBytes("Pilot outcome".toByteArray()))
 
         val api03Command = ProjectMutation(

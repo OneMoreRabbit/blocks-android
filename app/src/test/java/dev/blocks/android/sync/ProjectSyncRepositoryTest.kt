@@ -41,6 +41,8 @@ import dev.blocks.android.project.RegisteredBlock
 import java.io.IOException
 import java.net.ConnectException
 import java.net.SocketTimeoutException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -48,6 +50,128 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ProjectSyncRepositoryTest {
+    @Test
+    fun localParkingHistoryIsImmediateRestartSafeAndProgressivelyReadableNewestFirst() {
+        val drafts = MemoryDrafts()
+        val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
+        val service = FakeProjectService().apply { offline = true }
+        val repository = repository(service, drafts, state)
+        repository.activate(SESSION_A)
+
+        repeat(23) { index ->
+            repository.queueParking(
+                SESSION_A,
+                PROJECT_ID,
+                ParkingDraft("Place $index", "Action $index", "Remember $index"),
+                operationId = "parking-operation-$index",
+                clientId = "parking-client-$index",
+            )
+        }
+
+        val restarted = repository(service, drafts, state)
+        restarted.activate(SESSION_A)
+        val first = restarted.parkingHistory(SESSION_A, PROJECT_ID, offset = 0, limit = 10)
+        val second = restarted.parkingHistory(SESSION_A, PROJECT_ID, offset = 10, limit = 10)
+        val third = restarted.parkingHistory(SESSION_A, PROJECT_ID, offset = 20, limit = 10)
+
+        assertEquals((22 downTo 13).map { "parking-client-$it" }, first.records.map { it.id })
+        assertEquals((12 downTo 3).map { "parking-client-$it" }, second.records.map { it.id })
+        assertEquals((2 downTo 0).map { "parking-client-$it" }, third.records.map { it.id })
+        assertTrue(first.hasMore)
+        assertTrue(second.hasMore)
+        assertFalse(third.hasMore)
+        assertEquals("Place 22", restarted.projectPage(SESSION_A, PROJECT_ID).newestParking?.location)
+    }
+
+    @Test
+    fun slowBackgroundApiCannotBlockOrOverwriteAnImmediateLocalCommit() {
+        val drafts = MemoryDrafts()
+        val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
+        val service = FakeProjectService().apply {
+            changesEntered = CountDownLatch(1)
+            allowChanges = CountDownLatch(1)
+        }
+        val repository = repository(service, drafts, state)
+        repository.activate(SESSION_A)
+        var backgroundFailure: Throwable? = null
+        val background = Thread {
+            runCatching { repository.backgroundSync(SESSION_A) }
+                .exceptionOrNull()
+                ?.let { backgroundFailure = it }
+        }
+        background.start()
+        assertTrue(service.changesEntered.await(2, TimeUnit.SECONDS))
+
+        var localResult: dev.blocks.android.project.BackgroundSyncResult? = null
+        val local = Thread {
+            localResult = repository.queueCreateProject(
+                SESSION_A,
+                "Created while API waits",
+                operationId = "concurrent-create-operation",
+                clientId = "concurrent-create-client",
+            )
+        }
+        local.start()
+        local.join(500)
+
+        assertFalse("Local encrypted commit waited for background transport", local.isAlive)
+        assertTrue(localResult?.cache?.activeProjects?.any { it.name == "Created while API waits" } == true)
+        service.allowChanges.countDown()
+        background.join(2_000)
+        assertFalse("Background sync did not complete", background.isAlive)
+        assertEquals(null, backgroundFailure)
+        val durable = state.loadSyncState(TENANT_A).projectCache
+        assertTrue(durable.activeProjects.any { it.name == "Created while API waits" })
+        assertTrue(durable.commands.any { it.operationId == "concurrent-create-operation" })
+    }
+
+    @Test
+    fun concurrentDependentEditIsAtomicallyRemappedWhenProvisionalCreateIsAcknowledged() {
+        val drafts = MemoryDrafts()
+        val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
+        val service = FakeProjectService().apply {
+            createEntered = CountDownLatch(1)
+            allowCreate = CountDownLatch(1)
+        }
+        val repository = repository(service, drafts, state)
+        repository.activate(SESSION_A)
+        repository.queueCreateProject(
+            SESSION_A,
+            "Concurrent project",
+            operationId = "create-concurrent",
+            clientId = "client-concurrent",
+        )
+
+        var backgroundFailure: Throwable? = null
+        val background = Thread {
+            runCatching { repository.backgroundSync(SESSION_A) }
+                .exceptionOrNull()
+                ?.let { backgroundFailure = it }
+        }
+        background.start()
+        assertTrue(service.createEntered.await(2, TimeUnit.SECONDS))
+
+        repository.queueSaveNotes(
+            SESSION_A,
+            "client-concurrent",
+            rowVersion = 0,
+            body = "Saved while create waits",
+            operationId = "notes-concurrent",
+        )
+        service.allowCreate.countDown()
+        background.join(2_000)
+
+        assertFalse("Background reconciliation did not complete", background.isAlive)
+        assertEquals(null, backgroundFailure)
+        val durable = state.loadSyncState(TENANT_A).projectCache
+        assertEquals(listOf(ProjectIdentityMapping("client-concurrent", PROJECT_ID)), durable.projectIdMappings)
+        assertTrue(durable.commands.isEmpty())
+        assertTrue(durable.pages.none { it.project.id == "client-concurrent" })
+        assertTrue(durable.parkingRecords.none { it.projectId == "client-concurrent" })
+        assertEquals("Saved while create waits", durable.pages.single { it.project.id == PROJECT_ID }.notes.body)
+        assertEquals(listOf("Saved while create waits"), service.savedNotesBodies)
+    }
+
     @Test
     fun emptyCacheJourneyIsImmediatelyUsableOfflineAndConvergesInDependencyOrderAfterRestart() {
         val drafts = MemoryDrafts()
@@ -860,6 +984,10 @@ class ProjectSyncRepositoryTest {
         private val parkingByClientId = mutableMapOf<String, ProjectParking>()
         private val lostCreateResponses = mutableSetOf<String>()
         val changePages = ArrayDeque<ChangePage>()
+        lateinit var changesEntered: CountDownLatch
+        lateinit var allowChanges: CountDownLatch
+        lateinit var createEntered: CountDownLatch
+        lateinit var allowCreate: CountDownLatch
 
         override fun listProjects(session: Session, lifecycle: ProjectLifecycle): List<ProjectSummary> {
             calls += "list-${lifecycle.wireValue}"
@@ -882,6 +1010,10 @@ class ProjectSyncRepositoryTest {
             }
             if (incompatibleApi) throw IncompatibleServiceApiException()
             failIfNeeded()
+            if (::createEntered.isInitialized) {
+                createEntered.countDown()
+                check(allowCreate.await(2, TimeUnit.SECONDS)) { "Timed out waiting to release create" }
+            }
             val outcome = createOutcomes.getOrPut(idempotencyKey) {
                 clientId?.let { stableClientId ->
                     projectsByClientId.getOrPut(stableClientId) {
@@ -990,7 +1122,9 @@ class ProjectSyncRepositoryTest {
             return outcome
         }
 
-        override fun parking(session: Session, projectId: String) = listOfNotNull(page(session.tenantId).newestParking)
+        override fun parking(session: Session, projectId: String) =
+            (parkingOutcomes.values + listOfNotNull(page(session.tenantId).newestParking))
+                .distinctBy { it.clientId ?: it.id }
         override fun blocks(session: Session): List<PhysicalBlock> {
             calls += "blocks"
             failIfNeeded()
@@ -1005,6 +1139,10 @@ class ProjectSyncRepositoryTest {
         override fun changes(session: Session, cursor: String?, limit: Int): ChangePage {
             calls += "changes"
             failIfNeeded()
+            if (::changesEntered.isInitialized) {
+                changesEntered.countDown()
+                check(allowChanges.await(2, TimeUnit.SECONDS)) { "Timed out waiting to release changes" }
+            }
             return if (changePages.isEmpty()) ChangePage(emptyList(), cursor, false) else changePages.removeFirst()
         }
 

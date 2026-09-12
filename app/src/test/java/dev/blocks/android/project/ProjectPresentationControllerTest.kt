@@ -200,6 +200,32 @@ class ProjectPresentationControllerTest {
     }
 
     @Test
+    fun parkingHistoryOpensNewestFirstAndLoadsOlderRecordsInBoundedPages() {
+        val records = (0 until 23).map { index -> parking(index) }
+        val workspace = FakeWorkspace().apply {
+            cache = cache.copy(
+                pages = listOf(page().copy(newestParking = records.last())),
+                parkingRecords = records,
+                parkingLoadedProjectIds = listOf(PROJECT_ID),
+            )
+        }
+        val controller = controller(workspace)
+        controller.login("identity-token")
+
+        controller.openProject(PROJECT_ID)
+        assertEquals((22 downTo 13).map { "parking-$it" }, controller.state.parkingHistory.map { it.id })
+        assertTrue(controller.state.parkingHistoryHasMore)
+
+        controller.loadOlderParking()
+        assertEquals((22 downTo 3).map { "parking-$it" }, controller.state.parkingHistory.map { it.id })
+        assertTrue(controller.state.parkingHistoryHasMore)
+
+        controller.loadOlderParking()
+        assertEquals((22 downTo 0).map { "parking-$it" }, controller.state.parkingHistory.map { it.id })
+        assertFalse(controller.state.parkingHistoryHasMore)
+    }
+
+    @Test
     fun archiveAndReopenRemainContainedDashboardActions() {
         val workspace = FakeWorkspace()
         val controller = controller(workspace)
@@ -339,6 +365,17 @@ class ProjectPresentationControllerTest {
         override fun projectPage(session: Session, projectId: String): ProjectPage {
             pageCalls += 1
             return cache.pages.single { it.project.id == projectId }
+        }
+        override fun parkingHistory(
+            session: Session,
+            projectId: String,
+            offset: Int,
+            limit: Int,
+        ): ParkingHistoryPage {
+            val records = cache.parkingRecords.filter { it.projectId == projectId }
+                .sortedByDescending { it.occurredAt }
+            val visible = records.drop(offset).take(limit)
+            return ParkingHistoryPage(visible, offset + visible.size < records.size)
         }
 
         override fun backgroundSync(session: Session): BackgroundSyncResult {
@@ -581,6 +618,17 @@ class ProjectPresentationControllerTest {
             project(),
             ProjectNotes(PROJECT_ID, "Server notes", 2, NOW),
             null,
+        )
+
+        private fun parking(index: Int) = ProjectParking(
+            id = "parking-$index",
+            projectId = PROJECT_ID,
+            location = "Place $index",
+            nextAction = "Action $index",
+            mustNotForget = "Remember $index",
+            authoredByUserId = "user",
+            createdAt = "2026-09-07T10:${index.toString().padStart(2, '0')}:00Z",
+            occurredAt = "2026-09-07T10:${index.toString().padStart(2, '0')}:00Z",
         )
     }
 }

@@ -52,10 +52,14 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.concurrent.Executors
 
 internal data class ProjectAppDependencies(
     val controller: ProjectPresentationController,
@@ -91,6 +95,10 @@ internal object ProjectUiIds {
     const val PROJECT_LIST = 1037
     const val PROJECT_TILES = 1038
     const val PARK_SHEET = 1039
+    const val ROOT_SCROLL = 1040
+    const val DASHBOARD_BODY = 1041
+    const val PARKING_HISTORY = 1042
+    const val LOAD_OLDER_PARKING = 1043
 }
 
 class MainActivity : ComponentActivity() {
@@ -100,8 +108,13 @@ class MainActivity : ComponentActivity() {
     private val continuity get() = dependencies.continuity
     private val acceptedTenantStore get() = dependencies.acceptedTenantStore
     private val uiScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val localStateDispatcher = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "blocks-local-state")
+    }.asCoroutineDispatcher()
     private lateinit var content: LinearLayout
+    private lateinit var rootScroll: ScrollView
     private var syncJob: Job? = null
+    private var credentialJob: Job? = null
     private var restoreProjectId: String? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     internal var activeDialog: AlertDialog? = null
@@ -117,13 +130,23 @@ class MainActivity : ComponentActivity() {
             gravity = Gravity.TOP
             setPadding(dp(24), dp(24), dp(24), dp(24))
             setBackgroundColor(Color.rgb(246, 243, 234))
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            )
         }
         ViewCompat.setOnApplyWindowInsetsListener(content) { view, insets ->
             val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
             view.setPadding(dp(24), systemBars.top + dp(24), dp(24), systemBars.bottom + dp(24))
             insets
         }
-        setContentView(ScrollView(this).apply { addView(content) })
+        rootScroll = ScrollView(this).apply {
+            id = ProjectUiIds.ROOT_SCROLL
+            isFillViewport = true
+            setBackgroundColor(Color.rgb(246, 243, 234))
+            addView(content)
+        }
+        setContentView(rootScroll)
         ViewCompat.requestApplyInsets(content)
         onBackPressedDispatcher.addCallback(
             this,
@@ -133,7 +156,8 @@ class MainActivity : ComponentActivity() {
                         controller.hideParkingForm()
                         render()
                     } else if (controller.state.screen == ProjectScreen.PROJECT) {
-                        runRepositoryAction { controller.backToDashboard() }
+                        controller.backToDashboard()
+                        render()
                     } else {
                         isEnabled = false
                         onBackPressedDispatcher.onBackPressed()
@@ -152,12 +176,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        if (controller.isAuthenticated) {
-            synchronizeAutomatically(
-                refreshCredential = controller.state.authenticationRequired ||
-                    controller.state.sessionConfirmationRequired,
-            )
-        }
+        if (controller.canSynchronize) synchronizeAutomatically()
     }
 
     override fun onStop() {
@@ -230,7 +249,8 @@ class MainActivity : ComponentActivity() {
             bar.addView(button("Settings") { showSettings() }.apply { id = ProjectUiIds.SETTINGS })
         } else if (controller.state.screen == ProjectScreen.PROJECT) {
             bar.addView(button("Main") {
-                runRepositoryAction { controller.backToDashboard() }
+                controller.backToDashboard()
+                render()
             }.apply { id = ProjectUiIds.MAIN })
             bar.addView(button("Park") {
                 controller.showParkingForm()
@@ -254,40 +274,84 @@ class MainActivity : ComponentActivity() {
         content.tag = ProjectUiIds.SCREEN_DASHBOARD
         val archiveMode = controller.state.archiveMode
         val projects = if (archiveMode) controller.state.archivedProjects else controller.state.activeProjects
-        content.addView(label(if (archiveMode) "Archive" else "Projects", 22f))
+        val body = LinearLayout(this).apply {
+            id = ProjectUiIds.DASHBOARD_BODY
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+        }
+        body.addView(label(if (archiveMode) "Archive" else "Projects", 22f))
         if (projects.isEmpty()) {
-            content.addView(label(if (archiveMode) "No archived projects." else "No active projects yet.", 15f))
+            body.addView(label(if (archiveMode) "No archived projects." else "No active projects yet.", 15f))
         }
         val projectContainer: ViewGroup = if (controller.state.dashboardView == DashboardView.TILES) {
             GridLayout(this).apply {
                 id = ProjectUiIds.PROJECT_TILES
-                columnCount = 2
+                columnCount = dashboardColumnCount()
+                alignmentMode = GridLayout.ALIGN_BOUNDS
+                useDefaultMargins = true
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                )
             }
         } else {
             LinearLayout(this).apply {
                 id = ProjectUiIds.PROJECT_LIST
                 orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER_HORIZONTAL
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                )
             }
         }
         projects.forEach { project ->
-            projectContainer.addView(
-                button(project.name) {
-                    if (archiveMode) confirmReopen(project) else runRepositoryAction {
-                        controller.openProject(project.id)
-                    }
-                },
-            )
+            val projectButton = button(project.name) { source ->
+                if (archiveMode) confirmReopen(project) else runRepositoryAction(source = source) {
+                    controller.openProject(project.id)
+                }
+            }
+            if (projectContainer is GridLayout) {
+                projectContainer.addView(
+                    projectButton,
+                    GridLayout.LayoutParams().apply {
+                        width = 0
+                        columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1, 1f)
+                    },
+                )
+            } else {
+                projectContainer.addView(
+                    projectButton,
+                    LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                    ),
+                )
+            }
         }
-        content.addView(projectContainer)
+        body.addView(projectContainer)
 
         if (archiveMode) {
-            content.addView(button("Main") {
-                runRepositoryAction { controller.showMainDashboard() }
+            body.addView(button("Main") { source ->
+                runRepositoryAction(source = source) { controller.showMainDashboard() }
             }.apply { id = ProjectUiIds.ARCHIVE_MAIN })
         } else {
-            content.addView(button("Create project") { showCreateProject() }.apply {
+            body.addView(button("Create project") { showCreateProject() }.apply {
                 id = ProjectUiIds.CREATE_PROJECT
             })
+        }
+        content.addView(
+            body,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ),
+        )
+        rootScroll.post {
+            val availableBodyHeight = rootScroll.height - body.top - content.paddingBottom
+            if (availableBodyHeight > 0 && body.minimumHeight != availableBodyHeight) {
+                body.minimumHeight = availableBodyHeight
+            }
         }
     }
 
@@ -297,7 +361,9 @@ class MainActivity : ComponentActivity() {
             add("Archive")
             add(viewChoice)
             add("About")
-            if (controller.state.authenticationRequired) add("Reconnect Google account")
+            if (controller.state.authenticationRequired || controller.state.sessionConfirmationRequired) {
+                add("Reconnect Google account")
+            }
             add("Switch account")
             add("Sign out")
             add("Remove local data")
@@ -364,16 +430,44 @@ class MainActivity : ComponentActivity() {
 
         content.addView(label("Notes", 17f))
         val notesValue = controller.state.drafts.projectNotes[page.project.id] ?: page.notes.body
-        val notes = input("Project notes", notesValue) { controller.updateNotes(it) }.apply {
+        val notes = input("Project notes", notesValue) { value ->
+            queueDraftUpdate { controller.updateNotes(value) }
+        }.apply {
             id = ProjectUiIds.NOTES
             minLines = 4
             gravity = Gravity.TOP
         }
         notes.markInvalid(ProjectFormField.NOTES)
         content.addView(notes)
-        content.addView(button("Save notes") {
-            runRepositoryAction(syncAfter = true) { controller.saveNotes(notes.text.toString()) }
+        content.addView(button("Save notes") { source ->
+            runRepositoryAction(source = source, syncAfter = true) {
+                controller.saveNotes(notes.text.toString())
+            }
         }.apply { id = ProjectUiIds.SAVE_NOTES })
+
+        val olderParking = controller.state.parkingHistory.filterNot { it.id == newestParking?.id }
+        if (olderParking.isNotEmpty() || controller.state.parkingHistoryHasMore) {
+            content.addView(label("Parking history", 17f, Color.rgb(53, 104, 89)))
+            val history = LinearLayout(this).apply {
+                id = ProjectUiIds.PARKING_HISTORY
+                orientation = LinearLayout.VERTICAL
+            }
+            olderParking.forEach { record ->
+                history.addView(label(record.occurredAt, 12f, Color.GRAY))
+                history.addView(label("Where I was", 12f, Color.GRAY))
+                history.addView(label(record.location, 15f))
+                history.addView(label("Next physical action", 12f, Color.GRAY))
+                history.addView(label(record.nextAction, 15f))
+                history.addView(label("Must not forget", 12f, Color.GRAY))
+                history.addView(label(record.mustNotForget, 15f))
+            }
+            content.addView(history)
+            if (controller.state.parkingHistoryHasMore) {
+                content.addView(button("Show older park messages") { source ->
+                    runRepositoryAction(source = source) { controller.loadOlderParking() }
+                }.apply { id = ProjectUiIds.LOAD_OLDER_PARKING })
+            }
+        }
 
     }
 
@@ -398,7 +492,10 @@ class MainActivity : ComponentActivity() {
         var locationValue = draft.location
         var nextActionValue = draft.nextAction
         var mustNotForgetValue = draft.mustNotForget
-        fun persist() = controller.updateParking(ParkingDraft(locationValue, nextActionValue, mustNotForgetValue))
+        fun persist() {
+            val value = ParkingDraft(locationValue, nextActionValue, mustNotForgetValue)
+            queueDraftUpdate { controller.updateParking(value) }
+        }
 
         val location = input("Where I am", locationValue) { locationValue = it; persist() }.apply {
             id = ProjectUiIds.PARKING_LOCATION
@@ -416,8 +513,8 @@ class MainActivity : ComponentActivity() {
         content.addView(location)
         content.addView(nextAction)
         content.addView(mustNotForget)
-        content.addView(button("Save park message") {
-            runRepositoryAction(syncAfter = true) {
+        content.addView(button("Save park message") { source ->
+            runRepositoryAction(source = source, syncAfter = true) {
                 controller.addParking(
                     location.text.toString(),
                     nextAction.text.toString(),
@@ -436,7 +533,9 @@ class MainActivity : ComponentActivity() {
             id = ProjectUiIds.PROJECT_NAME
             hint = "Project name"
             setText(controller.state.drafts.projectName)
-            addTextChangedListener(watcher(controller::updateProjectName))
+            addTextChangedListener(watcher { value ->
+                queueDraftUpdate { controller.updateProjectName(value) }
+            })
         }
         val dialog = AlertDialog.Builder(this)
             .setTitle("Create project")
@@ -520,7 +619,9 @@ class MainActivity : ComponentActivity() {
         val input = EditText(this).apply {
             hint = "Project name"
             setText(controller.state.drafts.projectRenames[page.project.id] ?: page.project.name)
-            addTextChangedListener(watcher(controller::updateRename))
+            addTextChangedListener(watcher { value ->
+                queueDraftUpdate { controller.updateRename(value) }
+            })
         }
         val dialog = AlertDialog.Builder(this).setTitle("Rename project").setView(input)
             .setPositiveButton("Rename", null)
@@ -589,7 +690,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun signIn() {
-        uiScope.launch {
+        if (credentialJob?.isActive == true) return
+        credentialJob = uiScope.launch {
             try {
                 authenticate(identity.signIn(this@MainActivity))
             } catch (_: CancellationException) {
@@ -597,6 +699,8 @@ class MainActivity : ComponentActivity() {
             } catch (error: Exception) {
                 handleRepositoryError(error)
                 render()
+            } finally {
+                credentialJob = null
             }
         }
     }
@@ -604,14 +708,14 @@ class MainActivity : ComponentActivity() {
     private fun restoreSignIn() {
         uiScope.launch {
             try {
-                val acceptedTenant = withContext(Dispatchers.IO) { acceptedTenantStore.load() }
+                val acceptedTenant = withContext(localStateDispatcher) { acceptedTenantStore.load() }
                 if (acceptedTenant == null) {
                     continuity.shouldRestore = false
                     controller.lock()
                     render()
                     return@launch
                 } else {
-                    withContext(Dispatchers.IO) {
+                    withContext(localStateDispatcher) {
                         controller.restoreCached(acceptedTenant.tenantId)
                         restoreProjectId?.let { projectId ->
                             controller.openProject(projectId)
@@ -619,7 +723,6 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                     render()
-                    reconcileAcceptedTenant(acceptedTenant)
                 }
             } catch (_: CancellationException) {
                 return@launch
@@ -636,7 +739,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun reauthenticate() {
-        uiScope.launch {
+        if (credentialJob?.isActive == true) return
+        credentialJob = uiScope.launch {
             try {
                 runCatching { identity.clear(this@MainActivity) }
                 authenticate(identity.signIn(this@MainActivity))
@@ -645,6 +749,8 @@ class MainActivity : ComponentActivity() {
             } catch (error: Exception) {
                 handleRepositoryError(error)
                 render()
+            } finally {
+                credentialJob = null
             }
         }
     }
@@ -659,41 +765,13 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private suspend fun reconcileAcceptedTenant(acceptedTenant: AcceptedTenantContinuity) {
-        val token = try {
-            identity.restore(this@MainActivity)
-        } catch (_: CancellationException) {
-            return
-        } catch (_: Exception) {
-            controller.pauseSynchronizationForAuthentication()
-            render()
-            return
-        }
-        try {
-            val priorTenantId = acceptedTenant.tenantId
-            withContext(Dispatchers.IO) {
-                val session = acceptServiceValidatedToken(token)
-                if (session.tenantId != priorTenantId) restoreProjectId = null
-                controller.synchronize()
-            }
-        } catch (_: CancellationException) {
-            return
-        } catch (error: AcceptedAccountBindingException) {
-            failClosedAccountBinding()
-            return
-        } catch (error: Exception) {
-            handleRepositoryError(error)
-        }
-        render()
-    }
-
     private suspend fun acceptServiceValidatedToken(token: String): Session {
         val priorTenantId = controller.activeTenantId
         val authenticated = withContext(Dispatchers.IO) { controller.authenticate(token) }
         val accountIdentity = requireNotNull(authenticated.accountIdentity) {
             "Service accepted a session without a stable account identity"
         }
-        withContext(Dispatchers.IO) {
+        withContext(localStateDispatcher) {
             acceptedTenantStore.save(AcceptedTenantContinuity(authenticated.tenantId, accountIdentity))
             controller.activateAuthenticated(authenticated)
             if (priorTenantId == authenticated.tenantId) {
@@ -711,7 +789,7 @@ class MainActivity : ComponentActivity() {
         syncJob = null
         restoreProjectId = null
         val locked = runCatching {
-            withContext(Dispatchers.IO) {
+            withContext(localStateDispatcher) {
                 controller.lock()
                 acceptedTenantStore.lock()
             }
@@ -737,7 +815,7 @@ class MainActivity : ComponentActivity() {
             continuity.shouldRestore = false
             restoreProjectId = null
             val locked = runCatching {
-                withContext(Dispatchers.IO) {
+                withContext(localStateDispatcher) {
                     controller.lock()
                     acceptedTenantStore.lock()
                 }
@@ -762,7 +840,7 @@ class MainActivity : ComponentActivity() {
 
     private fun removeActiveLocalData() {
         uiScope.launch {
-            val tenantId = controller.activeTenantId ?: withContext(Dispatchers.IO) {
+            val tenantId = controller.activeTenantId ?: withContext(localStateDispatcher) {
                 acceptedTenantStore.load()?.tenantId
             } ?: return@launch
             syncJob?.cancel()
@@ -770,7 +848,7 @@ class MainActivity : ComponentActivity() {
             continuity.shouldRestore = false
             restoreProjectId = null
             val removed = runCatching {
-                withContext(Dispatchers.IO) {
+                withContext(localStateDispatcher) {
                     controller.eraseAcceptedTenantCache(tenantId)
                     acceptedTenantStore.remove(tenantId)
                 }
@@ -783,25 +861,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun synchronizeAutomatically(refreshCredential: Boolean = false) {
-        if (!controller.isAuthenticated || syncJob?.isActive == true) return
+    private fun synchronizeAutomatically() {
+        if (!controller.canSynchronize || syncJob?.isActive == true) return
         syncJob = uiScope.launch {
-            val refreshedToken = if (refreshCredential) {
-                try {
-                    identity.restore(this@MainActivity)
-                } catch (_: CancellationException) {
-                    return@launch
-                } catch (_: Exception) {
-                    controller.pauseSynchronizationForAuthentication()
-                    render()
-                    return@launch
-                }
-            } else {
-                null
-            }
             try {
                 withContext(Dispatchers.IO) {
-                    refreshedToken?.let { acceptServiceValidatedToken(it) }
                     controller.synchronize()
                 }
             } catch (error: AcceptedAccountBindingException) {
@@ -814,14 +878,19 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun runRepositoryAction(
+        source: View? = null,
         afterRender: Boolean = true,
         syncAfter: Boolean = false,
         complete: (() -> Unit)? = null,
         action: () -> Unit,
     ) {
+        source?.let {
+            it.isEnabled = false
+            it.alpha = 0.55f
+        }
         uiScope.launch {
             try {
-                withContext(Dispatchers.IO) { action() }
+                withContext(NonCancellable + localStateDispatcher) { action() }
             } catch (error: Exception) {
                 handleRepositoryError(error)
             }
@@ -836,10 +905,7 @@ class MainActivity : ComponentActivity() {
         val manager = getSystemService(ConnectivityManager::class.java)
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                synchronizeAutomatically(
-                    refreshCredential = controller.state.authenticationRequired ||
-                        controller.state.sessionConfirmationRequired,
-                )
+                if (controller.canSynchronize) synchronizeAutomatically()
             }
         }
         runCatching { manager.registerDefaultNetworkCallback(callback) }
@@ -861,24 +927,48 @@ class MainActivity : ComponentActivity() {
         dialog.show()
     }
 
+    /** Serializes encrypted draft writes off the main thread without reordering keystrokes. */
+    private fun queueDraftUpdate(action: () -> Unit) {
+        uiScope.launch {
+            try {
+                withContext(NonCancellable + localStateDispatcher) { action() }
+            } catch (error: Exception) {
+                handleRepositoryError(error)
+                render()
+            }
+        }
+    }
+
     private suspend fun handleRepositoryError(error: Exception) {
         val revokedTenantId = controller.reportRepositoryError(error)
         if (revokedTenantId != null) {
-            syncJob?.cancel()
+            val failingJob = currentCoroutineContext()[Job]
+            syncJob?.takeIf { it !== failingJob }?.cancel()
             syncJob = null
             continuity.shouldRestore = false
             restoreProjectId = null
-            runCatching { withContext(Dispatchers.IO) { acceptedTenantStore.remove(revokedTenantId) } }
-            runCatching { identity.clear(this@MainActivity) }
+            withContext(NonCancellable) {
+                runCatching {
+                    withContext(localStateDispatcher) { acceptedTenantStore.remove(revokedTenantId) }
+                }
+                runCatching { identity.clear(this@MainActivity) }
+            }
         }
     }
 
     override fun onDestroy() {
         uiScope.cancel()
+        localStateDispatcher.close()
         super.onDestroy()
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    private fun dashboardColumnCount(): Int = when {
+        resources.configuration.screenWidthDp >= 840 -> 4
+        resources.configuration.screenWidthDp >= 600 -> 3
+        else -> 2
+    }
 
     internal companion object {
         private const val STATE_PROJECT_ID = "project_id"
