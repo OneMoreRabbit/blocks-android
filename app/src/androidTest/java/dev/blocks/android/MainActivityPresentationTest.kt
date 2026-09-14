@@ -62,12 +62,14 @@ import dev.blocks.android.state.AndroidEncryptedSyncStateStore
 import dev.blocks.android.state.SessionContinuity
 import dev.blocks.android.sync.NoOpLegacyQueueReplay
 import dev.blocks.android.sync.ProjectSyncRepository
+import dev.blocks.android.tag.DirectTagWritePlan
 import dev.blocks.android.tag.LocalBlockOperation
 import dev.blocks.android.tag.LocalBlockOperationType
 import dev.blocks.android.tag.LocalBlockRecord
 import dev.blocks.android.tag.LocalBlockState
 import dev.blocks.android.tag.LocalTagResolution
 import dev.blocks.android.tag.NdefLocatorCodec
+import dev.blocks.android.tag.NfcClearResult
 import dev.blocks.android.tag.NfcProgrammingResult
 import dev.blocks.android.tag.NfcTagHandle
 import dev.blocks.android.tag.NfcTagPlatform
@@ -190,7 +192,7 @@ class MainActivityPresentationTest {
     }
 
     @Test
-    fun verifiedNfcProgrammingSurvivesActivityStopAndColdTapOpensTheLocalProjectOffline() {
+    fun verifiedNfcProgrammingCommitsOnlyAfterReadBackAndColdViewIntentOpensOffline() {
         lateinit var locator: TagLocator
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
@@ -200,11 +202,10 @@ class MainActivityPresentationTest {
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
             scenario.onActivity { activity ->
                 activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS).performClick()
-                activity.selectDialogItem("Set tag")
-                activity.dialogInput().setText("Desk block")
-                activity.dialogButton("Continue").performClick()
+                activity.selectDialogItem("Set Tag")
             }
             waitUntil { nfc.readerActive }
+            assertTrue(workspace.cache.localBlocks.isEmpty())
             nfc.tap()
             waitUntil { workspace.cache.localBlocks.singleOrNull()?.state == LocalBlockState.ACTIVE }
             val block = workspace.cache.localBlocks.single()
@@ -218,11 +219,9 @@ class MainActivityPresentationTest {
         }
 
         workspace.offline = true
-        val message = NdefLocatorCodec.message(locator)
         val launchIntent = Intent(context, MainActivity::class.java).apply {
-            action = NfcAdapter.ACTION_NDEF_DISCOVERED
+            action = Intent.ACTION_VIEW
             data = Uri.parse(locator.encoded)
-            putExtra(NfcAdapter.EXTRA_NDEF_MESSAGES, arrayOf(message))
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
         }
         val instrumentation = InstrumentationRegistry.getInstrumentation()
@@ -231,7 +230,6 @@ class MainActivityPresentationTest {
             waitUntilOnActivity(relaunched) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
             instrumentation.runOnMainSync {
                 assertTrue(relaunched.texts().contains("Active project"))
-                assertFalse(relaunched.intent.hasExtra(NfcAdapter.EXTRA_NDEF_MESSAGES))
                 assertEquals(null, relaunched.intent.data)
             }
             assertEquals(0, workspace.syncCalls)
@@ -241,95 +239,193 @@ class MainActivityPresentationTest {
     }
 
     @Test
-    fun qrFallbackActivatesTheSameLocatorAndQrScanRoutesWithoutAnotherDestination() {
+    fun warmOfflineViewIntentUsesOnlyCurrentTenantCacheAndContainsMalformedOrUnknownValues() {
+        val token = OpaqueTagToken.fromBytes(ByteArray(32) { (it + 13).toByte() })
+        workspace.cache = workspace.cache.copy(
+            localBlocks = listOf(
+                LocalBlockRecord(
+                    clientBlockId = "warm-block",
+                    token = token,
+                    label = "Active project",
+                    state = LocalBlockState.ACTIVE,
+                    intendedProjectId = PROJECT_ID,
+                    boundProjectId = PROJECT_ID,
+                    createdAt = NOW,
+                    verifiedAt = NOW,
+                    activationMedium = TagActivationMedium.NFC,
+                ),
+            ),
+        )
+        workspace.offline = true
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { activity ->
+                activity.handleIncomingTagIntent(
+                    Intent(Intent.ACTION_VIEW, Uri.parse(TagLocator.create(token).encoded)),
+                )
+            }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            scenario.onActivity { activity -> activity.findViewById<Button>(ProjectUiIds.MAIN).performClick() }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+
+            scenario.onActivity { activity ->
+                activity.handleIncomingTagIntent(
+                    Intent(Intent.ACTION_VIEW, Uri.parse("blocks://tag/v2/not-supported")),
+                )
+            }
+            waitFor(scenario) { it.dialogTexts().contains("Tag not recognized") }
+            scenario.onActivity { activity ->
+                assertEquals(ProjectUiIds.SCREEN_DASHBOARD, activity.screenTag())
+                activity.dialogButton("Done").performClick()
+                val unknown = TagLocator.create(OpaqueTagToken.fromBytes(ByteArray(32) { (it + 51).toByte() }))
+                activity.handleIncomingTagIntent(
+                    Intent(Intent.ACTION_VIEW, Uri.parse(unknown.encoded)),
+                )
+            }
+            waitFor(scenario) { it.dialogTexts().contains("Tag not available") }
+            assertEquals(0, workspace.syncCalls)
+            scenario.onActivity { it.dialogButton("Done").performClick() }
+        }
+    }
+
+    @Test
+    fun viewQrUsesTheNewestActiveTagAndNeverShowsTheRawLocator() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             scenario.onActivity { activity -> activity.button("Active project").performClick() }
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
             scenario.onActivity { activity ->
                 activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS).performClick()
-                activity.selectDialogItem("Set tag")
-                activity.dialogInput().setText("QR block")
-                activity.dialogButton("Continue").performClick()
+                activity.selectDialogItem("Set Tag")
             }
             waitUntil { nfc.readerActive }
-            scenario.onActivity { it.dialogButton("Use QR instead").performClick() }
+            nfc.tap()
+            waitUntil { workspace.cache.localBlocks.singleOrNull()?.state == LocalBlockState.ACTIVE }
+            scenario.onActivity { activity ->
+                activity.dialogButton("Done").performClick()
+                activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS).performClick()
+                activity.selectDialogItem("View QR")
+            }
             waitFor(scenario) { activity ->
-                workspace.cache.localBlocks.singleOrNull()?.activationMedium == TagActivationMedium.QR &&
-                    activity.activeDialog?.findViewById<android.widget.ImageView>(ProjectUiIds.TAG_QR) != null
+                activity.activeDialog?.findViewById<android.widget.ImageView>(ProjectUiIds.TAG_QR) != null
             }
             scenario.onActivity { activity ->
                 assertTrue(requireNotNull(activity.activeDialog).findViewById<android.widget.ImageView>(ProjectUiIds.TAG_QR) != null)
+                assertFalse(activity.dialogTexts().any { it.contains("blocks://tag/") })
+                assertTrue(activity.dialogButton("Share").isShown)
+            }
+        }
+    }
+
+    @Test
+    fun viewQrWithoutAnActiveTagHasAContainedSetTagAction() {
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { it.button("Active project").performClick() }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS).performClick()
+                activity.selectDialogItem("View QR")
+            }
+            waitFor(scenario) { it.dialogTexts().contains("No active tag") }
+            scenario.onActivity { activity ->
+                assertTrue(activity.dialogTexts().any { it.contains("Set a tag") })
+                activity.dialogButton("Set Tag").performClick()
+            }
+            waitUntil { nfc.readerActive }
+            assertTrue(workspace.cache.localBlocks.isEmpty())
+            scenario.onActivity { it.dialogButton("Cancel").performClick() }
+        }
+    }
+
+    @Test
+    fun everySetTagInvocationIsFreshAndFailureOrCancellationClaimsNoAssociation() {
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { it.button("Active project").performClick() }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS).performClick()
+                activity.selectDialogItem("Set Tag")
+            }
+            waitUntil { nfc.readerActive }
+            scenario.onActivity { it.dialogButton("Cancel").performClick() }
+            assertTrue(workspace.cache.localBlocks.isEmpty())
+
+            nfc.result = NfcProgrammingResult.WriteUncertain
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS).performClick()
+                activity.selectDialogItem("Set Tag")
+            }
+            waitUntil { nfc.readerActive }
+            nfc.tap()
+            waitFor(scenario) { it.dialogTexts().contains("Tag not set") }
+            assertTrue(workspace.cache.localBlocks.isEmpty())
+
+            nfc.result = NfcProgrammingResult.Verified()
+            scenario.onActivity { activity ->
                 activity.dialogButton("Done").performClick()
-                activity.findViewById<Button>(ProjectUiIds.MAIN).performClick()
+                activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS).performClick()
+                activity.selectDialogItem("Set Tag")
             }
-            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
-            val locator = TagLocator.create(workspace.cache.localBlocks.single().token)
-            scenario.onActivity { it.handleQrText(locator.encoded) }
-            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
-
-            assertEquals(ProjectScreen.PROJECT, presentationController.state.screen)
-            assertEquals(PROJECT_ID, presentationController.state.projectPage?.project?.id)
+            waitUntil { nfc.readerActive }
+            nfc.tap()
+            waitUntil { workspace.cache.localBlocks.singleOrNull()?.state == LocalBlockState.ACTIVE }
+            assertEquals(3, workspace.preparedTagTokens.distinct().size)
+            assertEquals(2, nfc.programmedLocators.distinct().size)
         }
     }
 
     @Test
-    fun unfinishedProgrammingMustResumeTheSavedLocatorBeforeAnotherTagCanBeCreated() {
+    fun overwriteAndClearChangeAssociationOnlyAfterVerifiedPhysicalSuccess() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             scenario.onActivity { it.button("Active project").performClick() }
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
             scenario.onActivity { activity ->
                 activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS).performClick()
-                activity.selectDialogItem("Set tag")
-                activity.dialogInput().setText("Unfinished block")
-                activity.dialogButton("Continue").performClick()
-            }
-            waitUntil { nfc.readerActive }
-            val pending = workspace.cache.localBlocks.single()
-            scenario.onActivity { it.dialogButton("Close").performClick() }
-
-            scenario.onActivity { activity ->
-                activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS).performClick()
-                activity.selectDialogItem("Set tag")
-            }
-            waitFor(scenario) { it.dialogTexts().contains("Resume unfinished tag") }
-            assertEquals(listOf(pending), workspace.cache.localBlocks)
-            scenario.onActivity { it.dialogButton("Resume").performClick() }
-            waitUntil { nfc.readerActive }
-            assertEquals(pending.token, workspace.cache.localBlocks.single().token)
-        }
-    }
-
-    @Test
-    fun unknownBlocksTagRequiresExplicitConfirmationAndTheSameTagBeforeReplacement() {
-        val existingLocator = TagLocator.create(
-            OpaqueTagToken.fromBytes(ByteArray(32) { (it + 23).toByte() }),
-        )
-        nfc.result = NfcProgrammingResult.ExistingBlocksTag(existingLocator)
-        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
-            scenario.onActivity { it.button("Active project").performClick() }
-            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
-            scenario.onActivity { activity ->
-                activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS).performClick()
-                activity.selectDialogItem("Set tag")
-                activity.dialogInput().setText("Replacement block")
-                activity.dialogButton("Continue").performClick()
+                activity.selectDialogItem("Set Tag")
             }
             waitUntil { nfc.readerActive }
             nfc.tap()
-            waitFor(scenario) { it.dialogTexts().contains("Replace unknown Blocks tag?") }
-            assertEquals(LocalBlockState.AWAITING_WRITE, workspace.cache.localBlocks.single().state)
-            assertEquals(null, nfc.lastAuthorizedReplacementFingerprint)
+            waitUntil { workspace.cache.localBlocks.singleOrNull()?.state == LocalBlockState.ACTIVE }
+            val first = workspace.cache.localBlocks.single()
 
-            scenario.onActivity { it.dialogButton("Replace on next tap").performClick() }
+            nfc.result = NfcProgrammingResult.Verified(TagLocator.create(first.token))
+            scenario.onActivity { activity ->
+                activity.dialogButton("Done").performClick()
+                activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS).performClick()
+                activity.selectDialogItem("Set Tag")
+            }
             waitUntil { nfc.readerActive }
-            nfc.result = NfcProgrammingResult.Verified
             nfc.tap()
-            waitUntil { workspace.cache.localBlocks.single().state == LocalBlockState.ACTIVE }
-            assertEquals(existingLocator.token.fingerprint(), nfc.lastAuthorizedReplacementFingerprint)
-            assertEquals(2, nfc.programCalls)
+            waitUntil {
+                workspace.cache.localBlocks.singleOrNull { it.state == LocalBlockState.ACTIVE }?.token != first.token
+            }
+            assertEquals(LocalBlockState.UNBOUND, workspace.cache.localBlocks.single { it.token == first.token }.state)
+            val replacement = workspace.cache.localBlocks.single { it.state == LocalBlockState.ACTIVE }
+
+            nfc.clearResult = NfcClearResult.ReadOnly
+            scenario.onActivity { activity ->
+                activity.dialogButton("Done").performClick()
+                activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS).performClick()
+                activity.selectDialogItem("Clear Tags")
+            }
+            waitUntil { nfc.readerActive }
+            nfc.tap()
+            waitFor(scenario) { it.dialogTexts().contains("Tag not cleared") }
+            assertEquals(LocalBlockState.ACTIVE, workspace.cache.localBlocks.single { it.token == replacement.token }.state)
+
+            nfc.clearResult = NfcClearResult.Verified(TagLocator.create(replacement.token))
+            scenario.onActivity { activity ->
+                activity.dialogButton("Done").performClick()
+                activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS).performClick()
+                activity.selectDialogItem("Clear Tags")
+            }
+            waitUntil { nfc.readerActive }
+            nfc.tap()
+            waitUntil { workspace.cache.localBlocks.none { it.state == LocalBlockState.ACTIVE } }
         }
     }
 
@@ -426,7 +522,6 @@ class MainActivityPresentationTest {
                 assertEquals(
                     listOf(
                         "Archive",
-                        "Scan QR",
                         "Tile view",
                         "About",
                         "Reconnect Google account",
@@ -460,7 +555,7 @@ class MainActivityPresentationTest {
                 activity.selectDialogItem("About")
                 val about = activity.dialogTexts().joinToString("\n")
                 assertTrue(about.contains("Blocks Android"))
-                assertTrue(about.contains("Version 0.6.0 (8)"))
+                assertTrue(about.contains("Version 0.6.1 (9)"))
                 assertTrue(about.contains("dev.blocks.android/debug"))
                 assertFalse(about.contains("tenant", ignoreCase = true))
                 assertFalse(about.contains("token", ignoreCase = true))
@@ -987,7 +1082,7 @@ class MainActivityPresentationTest {
                 val projectSettings = activity.activeDialog?.listView?.adapter
                     ?: error("Project Settings is missing")
                 assertEquals(
-                    listOf("Set tag", "Manage tags", "Scan QR", "Rename", "Archive"),
+                    listOf("Set Tag", "View QR", "Clear Tags", "Rename", "Archive"),
                     (0 until projectSettings.count).map { projectSettings.getItem(it).toString() },
                 )
                 activity.dialogButton("Cancel").callOnClick()
@@ -1110,6 +1205,11 @@ class MainActivityPresentationTest {
                 assertTrue(text.contains("Place 22"))
                 assertTrue(text.contains("Place 13"))
                 assertFalse(text.contains("Place 12"))
+                assertEquals(
+                    8,
+                    activity.findViewById<ViewGroup>(ProjectUiIds.PARKING_HISTORY)
+                        .descendants().count { it.id == ProjectUiIds.PARKING_HISTORY_DIVIDER },
+                )
                 activity.findViewById<Button>(ProjectUiIds.LOAD_OLDER_PARKING).performClick()
             }
             waitFor(scenario) { it.texts().contains("Place 3") }
@@ -1120,6 +1220,11 @@ class MainActivityPresentationTest {
             waitFor(scenario) { it.texts().contains("Place 0") }
             scenario.onActivity { activity ->
                 assertTrue(activity.findViewById<Button>(ProjectUiIds.LOAD_OLDER_PARKING) == null)
+                assertEquals(
+                    21,
+                    activity.findViewById<ViewGroup>(ProjectUiIds.PARKING_HISTORY)
+                        .descendants().count { it.id == ProjectUiIds.PARKING_HISTORY_DIVIDER },
+                )
             }
 
             scenario.recreate()
@@ -1309,9 +1414,11 @@ class MainActivityPresentationTest {
         override val isEnabled = true
         @Volatile
         var readerActive = false
-        var result: NfcProgrammingResult = NfcProgrammingResult.Verified
-        var lastAuthorizedReplacementFingerprint: String? = null
+        var result: NfcProgrammingResult = NfcProgrammingResult.Verified()
+        var clearResult: NfcClearResult = NfcClearResult.Verified()
         var programCalls = 0
+        var clearCalls = 0
+        val programmedLocators = mutableListOf<TagLocator>()
         private var callback: ((NfcTagHandle) -> Unit)? = null
 
         override fun startReader(onTag: (NfcTagHandle) -> Unit) {
@@ -1326,11 +1433,15 @@ class MainActivityPresentationTest {
         override fun programAndVerify(
             handle: NfcTagHandle,
             locator: TagLocator,
-            authorizedReplacementFingerprint: String?,
         ): NfcProgrammingResult {
             programCalls += 1
-            lastAuthorizedReplacementFingerprint = authorizedReplacementFingerprint
+            programmedLocators += locator
             return result
+        }
+
+        override fun clearAndVerify(handle: NfcTagHandle): NfcClearResult {
+            clearCalls += 1
+            return clearResult
         }
 
         fun tap() {
@@ -1423,6 +1534,7 @@ class MainActivityPresentationTest {
         val deactivatedTenants = mutableListOf<String>()
         val clearedTenants = mutableListOf<String>()
         val mutations = mutableListOf<String>()
+        val preparedTagTokens = mutableListOf<OpaqueTagToken>()
 
         override fun activate(session: Session) {
             activeTenantId = session.tenantId
@@ -1458,6 +1570,62 @@ class MainActivityPresentationTest {
                 .sortedByDescending { it.occurredAt }
             val visible = records.drop(offset).take(limit)
             return ParkingHistoryPage(visible, offset + visible.size < records.size)
+        }
+        override fun prepareDirectTagWrite(
+            session: Session,
+            projectId: String,
+            label: String,
+            clientBlockId: String,
+            token: OpaqueTagToken,
+            registrationOperationId: String,
+            bindingOperationId: String,
+        ): DirectTagWritePlan {
+            preparedTagTokens += token
+            return DirectTagWritePlan(
+                LocalBlockRecord(
+                    clientBlockId = clientBlockId,
+                    token = token,
+                    label = label,
+                    state = LocalBlockState.AWAITING_WRITE,
+                    intendedProjectId = projectId,
+                    registrationOperationId = registrationOperationId,
+                    initialBindingOperationId = bindingOperationId,
+                    createdAt = NOW,
+                ),
+            )
+        }
+        override fun commitVerifiedDirectTagWrite(
+            session: Session,
+            plan: DirectTagWritePlan,
+            replacedToken: OpaqueTagToken?,
+        ): BackgroundSyncResult {
+            replacedToken?.let { token ->
+                cache.localBlocks.firstOrNull {
+                    it.token == token && it.state == LocalBlockState.ACTIVE && it.boundProjectId != null
+                }?.let { replaced ->
+                    unbindLocalBlock(session, replaced.clientBlockId, "replace-${plan.block.clientBlockId}")
+                }
+            }
+            cache = cache.copy(localBlocks = cache.localBlocks + plan.block)
+            return completeTagProgramming(
+                session,
+                plan.block.clientBlockId,
+                plan.block.token,
+                TagActivationMedium.NFC,
+            )
+        }
+        override fun commitVerifiedDirectTagClear(
+            session: Session,
+            erasedToken: OpaqueTagToken?,
+            operationId: String,
+        ): BackgroundSyncResult {
+            val block = erasedToken?.let { token -> cache.localBlocks.firstOrNull { it.token == token } }
+                ?: return result()
+            return if (block.state == LocalBlockState.ACTIVE && block.boundProjectId != null) {
+                unbindLocalBlock(session, block.clientBlockId, operationId)
+            } else {
+                result()
+            }
         }
         override fun beginTagProgramming(
             session: Session,

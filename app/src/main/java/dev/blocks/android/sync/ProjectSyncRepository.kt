@@ -35,6 +35,7 @@ import dev.blocks.android.tag.LocalBlockOperationType
 import dev.blocks.android.tag.LocalBlockRecord
 import dev.blocks.android.tag.LocalBlockState
 import dev.blocks.android.tag.LocalTagResolution
+import dev.blocks.android.tag.DirectTagWritePlan
 import dev.blocks.android.tag.OpaqueTagToken
 import dev.blocks.android.tag.TagActivationMedium
 import dev.blocks.android.tag.TagProgrammingFailure
@@ -137,6 +138,167 @@ class ProjectSyncRepository(
 
     @Synchronized
     override fun localBlocks(session: Session): List<LocalBlockRecord> = activeState(session).projectCache.localBlocks
+
+    @Synchronized
+    override fun prepareDirectTagWrite(
+        session: Session,
+        projectId: String,
+        label: String,
+        clientBlockId: String,
+        token: OpaqueTagToken,
+        registrationOperationId: String,
+        bindingOperationId: String,
+    ): DirectTagWritePlan {
+        require(label.isNotBlank()) { "The project name cannot be blank" }
+        val state = activeState(session)
+        val resolvedProjectId = state.projectCache.resolveProjectId(projectId)
+        require(state.projectCache.pages.any { it.project.id == resolvedProjectId }) {
+            "The selected project is not available in saved local data"
+        }
+        require(state.projectCache.localBlocks.none { it.clientBlockId == clientBlockId }) {
+            "The local block identity already exists"
+        }
+        require(state.projectCache.localBlocks.none { it.token == token }) {
+            "The local tag token already exists"
+        }
+        return DirectTagWritePlan(
+            LocalBlockRecord(
+                clientBlockId = clientBlockId,
+                token = token,
+                label = label.take(MAX_BLOCK_LABEL),
+                state = LocalBlockState.AWAITING_WRITE,
+                intendedProjectId = resolvedProjectId,
+                registrationOperationId = registrationOperationId,
+                initialBindingOperationId = bindingOperationId,
+                createdAt = now(),
+            ),
+        )
+    }
+
+    @Synchronized
+    override fun commitVerifiedDirectTagWrite(
+        session: Session,
+        plan: DirectTagWritePlan,
+        replacedToken: OpaqueTagToken?,
+    ): BackgroundSyncResult {
+        val state = activeState(session)
+        val block = plan.block
+        require(block.state == LocalBlockState.AWAITING_WRITE) { "The direct tag plan is invalid" }
+        require(state.projectCache.localBlocks.none { it.clientBlockId == block.clientBlockId }) {
+            "The direct tag plan was already committed"
+        }
+        require(state.projectCache.localBlocks.none { it.token == block.token }) {
+            "The verified tag token already exists"
+        }
+        val projectId = state.projectCache.resolveProjectId(requireNotNull(block.intendedProjectId))
+        require(state.projectCache.pages.any { it.project.id == projectId }) {
+            "The selected project is not available in saved local data"
+        }
+
+        var blocks = state.projectCache.localBlocks
+        var operations = state.projectCache.localBlockOperations
+        val replaced = replacedToken?.let { token -> blocks.firstOrNull { it.token == token } }
+        if (replaced != null) {
+            if (replaced.state in PENDING_TAG_STATES && operations.none { it.clientBlockId == replaced.clientBlockId }) {
+                blocks = blocks.filterNot { it.clientBlockId == replaced.clientBlockId }
+            } else if (replaced.state == LocalBlockState.ACTIVE && replaced.boundProjectId != null) {
+                val unbindId = newOperationIdentity()
+                operations = operations + LocalBlockOperation(
+                    operationId = unbindId,
+                    type = LocalBlockOperationType.UNBIND_BLOCK,
+                    clientBlockId = replaced.clientBlockId,
+                    dependsOnOperationId = operations.lastOrNull {
+                        it.clientBlockId == replaced.clientBlockId
+                    }?.operationId,
+                    createdAt = now(),
+                )
+                blocks = blocks.replaceBlock(
+                    replaced.copy(
+                        state = LocalBlockState.UNBOUND,
+                        intendedProjectId = null,
+                        boundProjectId = null,
+                    ),
+                )
+            }
+        }
+
+        val registrationId = requireNotNull(block.registrationOperationId)
+        val bindingId = requireNotNull(block.initialBindingOperationId)
+        val verifiedAt = now()
+        val active = block.copy(
+            state = LocalBlockState.ACTIVE,
+            boundProjectId = projectId,
+            verifiedAt = verifiedAt,
+            activationMedium = TagActivationMedium.NFC,
+        )
+        operations = operations + LocalBlockOperation(
+            operationId = registrationId,
+            type = LocalBlockOperationType.REGISTER_BLOCK,
+            clientBlockId = block.clientBlockId,
+            token = block.token,
+            label = block.label,
+            createdAt = block.createdAt,
+        ) + LocalBlockOperation(
+            operationId = bindingId,
+            type = LocalBlockOperationType.BIND_BLOCK,
+            clientBlockId = block.clientBlockId,
+            projectId = projectId,
+            dependsOnOperationId = registrationId,
+            createdAt = verifiedAt,
+        )
+        val updated = state.copy(
+            projectCache = state.projectCache.copy(
+                localBlocks = blocks + active,
+                localBlockOperations = operations,
+            ),
+        )
+        save(session, updated)
+        return updated.toResult()
+    }
+
+    @Synchronized
+    override fun commitVerifiedDirectTagClear(
+        session: Session,
+        erasedToken: OpaqueTagToken?,
+        operationId: String,
+    ): BackgroundSyncResult {
+        val state = activeState(session)
+        val block = erasedToken?.let { token -> state.projectCache.localBlocks.firstOrNull { it.token == token } }
+            ?: return state.toResult()
+        if (block.state in PENDING_TAG_STATES &&
+            state.projectCache.localBlockOperations.none { it.clientBlockId == block.clientBlockId }
+        ) {
+            val updated = state.copy(
+                projectCache = state.projectCache.copy(
+                    localBlocks = state.projectCache.localBlocks.filterNot {
+                        it.clientBlockId == block.clientBlockId
+                    },
+                ),
+            )
+            save(session, updated)
+            return updated.toResult()
+        }
+        if (block.state != LocalBlockState.ACTIVE || block.boundProjectId == null) return state.toResult()
+        val operation = LocalBlockOperation(
+            operationId = operationId,
+            type = LocalBlockOperationType.UNBIND_BLOCK,
+            clientBlockId = block.clientBlockId,
+            dependsOnOperationId = state.projectCache.localBlockOperations.lastOrNull {
+                it.clientBlockId == block.clientBlockId
+            }?.operationId,
+            createdAt = now(),
+        )
+        val updated = state.copy(
+            projectCache = state.projectCache.copy(
+                localBlocks = state.projectCache.localBlocks.replaceBlock(
+                    block.copy(state = LocalBlockState.UNBOUND, intendedProjectId = null, boundProjectId = null),
+                ),
+                localBlockOperations = state.projectCache.localBlockOperations + operation,
+            ),
+        )
+        save(session, updated)
+        return updated.toResult()
+    }
 
     @Synchronized
     override fun beginTagProgramming(

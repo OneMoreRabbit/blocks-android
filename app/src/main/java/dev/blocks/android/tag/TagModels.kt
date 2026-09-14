@@ -97,6 +97,17 @@ data class LocalBlockRecord(
     val serverBlockId: String? = null,
 )
 
+/**
+ * One foreground-only Set Tag attempt. This value must not be persisted before the NFC payload
+ * has been written and read back successfully.
+ */
+data class DirectTagWritePlan(
+    val block: LocalBlockRecord,
+) {
+    val locator: TagLocator
+        get() = TagLocator.create(block.token)
+}
+
 enum class LocalBlockOperationType { REGISTER_BLOCK, BIND_BLOCK, UNBIND_BLOCK }
 
 /** Frozen local intent for the future API 0.5 adapter. API 0.4 must never transmit it. */

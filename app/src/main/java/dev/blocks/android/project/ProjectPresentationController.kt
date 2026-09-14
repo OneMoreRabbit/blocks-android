@@ -9,6 +9,7 @@ import dev.blocks.android.mvp.PendingMutation
 import dev.blocks.android.mvp.Session
 import dev.blocks.android.tag.LocalBlockRecord
 import dev.blocks.android.tag.LocalTagResolution
+import dev.blocks.android.tag.DirectTagWritePlan
 import dev.blocks.android.tag.OpaqueTagToken
 import dev.blocks.android.tag.TagActivationMedium
 import dev.blocks.android.tag.TagProgrammingFailure
@@ -270,6 +271,22 @@ class ProjectPresentationController(
             parkingHistoryHasMore = next.hasMore,
             error = null,
         )
+    }
+
+    @Synchronized
+    fun prepareDirectTagWrite(): DirectTagWritePlan {
+        val project = requireNotNull(state.projectPage).project
+        return workspace.prepareDirectTagWrite(activeSession(), project.id, project.name)
+    }
+
+    @Synchronized
+    fun commitVerifiedDirectTagWrite(plan: DirectTagWritePlan, replacedToken: OpaqueTagToken?) {
+        applyResult(workspace.commitVerifiedDirectTagWrite(activeSession(), plan, replacedToken))
+    }
+
+    @Synchronized
+    fun commitVerifiedDirectTagClear(erasedToken: OpaqueTagToken?) {
+        applyResult(workspace.commitVerifiedDirectTagClear(activeSession(), erasedToken, newOperationId()))
     }
 
     @Synchronized
