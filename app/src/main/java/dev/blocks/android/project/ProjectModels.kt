@@ -6,6 +6,7 @@ import dev.blocks.android.mvp.ParkingDraft
 import dev.blocks.android.mvp.Session
 import dev.blocks.android.tag.LocalBlockRecord
 import dev.blocks.android.tag.LocalTagResolution
+import dev.blocks.android.tag.DirectTagWritePlan
 import dev.blocks.android.tag.OpaqueTagToken
 import dev.blocks.android.tag.OpaqueTagTokenFactory
 import dev.blocks.android.tag.TagActivationMedium
@@ -244,6 +245,25 @@ interface ProjectWorkspace {
         limit: Int,
     ): ParkingHistoryPage
     fun localBlocks(session: Session): List<LocalBlockRecord> = snapshot(session).cache.localBlocks
+    fun prepareDirectTagWrite(
+        session: Session,
+        projectId: String,
+        label: String,
+        clientBlockId: String = newOperationIdentity(),
+        token: OpaqueTagToken = OpaqueTagTokenFactory().create(),
+        registrationOperationId: String = newOperationIdentity(),
+        bindingOperationId: String = newOperationIdentity(),
+    ): DirectTagWritePlan = throw UnsupportedOperationException("Direct tag writing is unavailable")
+    fun commitVerifiedDirectTagWrite(
+        session: Session,
+        plan: DirectTagWritePlan,
+        replacedToken: OpaqueTagToken?,
+    ): BackgroundSyncResult = throw UnsupportedOperationException("Direct tag writing is unavailable")
+    fun commitVerifiedDirectTagClear(
+        session: Session,
+        erasedToken: OpaqueTagToken?,
+        operationId: String = newOperationIdentity(),
+    ): BackgroundSyncResult = throw UnsupportedOperationException("Direct tag clearing is unavailable")
     fun beginTagProgramming(
         session: Session,
         projectId: String,

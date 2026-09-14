@@ -57,6 +57,89 @@ import org.junit.Test
 
 class ProjectSyncRepositoryTest {
     @Test
+    fun directTagPlanIsTransientAndVerifiedOverwriteCommitsNewAndPriorAssociationsAtomically() {
+        val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
+        val repository = repository(FakeProjectService(), MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+        val firstToken = OpaqueTagToken.fromBytes(ByteArray(32) { (it + 41).toByte() })
+        val first = repository.prepareDirectTagWrite(
+            SESSION_A,
+            PROJECT_ID,
+            "Project",
+            "direct-first",
+            firstToken,
+            "register-first",
+            "bind-first",
+        )
+
+        assertTrue(repository.snapshot(SESSION_A).cache.localBlocks.isEmpty())
+        assertTrue(state.loadSyncState(TENANT_A).projectCache.localBlocks.isEmpty())
+        val savesBeforeFirstVerification = state.saved.size
+        repository.commitVerifiedDirectTagWrite(SESSION_A, first, replacedToken = null)
+        assertEquals(savesBeforeFirstVerification + 1, state.saved.size)
+
+        val secondToken = OpaqueTagToken.fromBytes(ByteArray(32) { (it + 73).toByte() })
+        val second = repository.prepareDirectTagWrite(
+            SESSION_A,
+            PROJECT_ID,
+            "Project",
+            "direct-second",
+            secondToken,
+            "register-second",
+            "bind-second",
+        )
+        val beforeReplacement = state.saved.size
+        val replaced = repository.commitVerifiedDirectTagWrite(SESSION_A, second, firstToken)
+
+        assertEquals(beforeReplacement + 1, state.saved.size)
+        assertEquals(LocalBlockState.UNBOUND, replaced.cache.localBlocks.single { it.token == firstToken }.state)
+        assertEquals(LocalBlockState.ACTIVE, replaced.cache.localBlocks.single { it.token == secondToken }.state)
+        assertEquals(
+            listOf(
+                LocalBlockOperationType.REGISTER_BLOCK,
+                LocalBlockOperationType.BIND_BLOCK,
+                LocalBlockOperationType.UNBIND_BLOCK,
+                LocalBlockOperationType.REGISTER_BLOCK,
+                LocalBlockOperationType.BIND_BLOCK,
+            ),
+            replaced.cache.localBlockOperations.map { it.type },
+        )
+    }
+
+    @Test
+    fun verifiedPhysicalClearRemovesOnlyThePresentedTagAssociationAndRemainsTenantPartitioned() {
+        val state = MemoryState().apply {
+            saveSyncState(TENANT_A, loadedState(TENANT_A))
+            saveSyncState(TENANT_B, loadedState(TENANT_B))
+        }
+        val repository = repository(FakeProjectService(), MemoryDrafts(), state)
+        val token = OpaqueTagToken.fromBytes(ByteArray(32) { (it + 91).toByte() })
+        repository.activate(SESSION_A)
+        val plan = repository.prepareDirectTagWrite(
+            SESSION_A,
+            PROJECT_ID,
+            "Project",
+            "clear-block",
+            token,
+            "clear-register",
+            "clear-bind",
+        )
+        repository.commitVerifiedDirectTagWrite(SESSION_A, plan, null)
+
+        repository.activate(SESSION_B)
+        val untouchedB = repository.commitVerifiedDirectTagClear(SESSION_B, token, "tenant-b-clear")
+        assertTrue(untouchedB.cache.localBlocks.isEmpty())
+        repository.activate(SESSION_A)
+        val cleared = repository.commitVerifiedDirectTagClear(SESSION_A, token, "tenant-a-clear")
+
+        assertEquals(LocalBlockState.UNBOUND, cleared.cache.localBlocks.single().state)
+        assertEquals(null, cleared.cache.localBlocks.single().boundProjectId)
+        assertEquals(LocalBlockOperationType.UNBIND_BLOCK, cleared.cache.localBlockOperations.last().type)
+        assertEquals("tenant-a-clear", cleared.cache.localBlockOperations.last().operationId)
+        assertTrue(state.loadSyncState(TENANT_B).projectCache.localBlocks.isEmpty())
+    }
+
+    @Test
     fun pendingNfcProgrammingSurvivesAmbiguityAndRestartWithoutMintingAnotherToken() {
         val drafts = MemoryDrafts()
         val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
