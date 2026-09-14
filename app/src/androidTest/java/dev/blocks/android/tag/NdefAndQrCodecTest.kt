@@ -124,9 +124,16 @@ class NdefAndQrCodecTest {
     }
 
     @Test
-    fun foregroundReaderOwnsNdefDiscoveryInsteadOfLaunchingThePlatformViewer() {
-        assertTrue(BLOCKS_NFC_READER_FLAGS and NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK != 0)
-        assertTrue(BLOCKS_NFC_READER_FLAGS and NfcAdapter.FLAG_READER_NFC_A != 0)
+    fun foregroundReaderOwnsPresentationAndPreservesNdefEnumeration() {
+        assertFalse(BLOCKS_NFC_READER_FLAGS and NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK != 0)
+        listOf(
+            NfcAdapter.FLAG_READER_NFC_A,
+            NfcAdapter.FLAG_READER_NFC_B,
+            NfcAdapter.FLAG_READER_NFC_F,
+            NfcAdapter.FLAG_READER_NFC_V,
+        ).forEach { technologyFlag ->
+            assertTrue(BLOCKS_NFC_READER_FLAGS and technologyFlag != 0)
+        }
     }
 
     private fun locator(seed: Int) = TagLocator.create(
