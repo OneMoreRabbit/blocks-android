@@ -65,7 +65,7 @@ class SyncStateStorageCodecTest {
         val rows = SyncStateRowCodec().encode(state)
         val decoded = SyncStateRowCodec().decode(rows)
 
-        assertEquals(7, rows.schemaVersion)
+        assertEquals(8, rows.schemaVersion)
         assertEquals(1, rows.projects.size)
         assertEquals(1, rows.commands.size)
         assertEquals(1, rows.retiredIdempotencyKeys.size)
@@ -127,7 +127,7 @@ class SyncStateStorageCodecTest {
 
     @Test
     fun rejectsAnUnknownDatabaseRowSchemaWithoutDiscardingIt() {
-        val rows = SyncStateRowCodec().encode(TenantSyncState()).copy(schemaVersion = 8)
+        val rows = SyncStateRowCodec().encode(TenantSyncState()).copy(schemaVersion = 9)
 
         val error = runCatching { SyncStateRowCodec().decode(rows) }.exceptionOrNull()
 
@@ -231,7 +231,12 @@ class SyncStateStorageCodecTest {
             projectDraftsMigrated = true,
         )
 
-        assertEquals(state, SyncStateRowCodec().decode(SyncStateRowCodec().encode(state)))
+        val decoded = SyncStateRowCodec().decode(SyncStateRowCodec().encode(state))
+        assertEquals(
+            state,
+            decoded.copy(projectCache = decoded.projectCache.copy(projectLinks = emptyList())),
+        )
+        assertEquals(listOf(project.id), decoded.projectCache.projectLinks.map { it.projectId })
     }
 
     @Test
@@ -276,7 +281,7 @@ class SyncStateStorageCodecTest {
         val rows = SyncStateRowCodec().encode(state)
         val decoded = SyncStateRowCodec().decode(rows)
 
-        assertEquals(7, rows.schemaVersion)
+        assertEquals(8, rows.schemaVersion)
         assertEquals(state, decoded)
         assertEquals(
             listOf(LocalBlockOperationType.REGISTER_BLOCK, LocalBlockOperationType.BIND_BLOCK),

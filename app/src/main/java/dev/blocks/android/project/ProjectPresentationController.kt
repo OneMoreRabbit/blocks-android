@@ -11,6 +11,8 @@ import dev.blocks.android.tag.LocalBlockRecord
 import dev.blocks.android.tag.LocalTagResolution
 import dev.blocks.android.tag.DirectTagWritePlan
 import dev.blocks.android.tag.OpaqueTagToken
+import dev.blocks.android.tag.ProjectKey
+import dev.blocks.android.tag.ProjectLink
 import dev.blocks.android.tag.TagActivationMedium
 import dev.blocks.android.tag.TagProgrammingFailure
 import java.io.IOException
@@ -280,6 +282,12 @@ class ProjectPresentationController(
     }
 
     @Synchronized
+    fun currentProjectLink(): ProjectLink {
+        val project = requireNotNull(state.projectPage).project
+        return workspace.projectLink(activeSession(), project.id)
+    }
+
+    @Synchronized
     fun commitVerifiedDirectTagWrite(plan: DirectTagWritePlan, replacedToken: OpaqueTagToken?) {
         applyResult(workspace.commitVerifiedDirectTagWrite(activeSession(), plan, replacedToken))
     }
@@ -340,6 +348,10 @@ class ProjectPresentationController(
     @Synchronized
     fun resolveTagLocally(token: OpaqueTagToken): LocalTagResolution =
         workspace.resolveTagLocally(activeSession(), token)
+
+    @Synchronized
+    fun resolveProjectLinkLocally(key: ProjectKey): String? =
+        workspace.resolveProjectLinkLocally(activeSession(), key)
 
     fun resolveTagThroughService(token: OpaqueTagToken): LocalTagResolution {
         val active = synchronized(this) { activeSession() }

@@ -50,14 +50,13 @@ import dev.blocks.android.state.SessionContinuityStore
 import dev.blocks.android.sync.LegacyOperationReplayer
 import dev.blocks.android.sync.ProjectSyncRepository
 import dev.blocks.android.tag.AndroidNfcTagPlatform
-import dev.blocks.android.tag.DirectTagWritePlan
-import dev.blocks.android.tag.LocalBlockRecord
-import dev.blocks.android.tag.LocalBlockState
+import dev.blocks.android.tag.BlocksNavigationAddress
 import dev.blocks.android.tag.LocalTagResolution
 import dev.blocks.android.tag.NfcClearResult
 import dev.blocks.android.tag.NfcProgrammingResult
 import dev.blocks.android.tag.NfcTagHandle
 import dev.blocks.android.tag.NfcTagPlatform
+import dev.blocks.android.tag.ProjectLink
 import dev.blocks.android.tag.TagLocator
 import dev.blocks.android.tag.TagLaunchIntent
 import dev.blocks.android.tag.TagShareIntent
@@ -87,9 +86,22 @@ internal data class ProjectAppDependencies(
 )
 
 private sealed interface ActiveTagAction {
-    data class Write(val plan: DirectTagWritePlan) : ActiveTagAction
+    data class Write(val link: ProjectLink) : ActiveTagAction
     data object Clear : ActiveTagAction
 }
+
+private enum class TagAttemptPhase { ARMED, IN_FLIGHT, AWAITING_READ_BACK, COMPLETE, CANCELLED }
+
+private class ActiveTagAttempt(
+    val action: ActiveTagAction,
+    val tenantId: String,
+    val projectId: String,
+    var phase: TagAttemptPhase = TagAttemptPhase.ARMED,
+) {
+    var dialog: AlertDialog? = null
+}
+
+private enum class TagIoStep { PROGRAM, VERIFY_WRITE, CLEAR, VERIFY_CLEAR }
 
 internal object ProjectUiIds {
     const val CONTENT = 1000
@@ -144,10 +156,11 @@ class MainActivity : ComponentActivity() {
     private var syncJob: Job? = null
     private var credentialJob: Job? = null
     private var restoreProjectId: String? = null
-    private var pendingTagLocator: TagLocator? = null
+    private var pendingNavigationAddress: BlocksNavigationAddress? = null
     private var pendingInvalidTagIntent = false
+    private val tagAttemptLock = Any()
     @Volatile
-    private var activeTagAction: ActiveTagAction? = null
+    private var activeTagAttempt: ActiveTagAttempt? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     internal var activeDialog: AlertDialog? = null
         private set
@@ -213,6 +226,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onPause() {
+        cancelActiveTagAttempt()
         nfcTagPlatform.stopReader()
         super.onPause()
     }
@@ -650,22 +664,21 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun showSetTag() {
-        var plan: DirectTagWritePlan? = null
+        var link: ProjectLink? = null
         runRepositoryAction(
             syncAfter = false,
-            complete = { plan?.let(::showTagWriter) },
+            complete = { link?.let(::showTagWriter) },
         ) {
-            plan = controller.prepareDirectTagWrite()
+            link = controller.currentProjectLink()
         }
     }
 
-    private fun showTagWriter(plan: DirectTagWritePlan) {
-        val action = ActiveTagAction.Write(plan)
-        activeTagAction = action
+    private fun showTagWriter(link: ProjectLink) {
+        val attempt = newTagAttempt(ActiveTagAction.Write(link)) ?: return
         val message = when {
             !nfcTagPlatform.isAvailable -> "This device has no NFC hardware. No tag was changed."
             !nfcTagPlatform.isEnabled -> "NFC is turned off. Turn it on, then choose Set Tag again."
-            else -> "Hold one writable NFC tag to this device. Its current writable content will be replaced."
+            else -> "Hold one writable NFC tag to this device until Blocks confirms verification. Its current writable content will be replaced."
         }
         val dialog = AlertDialog.Builder(this)
             .setTitle("Set Tag")
@@ -673,18 +686,17 @@ class MainActivity : ComponentActivity() {
             .setNegativeButton("Cancel", null)
             .create()
         dialog.setOnDismissListener {
-            nfcTagPlatform.stopReader()
-            if (activeTagAction == action) activeTagAction = null
+            cancelTagAttempt(attempt)
             if (activeDialog === dialog) activeDialog = null
         }
         activeDialog = dialog
+        attempt.dialog = dialog
         dialog.show()
         startNfcReader()
     }
 
     private fun showClearTags() {
-        val action = ActiveTagAction.Clear
-        activeTagAction = action
+        val attempt = newTagAttempt(ActiveTagAction.Clear) ?: return
         val message = when {
             !nfcTagPlatform.isAvailable -> "This device has no NFC hardware. No tag was changed."
             !nfcTagPlatform.isEnabled -> "NFC is turned off. Turn it on, then choose Clear Tags again."
@@ -696,141 +708,229 @@ class MainActivity : ComponentActivity() {
             .setNegativeButton("Cancel", null)
             .create()
         dialog.setOnDismissListener {
-            nfcTagPlatform.stopReader()
-            if (activeTagAction == action) activeTagAction = null
+            cancelTagAttempt(attempt)
             if (activeDialog === dialog) activeDialog = null
         }
         activeDialog = dialog
+        attempt.dialog = dialog
         dialog.show()
         startNfcReader()
     }
 
     private fun startNfcReader() {
-        if (activeTagAction == null || !nfcTagPlatform.isEnabled) return
+        if (activeTagAttempt == null || !nfcTagPlatform.isEnabled) return
         nfcTagPlatform.startReader(::handleTagPresentation)
     }
 
     private fun handleTagPresentation(handle: NfcTagHandle) {
-        val action = activeTagAction ?: return
-        activeTagAction = null
+        val claimed = synchronized(tagAttemptLock) {
+            val attempt = activeTagAttempt ?: return
+            val step = when (attempt.phase) {
+                TagAttemptPhase.ARMED -> when (attempt.action) {
+                    is ActiveTagAction.Write -> TagIoStep.PROGRAM
+                    ActiveTagAction.Clear -> TagIoStep.CLEAR
+                }
+                TagAttemptPhase.AWAITING_READ_BACK -> when (attempt.action) {
+                    is ActiveTagAction.Write -> TagIoStep.VERIFY_WRITE
+                    ActiveTagAction.Clear -> TagIoStep.VERIFY_CLEAR
+                }
+                TagAttemptPhase.IN_FLIGHT,
+                TagAttemptPhase.COMPLETE,
+                TagAttemptPhase.CANCELLED,
+                -> return
+            }
+            attempt.phase = TagAttemptPhase.IN_FLIGHT
+            attempt to step
+        }
+        handleTagIo(claimed.first, claimed.second, handle)
+    }
+
+    private fun handleTagIo(attempt: ActiveTagAttempt, step: TagIoStep, handle: NfcTagHandle) {
+        uiScope.launch {
+            val outcome = withContext(Dispatchers.IO) {
+                when (step) {
+                    TagIoStep.PROGRAM -> nfcTagPlatform.programAndVerify(
+                        handle,
+                        (attempt.action as ActiveTagAction.Write).link,
+                    )
+                    TagIoStep.VERIFY_WRITE -> nfcTagPlatform.verifyWritten(
+                        handle,
+                        (attempt.action as ActiveTagAction.Write).link,
+                    )
+                    TagIoStep.CLEAR -> nfcTagPlatform.clearAndVerify(handle)
+                    TagIoStep.VERIFY_CLEAR -> nfcTagPlatform.verifyCleared(handle)
+                }
+            }
+            if (!isActiveTagAttempt(attempt)) return@launch
+            when (outcome) {
+                NfcProgrammingResult.AwaitingReadBack,
+                NfcClearResult.AwaitingReadBack,
+                -> awaitTagReadBack(attempt)
+                is NfcProgrammingResult.Verified -> finishTagWrite(attempt, outcome)
+                is NfcClearResult.Verified -> finishTagClear(attempt, outcome)
+                is NfcProgrammingResult -> presentTagOutcome(
+                    attempt,
+                    "Tag not set",
+                    outcome.userMessage(),
+                )
+                is NfcClearResult -> presentTagOutcome(
+                    attempt,
+                    "Tag not cleared",
+                    outcome.userMessage(),
+                )
+            }
+        }
+    }
+
+    private fun newTagAttempt(action: ActiveTagAction): ActiveTagAttempt? {
+        val tenantId = controller.activeTenantId ?: return null
+        val projectId = controller.state.projectPage?.project?.id ?: return null
+        return ActiveTagAttempt(action, tenantId, projectId).also { attempt ->
+            synchronized(tagAttemptLock) {
+                activeTagAttempt?.phase = TagAttemptPhase.CANCELLED
+                activeTagAttempt = attempt
+            }
+        }
+    }
+
+    private fun isActiveTagAttempt(attempt: ActiveTagAttempt): Boolean = synchronized(tagAttemptLock) {
+        activeTagAttempt === attempt && attempt.phase != TagAttemptPhase.CANCELLED &&
+            controller.activeTenantId == attempt.tenantId &&
+            controller.state.projectPage?.project?.id == attempt.projectId
+    }
+
+    private fun awaitTagReadBack(attempt: ActiveTagAttempt) {
+        val stillActive = synchronized(tagAttemptLock) {
+            if (activeTagAttempt !== attempt || attempt.phase == TagAttemptPhase.CANCELLED) false else {
+                attempt.phase = TagAttemptPhase.AWAITING_READ_BACK
+                true
+            }
+        }
+        if (!stillActive) return
+        attempt.dialog?.takeIf { it.isShowing }?.setMessage(
+            "The tag was formatted. Remove it, then hold the same tag to the device again until Blocks verifies it.",
+        )
+    }
+
+    private suspend fun finishTagWrite(attempt: ActiveTagAttempt, outcome: NfcProgrammingResult.Verified) {
+        try {
+            val replacedLegacy = outcome.replacedAddress as? TagLocator
+            if (replacedLegacy != null) {
+                withContext(NonCancellable + localStateDispatcher) {
+                    controller.commitVerifiedDirectTagClear(replacedLegacy.token)
+                }
+            }
+            presentTagOutcome(attempt, "Tag set", "The project link was written and verified.")
+        } catch (error: Exception) {
+            completeTagAttempt(attempt)
+            handleRepositoryError(error)
+            render()
+        }
+    }
+
+    private suspend fun finishTagClear(attempt: ActiveTagAttempt, outcome: NfcClearResult.Verified) {
+        try {
+            val erasedLegacy = outcome.erasedAddress as? TagLocator
+            if (erasedLegacy != null) {
+                withContext(NonCancellable + localStateDispatcher) {
+                    controller.commitVerifiedDirectTagClear(erasedLegacy.token)
+                }
+            }
+            presentTagOutcome(attempt, "Tag cleared", "The presented tag was erased and verified.")
+        } catch (error: Exception) {
+            completeTagAttempt(attempt)
+            handleRepositoryError(error)
+            render()
+        }
+    }
+
+    private fun presentTagOutcome(attempt: ActiveTagAttempt, title: String, message: String) {
+        val completed = synchronized(tagAttemptLock) {
+            if (activeTagAttempt !== attempt || attempt.phase == TagAttemptPhase.CANCELLED) false else {
+                attempt.phase = TagAttemptPhase.COMPLETE
+                true
+            }
+        }
+        if (!completed) return
+        attempt.dialog?.apply {
+            setTitle(title)
+            setMessage("$message Remove the tag, then choose Done.")
+            getButton(AlertDialog.BUTTON_NEGATIVE)?.text = "Done"
+        }
+    }
+
+    private fun completeTagAttempt(attempt: ActiveTagAttempt) {
+        val completed = synchronized(tagAttemptLock) {
+            if (activeTagAttempt !== attempt) false else {
+                attempt.phase = TagAttemptPhase.CANCELLED
+                activeTagAttempt = null
+                true
+            }
+        }
+        if (!completed) return
         nfcTagPlatform.stopReader()
-        when (action) {
-            is ActiveTagAction.Write -> handleTagWrite(action.plan, handle)
-            ActiveTagAction.Clear -> handleTagClear(handle)
-        }
+        attempt.dialog?.takeIf { it.isShowing }?.dismiss()
     }
 
-    private fun handleTagWrite(plan: DirectTagWritePlan, handle: NfcTagHandle) {
-        uiScope.launch {
-            val outcome = withContext(Dispatchers.IO) {
-                nfcTagPlatform.programAndVerify(handle, plan.locator)
-            }
-            activeDialog?.dismiss()
-            when (outcome) {
-                is NfcProgrammingResult.Verified -> {
-                    try {
-                        withContext(NonCancellable + localStateDispatcher) {
-                            controller.commitVerifiedDirectTagWrite(plan, outcome.replacedLocator?.token)
-                        }
-                        render()
-                        showMessage("Tag set", "The tag was written, verified, and assigned to this project.")
-                    } catch (error: Exception) {
-                        handleRepositoryError(error)
-                        render()
-                    }
-                }
-                else -> {
-                    render()
-                    showMessage("Tag not set", outcome.userMessage())
-                }
+    private fun cancelTagAttempt(attempt: ActiveTagAttempt) {
+        val cancelled = synchronized(tagAttemptLock) {
+            if (activeTagAttempt !== attempt) false else {
+                attempt.phase = TagAttemptPhase.CANCELLED
+                activeTagAttempt = null
+                true
             }
         }
+        if (cancelled) nfcTagPlatform.stopReader()
     }
 
-    private fun handleTagClear(handle: NfcTagHandle) {
-        uiScope.launch {
-            val outcome = withContext(Dispatchers.IO) {
-                nfcTagPlatform.clearAndVerify(handle)
-            }
-            activeDialog?.dismiss()
-            when (outcome) {
-                is NfcClearResult.Verified -> {
-                    try {
-                        withContext(NonCancellable + localStateDispatcher) {
-                            controller.commitVerifiedDirectTagClear(outcome.erasedLocator?.token)
-                        }
-                        render()
-                        showMessage("Tag cleared", "The tag was erased and verified.")
-                    } catch (error: Exception) {
-                        handleRepositoryError(error)
-                        render()
-                    }
-                }
-                else -> {
-                    render()
-                    showMessage("Tag not cleared", outcome.userMessage())
-                }
-            }
-        }
+    private fun cancelActiveTagAttempt() {
+        activeTagAttempt?.let(::cancelTagAttempt)
     }
 
     private fun showLatestQr() {
-        val projectId = requireNotNull(controller.state.projectPage).project.id
-        val block = controller.state.localBlocks
-            .filter { it.state == LocalBlockState.ACTIVE && it.boundProjectId == projectId }
-            .maxWithOrNull(compareBy<LocalBlockRecord> { it.verifiedAt ?: it.createdAt }.thenBy { it.clientBlockId })
-        if (block == null) {
-            showManagedDialog(
-                AlertDialog.Builder(this)
-                    .setTitle("No active tag")
-                    .setMessage("Set a tag for this project before viewing its QR code.")
-                    .setPositiveButton("Set Tag") { _, _ -> showSetTag() }
-                    .setNegativeButton("Cancel", null)
-                    .create(),
-            )
-            return
+        var link: ProjectLink? = null
+        runRepositoryAction(syncAfter = false, complete = { link?.let(::showQr) }) {
+            link = controller.currentProjectLink()
         }
-        showQr(block)
     }
 
-    private fun showQr(block: LocalBlockRecord) {
-        val locator = TagLocator.create(block.token)
+    private fun showQr(link: ProjectLink) {
         val size = dp(280).coerceAtLeast(1)
         val image = ImageView(this).apply {
             id = ProjectUiIds.TAG_QR
-            contentDescription = "QR code for this project tag"
+            contentDescription = "QR code for this project"
             adjustViewBounds = true
-            setImageBitmap(BarcodeEncoder().encodeBitmap(locator.encoded, BarcodeFormat.QR_CODE, size, size))
+            setImageBitmap(BarcodeEncoder().encodeBitmap(link.encoded, BarcodeFormat.QR_CODE, size, size))
         }
         showManagedDialog(
             AlertDialog.Builder(this)
-                .setTitle("Project tag QR")
+                .setTitle("Project QR")
                 .setView(image)
-                .setPositiveButton("Share") { _, _ -> shareTag(locator) }
+                .setPositiveButton("Share") { _, _ -> shareProjectLink(link) }
                 .setNegativeButton("Done", null)
                 .create(),
         )
     }
 
-    private fun shareTag(locator: TagLocator) {
+    private fun shareProjectLink(link: ProjectLink) {
         startActivity(
-            Intent.createChooser(TagShareIntent.create(locator), "Share Blocks tag"),
+            Intent.createChooser(TagShareIntent.create(link), "Share Blocks project"),
         )
     }
 
     internal fun handleQrText(value: String) {
-        val locator = TagLocator.parse(value)
-        if (locator == null) {
+        val address = dev.blocks.android.tag.BlocksNavigationAddressParser.parse(value)
+        if (address == null) {
             pendingInvalidTagIntent = true
         } else {
-            pendingTagLocator = locator
+            pendingNavigationAddress = address
         }
         resolvePendingTagLocator()
     }
 
     private fun consumeTagIntent(source: Intent?, clearActivityIntent: Boolean) {
         when (val parsed = TagLaunchIntent.parse(source)) {
-            is TagLaunchIntent.Valid -> pendingTagLocator = parsed.locator
+            is TagLaunchIntent.Valid -> pendingNavigationAddress = parsed.address
             TagLaunchIntent.Invalid -> pendingInvalidTagIntent = true
             TagLaunchIntent.None -> return
         }
@@ -842,34 +942,39 @@ class MainActivity : ComponentActivity() {
         if (pendingInvalidTagIntent) {
             pendingInvalidTagIntent = false
             render()
-            showMessage("Tag not recognized", "This is not a supported Blocks tag. The Dashboard remains available.")
+            showMessage("Link not recognized", "This is not a supported Blocks project link. The Dashboard remains available.")
             return
         }
-        val locator = pendingTagLocator ?: return
-        pendingTagLocator = null
+        val address = pendingNavigationAddress ?: return
+        pendingNavigationAddress = null
         uiScope.launch {
-            val local = try {
-                withContext(localStateDispatcher) { controller.resolveTagLocally(locator.token) }
+            val projectId = try {
+                withContext(localStateDispatcher) {
+                    when (address) {
+                        is ProjectLink -> controller.resolveProjectLinkLocally(address.key)
+                        is TagLocator -> when (val local = controller.resolveTagLocally(address.token)) {
+                            is LocalTagResolution.Bound -> local.projectId
+                            is LocalTagResolution.Unbound,
+                            is LocalTagResolution.PendingProgramming,
+                            is LocalTagResolution.Unknown,
+                            -> null
+                        }
+                    }
+                }
             } catch (error: Exception) {
                 handleRepositoryError(error)
                 render()
                 return@launch
             }
-            when (local) {
-                is LocalTagResolution.Bound -> {
-                    withContext(localStateDispatcher) { controller.openProject(local.projectId) }
-                    render()
-                }
-                is LocalTagResolution.Unbound,
-                is LocalTagResolution.PendingProgramming,
-                is LocalTagResolution.Unknown,
-                -> {
-                    render()
-                    showMessage(
-                        "Tag not available",
-                        "This tag does not open a project in the current account's saved data. The Dashboard remains usable.",
-                    )
-                }
+            if (projectId != null) {
+                withContext(localStateDispatcher) { controller.openProject(projectId) }
+                render()
+            } else {
+                render()
+                showMessage(
+                    "Project not available",
+                    "This link does not open a project in the current account's saved data. The Dashboard remains usable.",
+                )
             }
         }
     }
@@ -888,16 +993,20 @@ class MainActivity : ComponentActivity() {
         NfcProgrammingResult.Unsupported -> "This tag does not support writable NDEF records. No association was saved."
         NfcProgrammingResult.ReadOnly -> "This tag is read-only. No association was saved."
         NfcProgrammingResult.TooSmall -> "This tag is too small for a Blocks locator. No association was saved."
+        NfcProgrammingResult.Removed -> "The tag was removed before writing began. No association was saved."
         NfcProgrammingResult.VerificationMismatch -> "The new value could not be verified. No association was saved."
         NfcProgrammingResult.WriteUncertain -> "The write result is uncertain. Choose Set Tag to make a fresh attempt."
+        NfcProgrammingResult.AwaitingReadBack -> error("Read-back continuation is handled before failure presentation")
         is NfcProgrammingResult.Verified -> error("A verified NFC write is not a failure")
     }
 
     private fun NfcClearResult.userMessage() = when (this) {
         NfcClearResult.Unsupported -> "This tag does not support writable NDEF records. Its association was retained."
         NfcClearResult.ReadOnly -> "This tag is read-only. Its association was retained."
+        NfcClearResult.Removed -> "The tag was removed before erasing began. Its content was not changed."
         NfcClearResult.VerificationMismatch -> "The erase could not be verified. Its association was retained."
         NfcClearResult.WriteUncertain -> "The erase result is uncertain. Its association was retained."
+        NfcClearResult.AwaitingReadBack -> error("Read-back continuation is handled before failure presentation")
         is NfcClearResult.Verified -> error("A verified NFC clear is not a failure")
     }
 

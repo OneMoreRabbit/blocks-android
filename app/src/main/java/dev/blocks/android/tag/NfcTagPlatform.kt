@@ -7,6 +7,7 @@ import android.nfc.NdefRecord
 import android.nfc.NfcAdapter
 import android.nfc.Tag
 import android.nfc.tech.Ndef
+import android.nfc.tech.NdefFormatable
 import android.os.Build
 
 internal const val BLOCKS_NFC_READER_FLAGS = NfcAdapter.FLAG_READER_NFC_A or
@@ -17,18 +18,22 @@ internal const val BLOCKS_NFC_READER_FLAGS = NfcAdapter.FLAG_READER_NFC_A or
 internal interface NfcTagHandle
 
 internal sealed interface NfcProgrammingResult {
-    data class Verified(val replacedLocator: TagLocator? = null) : NfcProgrammingResult
+    data class Verified(val replacedAddress: BlocksNavigationAddress? = null) : NfcProgrammingResult
+    data object AwaitingReadBack : NfcProgrammingResult
     data object Unsupported : NfcProgrammingResult
     data object ReadOnly : NfcProgrammingResult
     data object TooSmall : NfcProgrammingResult
+    data object Removed : NfcProgrammingResult
     data object VerificationMismatch : NfcProgrammingResult
     data object WriteUncertain : NfcProgrammingResult
 }
 
 internal sealed interface NfcClearResult {
-    data class Verified(val erasedLocator: TagLocator? = null) : NfcClearResult
+    data class Verified(val erasedAddress: BlocksNavigationAddress? = null) : NfcClearResult
+    data object AwaitingReadBack : NfcClearResult
     data object Unsupported : NfcClearResult
     data object ReadOnly : NfcClearResult
+    data object Removed : NfcClearResult
     data object VerificationMismatch : NfcClearResult
     data object WriteUncertain : NfcClearResult
 }
@@ -40,12 +45,15 @@ internal interface NfcTagPlatform {
     fun stopReader()
     fun programAndVerify(
         handle: NfcTagHandle,
-        locator: TagLocator,
+        address: BlocksNavigationAddress,
     ): NfcProgrammingResult
+    fun verifyWritten(handle: NfcTagHandle, address: BlocksNavigationAddress): NfcProgrammingResult
     fun clearAndVerify(handle: NfcTagHandle): NfcClearResult
+    fun verifyCleared(handle: NfcTagHandle): NfcClearResult
 }
 
 internal class AndroidNfcTagPlatform(private val activity: Activity) : NfcTagPlatform {
+    private val io = NfcTagIo(AndroidNfcTechnologyFactory)
     private val adapter: NfcAdapter?
         get() = NfcAdapter.getDefaultAdapter(activity)
 
@@ -72,55 +80,181 @@ internal class AndroidNfcTagPlatform(private val activity: Activity) : NfcTagPla
 
     override fun programAndVerify(
         handle: NfcTagHandle,
-        locator: TagLocator,
+        address: BlocksNavigationAddress,
+    ): NfcProgrammingResult = io.programAndVerify(handle, address)
+
+    override fun verifyWritten(
+        handle: NfcTagHandle,
+        address: BlocksNavigationAddress,
+    ): NfcProgrammingResult = io.verifyWritten(handle, address)
+
+    override fun clearAndVerify(handle: NfcTagHandle): NfcClearResult = io.clearAndVerify(handle)
+
+    override fun verifyCleared(handle: NfcTagHandle): NfcClearResult = io.verifyCleared(handle)
+}
+
+private data class AndroidNfcTagHandle(val tag: Tag) : NfcTagHandle
+
+internal interface NdefConnection {
+    val isWritable: Boolean
+    val maxSize: Int
+    fun connect()
+    fun readMessage(): NdefMessage?
+    fun writeMessage(message: NdefMessage)
+    fun close()
+}
+
+internal interface NdefFormatableConnection {
+    fun connect()
+    fun format(message: NdefMessage)
+    fun close()
+}
+
+internal interface NfcTechnologyFactory {
+    fun ndef(handle: NfcTagHandle): NdefConnection?
+    fun formatable(handle: NfcTagHandle): NdefFormatableConnection?
+}
+
+private object AndroidNfcTechnologyFactory : NfcTechnologyFactory {
+    override fun ndef(handle: NfcTagHandle): NdefConnection? {
+        val tag = (handle as? AndroidNfcTagHandle)?.tag ?: return null
+        return Ndef.get(tag)?.let(::AndroidNdefConnection)
+    }
+
+    override fun formatable(handle: NfcTagHandle): NdefFormatableConnection? {
+        val tag = (handle as? AndroidNfcTagHandle)?.tag ?: return null
+        return NdefFormatable.get(tag)?.let(::AndroidNdefFormatableConnection)
+    }
+}
+
+private class AndroidNdefConnection(private val ndef: Ndef) : NdefConnection {
+    override val isWritable: Boolean get() = ndef.isWritable
+    override val maxSize: Int get() = ndef.maxSize
+    override fun connect() = ndef.connect()
+    override fun readMessage(): NdefMessage? = ndef.ndefMessage
+    override fun writeMessage(message: NdefMessage) = ndef.writeNdefMessage(message)
+    override fun close() = ndef.close()
+}
+
+private class AndroidNdefFormatableConnection(private val formatable: NdefFormatable) : NdefFormatableConnection {
+    override fun connect() = formatable.connect()
+    override fun format(message: NdefMessage) = formatable.format(message)
+    override fun close() = formatable.close()
+}
+
+/** Physical I/O state machine, separated from Activity reader-mode ownership for deterministic tests. */
+internal class NfcTagIo(private val technologies: NfcTechnologyFactory) {
+    fun programAndVerify(
+        handle: NfcTagHandle,
+        address: BlocksNavigationAddress,
     ): NfcProgrammingResult {
-        val tag = (handle as? AndroidNfcTagHandle)?.tag ?: return NfcProgrammingResult.Unsupported
-        val ndef = Ndef.get(tag) ?: return NfcProgrammingResult.Unsupported
-        val message = NdefLocatorCodec.message(locator)
+        val message = NdefLocatorCodec.message(address)
+        technologies.ndef(handle)?.let { ndef ->
+            var writeStarted = false
+            return try {
+                ndef.connect()
+                val replacedAddress = NdefLocatorCodec.parse(ndef.readMessage())
+                if (!ndef.isWritable) return NfcProgrammingResult.ReadOnly
+                if (ndef.maxSize < message.toByteArray().size) return NfcProgrammingResult.TooSmall
+                writeStarted = true
+                ndef.writeMessage(message)
+                if (NdefLocatorCodec.parse(ndef.readMessage()) == address) {
+                    NfcProgrammingResult.Verified(replacedAddress)
+                } else {
+                    NfcProgrammingResult.VerificationMismatch
+                }
+            } catch (_: Exception) {
+                if (writeStarted) NfcProgrammingResult.WriteUncertain else NfcProgrammingResult.Removed
+            } finally {
+                runCatching(ndef::close)
+            }
+        }
+        val formatable = technologies.formatable(handle) ?: return NfcProgrammingResult.Unsupported
+        var formatStarted = false
+        return try {
+            formatable.connect()
+            formatStarted = true
+            formatable.format(message)
+            NfcProgrammingResult.AwaitingReadBack
+        } catch (_: Exception) {
+            if (formatStarted) NfcProgrammingResult.WriteUncertain else NfcProgrammingResult.Removed
+        } finally {
+            runCatching(formatable::close)
+        }
+    }
+
+    fun verifyWritten(
+        handle: NfcTagHandle,
+        address: BlocksNavigationAddress,
+    ): NfcProgrammingResult {
+        val ndef = technologies.ndef(handle) ?: return NfcProgrammingResult.WriteUncertain
         return try {
             ndef.connect()
-            val current = ndef.ndefMessage
-            val replacedLocator = NdefLocatorCodec.parse(current)
-            if (!ndef.isWritable) return NfcProgrammingResult.ReadOnly
-            if (ndef.maxSize < message.toByteArray().size) return NfcProgrammingResult.TooSmall
-            ndef.writeNdefMessage(message)
-            if (NdefLocatorCodec.parse(ndef.ndefMessage) == locator) {
-                NfcProgrammingResult.Verified(replacedLocator)
+            if (NdefLocatorCodec.parse(ndef.readMessage()) == address) {
+                NfcProgrammingResult.Verified()
             } else {
                 NfcProgrammingResult.VerificationMismatch
             }
         } catch (_: Exception) {
             NfcProgrammingResult.WriteUncertain
         } finally {
-            runCatching { ndef.close() }
+            runCatching(ndef::close)
         }
     }
 
-    override fun clearAndVerify(handle: NfcTagHandle): NfcClearResult {
-        val tag = (handle as? AndroidNfcTagHandle)?.tag ?: return NfcClearResult.Unsupported
-        val ndef = Ndef.get(tag) ?: return NfcClearResult.Unsupported
+    fun clearAndVerify(handle: NfcTagHandle): NfcClearResult {
+        technologies.ndef(handle)?.let { ndef ->
+            var writeStarted = false
+            return try {
+                ndef.connect()
+                val erasedAddress = NdefLocatorCodec.parse(ndef.readMessage())
+                if (!ndef.isWritable) return NfcClearResult.ReadOnly
+                writeStarted = true
+                ndef.writeMessage(NdefLocatorCodec.emptyMessage())
+                if (NdefLocatorCodec.isEmpty(ndef.readMessage())) {
+                    NfcClearResult.Verified(erasedAddress)
+                } else {
+                    NfcClearResult.VerificationMismatch
+                }
+            } catch (_: Exception) {
+                if (writeStarted) NfcClearResult.WriteUncertain else NfcClearResult.Removed
+            } finally {
+                runCatching(ndef::close)
+            }
+        }
+        val formatable = technologies.formatable(handle) ?: return NfcClearResult.Unsupported
+        var formatStarted = false
+        return try {
+            formatable.connect()
+            formatStarted = true
+            formatable.format(NdefLocatorCodec.emptyMessage())
+            NfcClearResult.AwaitingReadBack
+        } catch (_: Exception) {
+            if (formatStarted) NfcClearResult.WriteUncertain else NfcClearResult.Removed
+        } finally {
+            runCatching(formatable::close)
+        }
+    }
+
+    fun verifyCleared(handle: NfcTagHandle): NfcClearResult {
+        val ndef = technologies.ndef(handle) ?: return NfcClearResult.WriteUncertain
         return try {
             ndef.connect()
-            val erasedLocator = NdefLocatorCodec.parse(ndef.ndefMessage)
-            if (!ndef.isWritable) return NfcClearResult.ReadOnly
-            ndef.writeNdefMessage(NdefLocatorCodec.emptyMessage())
-            if (NdefLocatorCodec.isEmpty(ndef.ndefMessage)) {
-                NfcClearResult.Verified(erasedLocator)
+            if (NdefLocatorCodec.isEmpty(ndef.readMessage())) {
+                NfcClearResult.Verified()
             } else {
                 NfcClearResult.VerificationMismatch
             }
         } catch (_: Exception) {
             NfcClearResult.WriteUncertain
         } finally {
-            runCatching { ndef.close() }
+            runCatching(ndef::close)
         }
     }
-
-    private data class AndroidNfcTagHandle(val tag: Tag) : NfcTagHandle
 }
 
 internal object NdefLocatorCodec {
-    fun message(locator: TagLocator) = NdefMessage(arrayOf(NdefRecord.createUri(locator.encoded)))
+    fun message(address: BlocksNavigationAddress) = NdefMessage(arrayOf(NdefRecord.createUri(address.encoded)))
 
     fun emptyMessage() = NdefMessage(
         arrayOf(NdefRecord(NdefRecord.TNF_EMPTY, byteArrayOf(), byteArrayOf(), byteArrayOf())),
@@ -131,14 +265,14 @@ internal object NdefLocatorCodec {
             records.single().type.isEmpty() && records.single().id.isEmpty() && records.single().payload.isEmpty()
     } == true
 
-    fun parse(message: NdefMessage?): TagLocator? {
+    fun parse(message: NdefMessage?): BlocksNavigationAddress? {
         val records = message?.records ?: return null
         if (records.size != 1) return null
         val uri = runCatching { records.single().toUri() }.getOrNull() ?: return null
-        return TagLocator.parse(uri.toString())
+        return BlocksNavigationAddressParser.parse(uri.toString())
     }
 
-    fun fromIntent(intent: Intent?): TagLocator? {
+    fun fromIntent(intent: Intent?): BlocksNavigationAddress? {
         if (intent?.action != NfcAdapter.ACTION_NDEF_DISCOVERED) return null
         val messages = if (Build.VERSION.SDK_INT >= 33) {
             intent.getParcelableArrayExtra(NfcAdapter.EXTRA_NDEF_MESSAGES, NdefMessage::class.java)
@@ -156,7 +290,7 @@ internal object NdefLocatorCodec {
 
 internal sealed interface TagLaunchIntent {
     data object None : TagLaunchIntent
-    data class Valid(val locator: TagLocator) : TagLaunchIntent
+    data class Valid(val address: BlocksNavigationAddress) : TagLaunchIntent
     data object Invalid : TagLaunchIntent
 
     companion object {
@@ -165,7 +299,7 @@ internal sealed interface TagLaunchIntent {
                 NdefLocatorCodec.fromIntent(intent)?.let(::Valid) ?: Invalid
             }
             Intent.ACTION_VIEW -> {
-                intent.dataString?.let(TagLocator::parse)?.let(::Valid) ?: Invalid
+                intent.dataString?.let(BlocksNavigationAddressParser::parse)?.let(::Valid) ?: Invalid
             }
             else -> None
         }
@@ -173,8 +307,8 @@ internal sealed interface TagLaunchIntent {
 }
 
 internal object TagShareIntent {
-    fun create(locator: TagLocator): Intent = Intent(Intent.ACTION_SEND).apply {
+    fun create(address: BlocksNavigationAddress): Intent = Intent(Intent.ACTION_SEND).apply {
         type = "text/plain"
-        putExtra(Intent.EXTRA_TEXT, locator.encoded)
+        putExtra(Intent.EXTRA_TEXT, address.encoded)
     }
 }

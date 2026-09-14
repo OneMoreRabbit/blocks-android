@@ -25,6 +25,28 @@
                 <category android:name="android.intent.category.DEFAULT" />
 
                 <data
+                    android:host="api.blocks.onemorerabbit.co.uk"
+                    android:pathPrefix="/p/v1/"
+                    android:scheme="https" />
+            </intent-filter>
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+
+                <data
+                    android:host="api.blocks.onemorerabbit.co.uk"
+                    android:pathPrefix="/p/v1/"
+                    android:scheme="https" />
+            </intent-filter>
+            <!-- Frozen 0.6.0 locator support remains read-compatible for existing media. -->
+            <intent-filter>
+                <action android:name="android.nfc.action.NDEF_DISCOVERED" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+
+                <data
                     android:host="tag"
                     android:pathPrefix="/v1/"
                     android:scheme="blocks" />
