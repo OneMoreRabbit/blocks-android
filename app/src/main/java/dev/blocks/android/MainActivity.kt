@@ -222,6 +222,7 @@ class MainActivity : ComponentActivity() {
         uiScope.launch(Dispatchers.IO) {
             coverCaptureFiles.delete(interruptedCapture)
             coverCaptureFiles.cleanupOrphans()
+            coverImporter.cleanupAbandonedSources()
         }
         content = LinearLayout(this).apply {
             id = ProjectUiIds.CONTENT

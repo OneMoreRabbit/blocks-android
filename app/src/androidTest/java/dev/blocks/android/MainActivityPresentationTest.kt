@@ -34,6 +34,7 @@ import dev.blocks.android.auth.IdentityProvider
 import dev.blocks.android.cover.ProjectCoverImporter
 import dev.blocks.android.cover.CoverCaptureFiles
 import dev.blocks.android.cover.AndroidEncryptedProjectCoverMediaStore
+import dev.blocks.android.cover.CoverImportFiles
 import dev.blocks.android.mvp.AccountIdentity
 import dev.blocks.android.mvp.ChangePage
 import dev.blocks.android.mvp.FormDrafts
@@ -134,7 +135,7 @@ class MainActivityPresentationTest {
         authenticatedTenant = TENANT_ID
         sessionExchanges = AtomicInteger()
         nfc = FakeNfcTagPlatform()
-        coverImporter = FakeCoverImporter()
+        coverImporter = FakeCoverImporter(context)
         MainActivity.dependencyFactory = { activity ->
             val drafts = AndroidEncryptedDraftStore(activity)
             presentationController = ProjectPresentationController(
@@ -1908,6 +1909,35 @@ class MainActivityPresentationTest {
     }
 
     @Test
+    fun activityStartupRemovesAbandonedImportSourcesWithoutTouchingOwnedExceptions() {
+        val imports = CoverImportFiles(context)
+        val directory = imports.directoryForTest().apply { mkdirs() }
+        val abandoned = java.io.File(directory, "123e4567-e89b-42d3-a456-426614174999.source").apply {
+            writeBytes(byteArrayOf(1, 2, 3))
+        }
+        val retained = imports.createRetained().apply { writeBytes(byteArrayOf(4, 5, 6)) }
+        val unrelatedInDirectory = java.io.File(directory, "not-owned.source").apply {
+            writeBytes(byteArrayOf(7, 8, 9))
+        }
+        val unrelatedCache = java.io.File(context.cacheDir, "unrelated-cover-cache.source").apply {
+            writeBytes(byteArrayOf(10, 11, 12))
+        }
+        try {
+            ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+                waitUntil { !abandoned.exists() }
+                assertTrue(retained.isFile)
+                assertTrue(unrelatedInDirectory.isFile)
+                assertTrue(unrelatedCache.isFile)
+            }
+        } finally {
+            imports.delete(retained)
+            unrelatedInDirectory.delete()
+            unrelatedCache.delete()
+        }
+    }
+
+    @Test
     fun cachedDashboardAndProjectLinkOpenAreMeasuredWithoutWaitingForTransportOrCoverDecode() {
         workspace.cache = workspace.cache.copy(projectCovers = listOf(coverImporter.metadata(PROJECT_ID)))
         sessionExchangeOffline = true
@@ -2076,7 +2106,8 @@ class MainActivityPresentationTest {
         }
     }
 
-    private class FakeCoverImporter : ProjectCoverImporter {
+    private class FakeCoverImporter(context: Context) : ProjectCoverImporter {
+        private val importFiles = CoverImportFiles(context)
         @Volatile
         var failure: Exception? = null
         private var importCount = 0
@@ -2099,6 +2130,8 @@ class MainActivityPresentationTest {
             importCount += 1
             return content(projectId, (importCount.coerceAtMost(9) + '0'.code).toChar())
         }
+
+        override fun cleanupAbandonedSources(): Int = importFiles.cleanupOrphans()
 
         private fun content(projectId: String, digestCharacter: Char): ProjectCoverContent {
             val display = encoded + byteArrayOf(digestCharacter.code.toByte())

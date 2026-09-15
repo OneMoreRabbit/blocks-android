@@ -23,6 +23,53 @@ import kotlin.math.max
 
 fun interface ProjectCoverImporter {
     fun importCover(projectId: String, uri: Uri): ProjectCoverContent
+
+    /** Best-effort next-start cleanup for plaintext source files abandoned by process death. */
+    fun cleanupAbandonedSources(): Int = 0
+}
+
+/** Owns the narrowly named plaintext source files used only while a cover import is running. */
+class CoverImportFiles(context: Context) {
+    private val directory = File(context.applicationContext.cacheDir, DIRECTORY)
+
+    fun createRetained(): File = synchronized(ACTIVE_LOCK) {
+        check(directory.mkdirs() || directory.isDirectory) { "Could not create the cover import directory" }
+        File(directory, "${UUID.randomUUID()}$SOURCE_SUFFIX").also { file ->
+            check(file.createNewFile()) { "Could not create a cover import source" }
+            ACTIVE_PATHS += file.canonicalPath
+        }
+    }
+
+    fun delete(file: File?): Boolean = synchronized(ACTIVE_LOCK) {
+        file ?: return@synchronized true
+        if (!isOwned(file)) return@synchronized false
+        val path = runCatching { file.canonicalPath }.getOrNull() ?: return@synchronized false
+        ACTIVE_PATHS -= path
+        !file.exists() || bestEffortPrivateDelete(file)
+    }
+
+    fun cleanupOrphans(): Int = synchronized(ACTIVE_LOCK) {
+        var removed = 0
+        directory.listFiles().orEmpty().forEach { file ->
+            val path = runCatching { file.canonicalPath }.getOrNull()
+            if (path != null && isOwned(file) && path !in ACTIVE_PATHS && bestEffortPrivateDelete(file)) removed += 1
+        }
+        removed
+    }
+
+    internal fun directoryForTest(): File = directory
+
+    private fun isOwned(file: File): Boolean = runCatching {
+        file.canonicalFile.parentFile == directory.canonicalFile && file.name.matches(SOURCE_NAME)
+    }.getOrDefault(false)
+
+    private companion object {
+        const val DIRECTORY = "cover-import"
+        const val SOURCE_SUFFIX = ".source"
+        val SOURCE_NAME = Regex("[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.source")
+        val ACTIVE_LOCK = Any()
+        val ACTIVE_PATHS = mutableSetOf<String>()
+    }
 }
 
 /** Copies an ambient source to a bounded private temp file before any bounds or pixel decode. */
@@ -33,11 +80,13 @@ class AndroidProjectCoverImporter(
 ) : ProjectCoverImporter {
     private val applicationContext = context.applicationContext
     private val resolver = applicationContext.contentResolver
-    private val importDirectory = File(applicationContext.cacheDir, IMPORT_DIRECTORY)
+    private val importFiles = CoverImportFiles(applicationContext)
+
+    override fun cleanupAbandonedSources(): Int = importFiles.cleanupOrphans()
 
     override fun importCover(projectId: String, uri: Uri): ProjectCoverContent {
-        check(importDirectory.mkdirs() || importDirectory.isDirectory) { "Could not create the cover import directory" }
-        val source = File(importDirectory, "${UUID.randomUUID()}.source")
+        importFiles.cleanupOrphans()
+        val source = importFiles.createRetained()
         try {
             requireNotNull(resolver.openInputStream(uri)) { "The selected image is unavailable" }.use { input ->
                 FileOutputStream(source).use { output ->
@@ -62,12 +111,11 @@ class AndroidProjectCoverImporter(
             }
             return processor.process(projectId, source, now())
         } finally {
-            bestEffortPrivateDelete(source)
+            importFiles.delete(source)
         }
     }
 
     private companion object {
-        const val IMPORT_DIRECTORY = "cover-import"
         const val COPY_BUFFER_BYTES = 32 * 1024
     }
 }
