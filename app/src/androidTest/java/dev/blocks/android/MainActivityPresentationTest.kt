@@ -116,6 +116,7 @@ class MainActivityPresentationTest {
     private lateinit var presentationController: ProjectPresentationController
     private lateinit var nfc: FakeNfcTagPlatform
     private lateinit var coverImporter: FakeCoverImporter
+    private lateinit var coverSourceActions: FakeCoverSourceActions
     @Volatile
     private var sessionExchangeOffline = false
     @Volatile
@@ -136,6 +137,7 @@ class MainActivityPresentationTest {
         sessionExchanges = AtomicInteger()
         nfc = FakeNfcTagPlatform()
         coverImporter = FakeCoverImporter(context)
+        coverSourceActions = FakeCoverSourceActions()
         MainActivity.dependencyFactory = { activity ->
             val drafts = AndroidEncryptedDraftStore(activity)
             presentationController = ProjectPresentationController(
@@ -159,6 +161,7 @@ class MainActivityPresentationTest {
                 observeConnectivity = false,
                 nfcTagPlatform = nfc,
                 coverImporter = coverImporter,
+                coverSourceActions = coverSourceActions,
             )
         }
     }
@@ -1747,19 +1750,35 @@ class MainActivityPresentationTest {
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             scenario.onActivity { it.button("Active project").performClick() }
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            scenario.onActivity { it.findViewById<Button>(ProjectUiIds.EDIT_COVER).performClick() }
+            waitFor(scenario) { it.visibleDialogItems().containsAll(listOf("Take photo", "Choose image")) }
             scenario.onActivity { activity ->
-                activity.findViewById<Button>(ProjectUiIds.EDIT_COVER).performClick()
-                val texts = activity.dialogItems()
-                assertTrue(texts.containsAll(listOf("Take photo", "Choose image")))
-                assertFalse(texts.contains("Remove cover"))
+                val before = presentationController.state.projectCovers
+                assertFalse(activity.visibleDialogItems().contains("Remove cover"))
                 activity.dialogButton("Cancel").performClick()
+                assertEquals(before, presentationController.state.projectCovers)
+                activity.findViewById<Button>(ProjectUiIds.EDIT_COVER).performClick()
+            }
+            waitFor(scenario) { it.visibleDialogItems().contains("Take photo") }
+            scenario.onActivity { activity ->
+                activity.activateVisibleDialogItem("Take photo")
+                assertEquals(listOf(PROJECT_ID), coverSourceActions.cameraProjects)
+                assertTrue(presentationController.state.projectCovers.isEmpty())
+                activity.findViewById<Button>(ProjectUiIds.EDIT_COVER).performClick()
+            }
+            waitFor(scenario) { it.visibleDialogItems().contains("Choose image") }
+            scenario.onActivity { activity ->
+                activity.activateVisibleDialogItem("Choose image")
+                assertEquals(listOf(PROJECT_ID), coverSourceActions.pickerProjects)
+                assertTrue(presentationController.state.projectCovers.isEmpty())
                 activity.stagePendingCover(PROJECT_ID)
                 activity.handleCoverPickerResult(Uri.parse("content://test/cover"))
             }
             waitUntil { presentationController.state.projectCovers.isNotEmpty() }
+            scenario.onActivity { it.findViewById<Button>(ProjectUiIds.EDIT_COVER).performClick() }
+            waitFor(scenario) { it.visibleDialogItems().contains("Remove cover") }
             scenario.onActivity { activity ->
-                activity.findViewById<Button>(ProjectUiIds.EDIT_COVER).performClick()
-                val texts = activity.dialogItems()
+                val texts = activity.visibleDialogItems()
                 assertTrue(
                     texts.containsAll(
                         listOf("Take replacement photo", "Choose replacement image", "Remove cover"),
@@ -2081,6 +2100,29 @@ class MainActivityPresentationTest {
         return (0 until adapter.count).map { adapter.getItem(it).toString() }
     }
 
+    private fun MainActivity.visibleDialogItems(): List<String> = requireNotNull(activeDialog).listView.run {
+        (0 until childCount).mapNotNull { index ->
+            getChildAt(index).descendants()
+                .filterIsInstance<android.widget.TextView>()
+                .firstOrNull { it.text.isNotBlank() && it.isShown && it.height > 0 }
+                ?.text
+                ?.toString()
+        }
+    }
+
+    private fun MainActivity.activateVisibleDialogItem(text: String) {
+        val list = requireNotNull(activeDialog).listView
+        val childIndex = (0 until list.childCount).single { index ->
+            list.getChildAt(index).descendants()
+                .filterIsInstance<android.widget.TextView>()
+                .any { it.text.toString() == text && it.isShown && it.height > 0 }
+        }
+        val child = list.getChildAt(childIndex)
+        val adapterPosition = list.firstVisiblePosition + childIndex
+        assertTrue(child.isShown && child.height > 0)
+        list.performItemClick(child, adapterPosition, list.adapter.getItemId(adapterPosition))
+    }
+
     private fun MainActivity.dialogInput(): EditText = requireNotNull(activeDialog)
         .window?.decorView?.descendants().orEmpty()
         .filterIsInstance<EditText>()
@@ -2090,6 +2132,19 @@ class MainActivityPresentationTest {
         yield(this@descendants)
         if (this@descendants is ViewGroup) {
             for (index in 0 until childCount) yieldAll(getChildAt(index).descendants())
+        }
+    }
+
+    private class FakeCoverSourceActions : CoverSourceActions {
+        val cameraProjects = mutableListOf<String>()
+        val pickerProjects = mutableListOf<String>()
+
+        override fun takePhoto(projectId: String) {
+            cameraProjects += projectId
+        }
+
+        override fun chooseImage(projectId: String) {
+            pickerProjects += projectId
         }
     }
 

@@ -43,6 +43,8 @@ class AndroidSyncStateStore internal constructor(
     private val migrationVerifier: (TenantSyncState, TenantSyncState) -> Unit = { expected, actual ->
         check(actual == expected) { "Normalized migration verification failed" }
     },
+    private val migrationCheckpoint: (MigrationCheckpoint) -> Unit = {},
+    private val beforeMutationCommit: (ProjectMutationType) -> Unit = {},
 ) : SyncStateStore {
     private val applicationContext = context.applicationContext
     private val rowCodec = SyncStateRowCodec()
@@ -51,6 +53,13 @@ class AndroidSyncStateStore internal constructor(
     @Synchronized
     override fun loadSyncState(tenantId: String): TenantSyncState {
         if (!databaseFile(tenantId).exists()) return migrateReleasedStore(tenantId)
+        if (!isAuthoritative(tenantId)) {
+            check(releasedStateExists(tenantId)) {
+                "Unverified normalized tenant state has no released recovery source"
+            }
+            discardNormalizedReplacement(tenantId)
+            return migrateReleasedStore(tenantId)
+        }
         val state = open(tenantId).use { helper ->
             rowCodec.decode(readRows(helper.readableDatabase, tenantId))
         }
@@ -86,6 +95,7 @@ class AndroidSyncStateStore internal constructor(
             database.beginTransaction()
             try {
                 persistMutationRows(database, previous, state, type)
+                beforeMutationCommit(type)
                 database.setTransactionSuccessful()
             } finally {
                 database.endTransaction()
@@ -205,6 +215,7 @@ class AndroidSyncStateStore internal constructor(
                 database.beginTransaction()
                 try {
                     writeDiff(database, tenantId, previous?.takeIf { existed }?.let(rowCodec::encode), desired)
+                    upsertMetadata(database, META_AUTHORITATIVE, "true", previousKnown = existed)
                     database.setTransactionSuccessful()
                 } finally {
                     database.endTransaction()
@@ -243,17 +254,25 @@ class AndroidSyncStateStore internal constructor(
         val released = LegacyEncryptedSyncStateStore(applicationContext).loadSyncState(tenantId)
         try {
             writeMigratedState(tenantId, released)
+            migrationCheckpoint(MigrationCheckpoint.NORMALIZED_COMMITTED)
             val verified = open(tenantId).use { helper ->
                 rowCodec.decode(readRows(helper.readableDatabase, tenantId))
             }
             migrationVerifier(released, verified)
             validateTenant(tenantId, verified)
-            LegacyEncryptedSyncStateStore(applicationContext).clearSyncState(tenantId)
-            return verified
         } catch (error: Exception) {
-            applicationContext.deleteDatabase(databaseName(tenantId))
-            runCatching { deleteSecretKey(tenantId) }
+            discardNormalizedReplacement(tenantId)
             throw IllegalStateException("Could not migrate the released tenant store", error)
+        }
+        markAuthoritative(tenantId)
+        migrationCheckpoint(MigrationCheckpoint.VERIFIED_MARKER_COMMITTED)
+        try {
+            LegacyEncryptedSyncStateStore(applicationContext).clearSyncState(tenantId)
+        } catch (error: Exception) {
+            throw IllegalStateException("Could not retire the verified released tenant store", error)
+        }
+        return open(tenantId).use { helper ->
+            rowCodec.decode(readRows(helper.readableDatabase, tenantId))
         }
     }
 
@@ -271,11 +290,54 @@ class AndroidSyncStateStore internal constructor(
         }
     }
 
+    private fun markAuthoritative(tenantId: String) {
+        open(tenantId).use { helper ->
+            val database = helper.writableDatabase
+            database.beginTransaction()
+            try {
+                upsertMetadata(database, META_AUTHORITATIVE, "true", previousKnown = false)
+                database.setTransactionSuccessful()
+            } finally {
+                database.endTransaction()
+            }
+        }
+    }
+
+    private fun isAuthoritative(tenantId: String): Boolean = runCatching {
+        open(tenantId).use { helper ->
+            helper.readableDatabase.query(
+                TABLE_METADATA,
+                arrayOf(COLUMN_VALUE),
+                "$COLUMN_ID = ?",
+                arrayOf(META_AUTHORITATIVE),
+                null,
+                null,
+                null,
+            ).use { cursor -> cursor.moveToFirst() && cursor.getString(0) == "true" }
+        }
+    }.getOrDefault(false)
+
+    private fun discardNormalizedReplacement(tenantId: String) {
+        if (databaseFile(tenantId).exists()) {
+            check(applicationContext.deleteDatabase(databaseName(tenantId))) {
+                "Could not discard an unverified normalized tenant store"
+            }
+        }
+        deleteSecretKey(tenantId)
+    }
+
     private fun retireReleasedStoreIfPresent(tenantId: String) {
-        if (releasedStateExists(tenantId)) {
+        if (releasedArtifactsExist(tenantId)) {
             LegacyEncryptedSyncStateStore(applicationContext).clearSyncState(tenantId)
         }
     }
+
+    private fun releasedArtifactsExist(tenantId: String): Boolean =
+        releasedStateExists(tenantId) || KeyStore.getInstance("AndroidKeyStore").run {
+            load(null)
+            containsAlias("blocks-sync-db-v1-${tenantDigest(tenantId)}") ||
+                containsAlias("blocks-sync-state-v1-${tenantDigest(tenantId)}")
+        }
 
     private fun releasedStateExists(tenantId: String): Boolean =
         applicationContext.getDatabasePath("blocks_sync_${tenantDigest(tenantId)}.db").exists() ||
@@ -672,6 +734,7 @@ class AndroidSyncStateStore internal constructor(
         const val META_ARCHIVED_PROJECTS_LOADED = "archived_projects_loaded"
         const val META_BLOCKS_LOADED = "blocks_loaded"
         const val META_PROJECT_DRAFTS_MIGRATED = "project_drafts_migrated"
+        const val META_AUTHORITATIVE = "authoritative_cutover"
         val SECRET_TABLES = setOf(TABLE_LOCAL_BLOCKS, TABLE_LOCAL_BLOCK_OPERATIONS)
         val STATE_TABLES = listOf(
             TABLE_PROJECTS,
@@ -699,4 +762,9 @@ class AndroidSyncStateStore internal constructor(
             TABLE_PROJECT_UI_PREFERENCES,
         )
     }
+}
+
+internal enum class MigrationCheckpoint {
+    NORMALIZED_COMMITTED,
+    VERIFIED_MARKER_COMMITTED,
 }

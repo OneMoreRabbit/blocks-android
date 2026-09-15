@@ -45,7 +45,9 @@ class AndroidNormalizedSyncStateStoreTest {
     @Before
     @After
     fun clear() {
-        listOf(TENANT, FAILED_TENANT, OTHER_TENANT).forEach { store.clearSyncState(it) }
+        listOf(TENANT, FAILED_TENANT, OTHER_TENANT, BEFORE_MARKER_TENANT, AFTER_MARKER_TENANT).forEach {
+            store.clearSyncState(it)
+        }
     }
 
     @Test
@@ -70,13 +72,54 @@ class AndroidNormalizedSyncStateStoreTest {
     fun failedCutoverLeavesReleasedSnapshotAndKeyRetryable() {
         val released = state(FAILED_TENANT)
         LegacyEncryptedSyncStateStore(context).saveSyncState(FAILED_TENANT, released)
-        val failing = AndroidSyncStateStore(context) { _, _ -> error("simulated cutover check") }
+        val failing = AndroidSyncStateStore(
+            context,
+            migrationVerifier = { _, _ -> error("simulated cutover check") },
+        )
 
         assertTrue(runCatching { failing.loadSyncState(FAILED_TENANT) }.isFailure)
         assertFalse(normalizedDatabase(FAILED_TENANT).exists())
         assertTrue(releasedDatabase(FAILED_TENANT).isFile)
         assertTrue(keyStore().containsAlias(releasedKeyAlias(FAILED_TENANT)))
         assertEquals(released, store.loadSyncState(FAILED_TENANT))
+    }
+
+    @Test
+    fun processDeathAfterReplacementCommitRebuildsAndReverifiesFromReleasedSource() {
+        val released = state(BEFORE_MARKER_TENANT)
+        LegacyEncryptedSyncStateStore(context).saveSyncState(BEFORE_MARKER_TENANT, released)
+        val interrupted = AndroidSyncStateStore(context, migrationCheckpoint = { checkpoint ->
+            if (checkpoint == MigrationCheckpoint.NORMALIZED_COMMITTED) throw SimulatedProcessDeath()
+        })
+
+        assertTrue(runCatching { interrupted.loadSyncState(BEFORE_MARKER_TENANT) }.isFailure)
+        assertTrue(normalizedDatabase(BEFORE_MARKER_TENANT).isFile)
+        assertFalse(hasAuthoritativeMarker(BEFORE_MARKER_TENANT))
+        assertTrue(releasedDatabase(BEFORE_MARKER_TENANT).isFile)
+        assertTrue(keyStore().containsAlias(releasedKeyAlias(BEFORE_MARKER_TENANT)))
+
+        assertEquals(released, store.loadSyncState(BEFORE_MARKER_TENANT))
+        assertTrue(hasAuthoritativeMarker(BEFORE_MARKER_TENANT))
+        assertFalse(releasedDatabase(BEFORE_MARKER_TENANT).exists())
+        assertFalse(keyStore().containsAlias(releasedKeyAlias(BEFORE_MARKER_TENANT)))
+    }
+
+    @Test
+    fun processDeathAfterVerifiedMarkerCompletesReleasedStoreRetirementOnRestart() {
+        val released = state(AFTER_MARKER_TENANT)
+        LegacyEncryptedSyncStateStore(context).saveSyncState(AFTER_MARKER_TENANT, released)
+        val interrupted = AndroidSyncStateStore(context, migrationCheckpoint = { checkpoint ->
+            if (checkpoint == MigrationCheckpoint.VERIFIED_MARKER_COMMITTED) throw SimulatedProcessDeath()
+        })
+
+        assertTrue(runCatching { interrupted.loadSyncState(AFTER_MARKER_TENANT) }.isFailure)
+        assertTrue(normalizedDatabase(AFTER_MARKER_TENANT).isFile)
+        assertTrue(hasAuthoritativeMarker(AFTER_MARKER_TENANT))
+        assertTrue(releasedDatabase(AFTER_MARKER_TENANT).isFile)
+
+        assertEquals(released, store.loadSyncState(AFTER_MARKER_TENANT))
+        assertFalse(releasedDatabase(AFTER_MARKER_TENANT).exists())
+        assertFalse(keyStore().containsAlias(releasedKeyAlias(AFTER_MARKER_TENANT)))
     }
 
     @Test
@@ -112,6 +155,57 @@ class AndroidNormalizedSyncStateStoreTest {
             setOf(AndroidSyncStateStore.TABLE_PROJECT_NOTES, AndroidSyncStateStore.TABLE_PROJECT_COMMANDS),
             auditedTables(TENANT),
         )
+    }
+
+    @Test
+    fun createTouchesOnlyItsStructuralIdentityAndQueueRows() {
+        val initial = state(TENANT).withoutCommands()
+        store.saveSyncState(TENANT, initial)
+        installAuditTriggers(TENANT)
+        val updated = initial.withCreatedProject()
+
+        store.saveProjectMutation(TENANT, initial, updated, ProjectMutationType.CREATE_PROJECT)
+
+        assertEquals(updated, store.loadSyncState(TENANT))
+        assertEquals(
+            setOf(
+                AndroidSyncStateStore.TABLE_METADATA,
+                AndroidSyncStateStore.TABLE_ACTIVE_PROJECTS,
+                AndroidSyncStateStore.TABLE_PROJECT_PAGES,
+                AndroidSyncStateStore.TABLE_PROJECT_NOTES,
+                AndroidSyncStateStore.TABLE_PROJECT_LINKS,
+                AndroidSyncStateStore.TABLE_PROVISIONAL_PROJECTS,
+                AndroidSyncStateStore.TABLE_PARKING_LOADED_PROJECTS,
+                AndroidSyncStateStore.TABLE_PROJECT_COMMANDS,
+            ),
+            auditedTables(TENANT),
+        )
+    }
+
+    @Test
+    fun parkTouchesOnlyItsAppendAndQueueRows() {
+        val initial = state(TENANT).withoutCommands()
+        store.saveSyncState(TENANT, initial)
+        installAuditTriggers(TENANT)
+        val updated = initial.withAddedParking()
+
+        store.saveProjectMutation(TENANT, initial, updated, ProjectMutationType.ADD_PARKING)
+
+        assertEquals(updated, store.loadSyncState(TENANT))
+        assertEquals(
+            setOf(AndroidSyncStateStore.TABLE_PARKING_RECORDS, AndroidSyncStateStore.TABLE_PROJECT_COMMANDS),
+            auditedTables(TENANT),
+        )
+    }
+
+    @Test
+    fun createFailureCommitsNeitherDomainNorQueueRows() {
+        assertMutationRollsBack(ProjectMutationType.CREATE_PROJECT) { it.withCreatedProject() }
+    }
+
+    @Test
+    fun parkFailureCommitsNeitherDomainNorQueueRows() {
+        assertMutationRollsBack(ProjectMutationType.ADD_PARKING) { it.withAddedParking() }
     }
 
     @Test
@@ -258,10 +352,98 @@ class AndroidNormalizedSyncStateStoreTest {
         )
     }
 
+    private fun TenantSyncState.withoutCommands() = copy(
+        projectCache = projectCache.copy(commands = emptyList()),
+    )
+
+    private fun TenantSyncState.withCreatedProject(): TenantSyncState {
+        val project = ProjectSummary(
+            id = CREATED_PROJECT,
+            tenantId = TENANT,
+            name = "New workbench",
+            lifecycle = ProjectLifecycle.ACTIVE,
+            rowVersion = 0,
+            createdAt = NOW,
+            updatedAt = NOW,
+            clientId = CREATED_PROJECT,
+        )
+        val page = ProjectPage(project, ProjectNotes(CREATED_PROJECT, "", 0, NOW), null)
+        val command = ProjectMutation(
+            operationId = "create-operation",
+            type = ProjectMutationType.CREATE_PROJECT,
+            targetId = CREATED_PROJECT,
+            idempotencyKey = "create-operation",
+            clientResourceId = CREATED_PROJECT,
+            projectName = project.name,
+            localCreatedAt = NOW,
+        )
+        return copy(
+            projectCache = projectCache.copy(
+                activeProjects = projectCache.activeProjects + project,
+                pages = projectCache.pages + page,
+                parkingLoadedProjectIds = projectCache.parkingLoadedProjectIds + CREATED_PROJECT,
+                projectLinks = projectCache.projectLinks +
+                    ProjectLinkIdentity(CREATED_PROJECT, ProjectKey.parse(CREATED_PROJECT)!!),
+                commands = projectCache.commands + command,
+                provisionalProjectIds = projectCache.provisionalProjectIds + CREATED_PROJECT,
+            ),
+        )
+    }
+
+    private fun TenantSyncState.withAddedParking(): TenantSyncState {
+        val parking = ProjectParking(
+            id = CREATED_PARKING,
+            projectId = PROJECT,
+            location = "Cutting bench",
+            nextAction = "Mark the joint",
+            mustNotForget = "Use the square",
+            authoredByUserId = "local",
+            createdAt = NOW,
+            occurredAt = NOW,
+            clientId = CREATED_PARKING,
+        )
+        val command = ProjectMutation(
+            operationId = "parking-operation",
+            type = ProjectMutationType.ADD_PARKING,
+            targetId = PROJECT,
+            projectId = PROJECT,
+            idempotencyKey = "parking-operation",
+            clientResourceId = CREATED_PARKING,
+            parking = ParkingDraft(parking.location, parking.nextAction, parking.mustNotForget),
+            localCreatedAt = NOW,
+        )
+        return copy(
+            projectCache = projectCache.copy(
+                pages = projectCache.pages.map { page ->
+                    if (page.project.id == PROJECT) page.copy(newestParking = parking) else page
+                },
+                parkingRecords = projectCache.parkingRecords + parking,
+                commands = projectCache.commands + command,
+            ),
+        )
+    }
+
+    private fun assertMutationRollsBack(
+        type: ProjectMutationType,
+        update: (TenantSyncState) -> TenantSyncState,
+    ) {
+        val initial = state(TENANT).withoutCommands()
+        store.saveSyncState(TENANT, initial)
+        installAuditTriggers(TENANT)
+        val failing = AndroidSyncStateStore(context, beforeMutationCommit = { attempted ->
+            if (attempted == type) error("simulated commit failure")
+        })
+
+        assertTrue(runCatching { failing.saveProjectMutation(TENANT, initial, update(initial), type) }.isFailure)
+        assertEquals(initial, store.loadSyncState(TENANT))
+        assertTrue(auditedTables(TENANT).isEmpty())
+    }
+
     private fun installAuditTriggers(tenantId: String) {
         SQLiteDatabase.openDatabase(normalizedDatabase(tenantId).path, null, SQLiteDatabase.OPEN_READWRITE).use { db ->
             db.execSQL("CREATE TABLE write_audit (table_name TEXT NOT NULL)")
-            AndroidSyncStateStore.STATE_TABLES.forEachIndexed { index, table ->
+            (listOf(AndroidSyncStateStore.TABLE_METADATA) + AndroidSyncStateStore.STATE_TABLES)
+                .forEachIndexed { index, table ->
                 listOf("INSERT", "UPDATE", "DELETE").forEachIndexed { operationIndex, operation ->
                     db.execSQL(
                         "CREATE TRIGGER audit_${index}_$operationIndex AFTER $operation ON $table " +
@@ -277,6 +459,14 @@ class AndroidNormalizedSyncStateStoreTest {
             db.rawQuery("SELECT DISTINCT table_name FROM write_audit", null).use { cursor ->
                 buildSet { while (cursor.moveToNext()) add(cursor.getString(0)) }
             }
+        }
+
+    private fun hasAuthoritativeMarker(tenantId: String): Boolean =
+        SQLiteDatabase.openDatabase(normalizedDatabase(tenantId).path, null, SQLiteDatabase.OPEN_READONLY).use { db ->
+            db.rawQuery(
+                "SELECT value FROM ${AndroidSyncStateStore.TABLE_METADATA} WHERE record_id = ?",
+                arrayOf(AndroidSyncStateStore.META_AUTHORITATIVE),
+            ).use { cursor -> cursor.moveToFirst() && cursor.getString(0) == "true" }
         }
 
     private fun normalizedDatabase(tenantId: String) = context.getDatabasePath(
@@ -296,9 +486,15 @@ class AndroidNormalizedSyncStateStoreTest {
         const val TENANT = "00000000-0000-0000-0000-000000000071"
         const val FAILED_TENANT = "00000000-0000-0000-0000-000000000072"
         const val OTHER_TENANT = "00000000-0000-0000-0000-000000000073"
+        const val BEFORE_MARKER_TENANT = "00000000-0000-0000-0000-000000000074"
+        const val AFTER_MARKER_TENANT = "00000000-0000-0000-0000-000000000075"
         const val PROJECT = "123e4567-e89b-12d3-a456-426614174071"
         const val OTHER_PROJECT = "223e4567-e89b-12d3-a456-426614174073"
+        const val CREATED_PROJECT = "323e4567-e89b-12d3-a456-426614174074"
+        const val CREATED_PARKING = "423e4567-e89b-12d3-a456-426614174075"
         const val NOW = "2026-09-15T12:00:00Z"
         val TAG_TOKEN = OpaqueTagToken.fromBytes(ByteArray(32) { (it + 41).toByte() })
     }
+
+    private class SimulatedProcessDeath : Error("simulated process death")
 }

@@ -107,7 +107,13 @@ internal data class ProjectAppDependencies(
     val observeConnectivity: Boolean = true,
     val nfcTagPlatform: NfcTagPlatform? = null,
     val coverImporter: ProjectCoverImporter? = null,
+    val coverSourceActions: CoverSourceActions? = null,
 )
+
+internal interface CoverSourceActions {
+    fun takePhoto(projectId: String)
+    fun chooseImage(projectId: String)
+}
 
 private sealed interface ActiveTagAction {
     data class Write(val link: ProjectLink) : ActiveTagAction
@@ -1038,7 +1044,11 @@ class MainActivity : ComponentActivity() {
                 return@setOnClickListener
             }
             dialog.dismiss()
-            runRepositoryAction(syncAfter = true) { controller.createProject(value) }
+            val previousProjectIds = controller.state.activeProjects.mapTo(mutableSetOf()) { it.id }
+            runRepositoryAction(
+                syncAfter = true,
+                renderCommitted = { renderCreatedProject(previousProjectIds) },
+            ) { controller.createProject(value) }
         }
         dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
             dialog.dismiss()
@@ -1082,11 +1092,16 @@ class MainActivity : ComponentActivity() {
         showManagedDialog(
             AlertDialog.Builder(this)
                 .setTitle("Project cover")
-                .setMessage("Choose how this project appears on your dashboard.")
                 .setItems(items.toTypedArray()) { _, which ->
                     when (items[which]) {
-                        "Take photo", "Take replacement photo" -> launchCoverCamera(page.project.id)
-                        "Choose image", "Choose replacement image" -> launchCoverPicker(page.project.id)
+                        "Take photo", "Take replacement photo" -> {
+                            dependencies.coverSourceActions?.takePhoto(page.project.id)
+                                ?: launchCoverCamera(page.project.id)
+                        }
+                        "Choose image", "Choose replacement image" -> {
+                            dependencies.coverSourceActions?.chooseImage(page.project.id)
+                                ?: launchCoverPicker(page.project.id)
+                        }
                         "Remove cover" -> confirmRemoveCover()
                     }
                 }
@@ -2075,6 +2090,7 @@ class MainActivity : ComponentActivity() {
         afterRender: Boolean = true,
         syncAfter: Boolean = false,
         complete: (() -> Unit)? = null,
+        renderCommitted: (() -> Boolean)? = null,
         action: () -> Unit,
     ) {
         source?.let {
@@ -2082,15 +2098,41 @@ class MainActivity : ComponentActivity() {
             it.alpha = 0.55f
         }
         uiScope.launch {
+            var committed = false
             try {
                 withContext(NonCancellable + localStateDispatcher) { action() }
+                committed = true
             } catch (error: Exception) {
                 handleRepositoryError(error)
             }
-            if (afterRender) render()
+            if (afterRender && !(committed && renderCommitted?.invoke() == true)) render()
             complete?.invoke()
             if (syncAfter) synchronizeAutomatically()
         }
+    }
+
+    /** Adds one committed create result without rebuilding every existing dashboard row. */
+    private fun renderCreatedProject(previousProjectIds: Set<String>): Boolean {
+        if (
+            controller.state.screen != ProjectScreen.DASHBOARD ||
+            controller.state.archiveMode ||
+            dashboardSearchQuery.isNotEmpty() ||
+            controller.state.dashboardView != DashboardView.TILES
+        ) return false
+        val created = controller.state.activeProjects.singleOrNull { it.id !in previousProjectIds } ?: return false
+        val grid = content.findViewById<GridLayout>(ProjectUiIds.PROJECT_TILES) ?: return false
+        val position = controller.state.activeProjects.indexOfFirst { it.id == created.id }
+        if (position < 0 || grid.childCount != previousProjectIds.size) return false
+        grid.addView(
+            projectTile(created, archiveMode = false),
+            position,
+            GridLayout.LayoutParams().apply {
+                width = 0
+                columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1, 1f)
+                setMargins(dp(4), dp(4), dp(4), dp(4))
+            },
+        )
+        return true
     }
 
     private fun registerConnectivitySync() {
