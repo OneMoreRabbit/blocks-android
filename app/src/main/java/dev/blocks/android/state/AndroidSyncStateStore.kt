@@ -562,13 +562,9 @@ private fun requireCoverTenantScope(tenantId: String, state: TenantSyncState) {
     }
 }
 
-/**
- * One SQLite database per tenant. Every logical value is an independently authenticated
- * ciphertext; only table structure, row order, and non-secret metadata names remain visible.
- * A tenant-specific AES key lives in Android Keystore, and each state replacement is one
- * SQLite transaction so a queue/cursor/cache snapshot cannot be partially committed.
- */
-class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
+/** Released 0.7.0 encrypted snapshot reader; new writes use [AndroidSyncStateStore]. */
+/** Read-only compatibility implementation retained for the forward migration from 0.7.0. */
+internal class LegacyEncryptedSyncStateStore(context: Context) : SyncStateStore {
     private val applicationContext = context.applicationContext
     private val rowCodec = SyncStateRowCodec()
     private val legacyCodec = LegacySyncStateJsonCodec()

@@ -52,6 +52,7 @@ import dev.blocks.android.cover.AndroidEncryptedProjectCoverMediaStore
 import dev.blocks.android.cover.CoverCaptureFiles
 import dev.blocks.android.cover.PendingCameraCover
 import dev.blocks.android.cover.ProjectCoverImporter
+import dev.blocks.android.mvp.FormDrafts
 import dev.blocks.android.mvp.ParkingDraft
 import dev.blocks.android.mvp.Session
 import dev.blocks.android.project.ProjectFormField
@@ -63,7 +64,7 @@ import dev.blocks.android.project.ProjectPresentationController
 import dev.blocks.android.project.ProjectScreen
 import dev.blocks.android.project.ProjectSummary
 import dev.blocks.android.state.AndroidEncryptedDraftStore
-import dev.blocks.android.state.AndroidEncryptedSyncStateStore
+import dev.blocks.android.state.AndroidSyncStateStore
 import dev.blocks.android.state.SessionContinuity
 import dev.blocks.android.state.SessionContinuityStore
 import dev.blocks.android.sync.LegacyOperationReplayer
@@ -83,6 +84,7 @@ import dev.blocks.android.tag.TagLaunchIntent
 import dev.blocks.android.tag.TagShareIntent
 import com.google.zxing.BarcodeFormat
 import com.journeyapps.barcodescanner.BarcodeEncoder
+import com.google.gson.Gson
 import java.net.URI
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -105,7 +107,13 @@ internal data class ProjectAppDependencies(
     val observeConnectivity: Boolean = true,
     val nfcTagPlatform: NfcTagPlatform? = null,
     val coverImporter: ProjectCoverImporter? = null,
+    val coverSourceActions: CoverSourceActions? = null,
 )
+
+internal interface CoverSourceActions {
+    fun takePhoto(projectId: String)
+    fun chooseImage(projectId: String)
+}
 
 private sealed interface ActiveTagAction {
     data class Write(val link: ProjectLink) : ActiveTagAction
@@ -167,6 +175,8 @@ internal object ProjectUiIds {
     const val VIEW_LIST = 1062
     const val SEARCH_EMPTY = 1063
     const val DASHBOARD_WATERMARK = 1064
+    const val ROOT_CONTAINER = 1065
+    const val TOP_NAVIGATION = 1066
     const val PROJECT_COVER = 1070
     const val EDIT_COVER = 1071
 }
@@ -186,10 +196,14 @@ class MainActivity : ComponentActivity() {
     }.asCoroutineDispatcher()
     private lateinit var content: LinearLayout
     private lateinit var rootScroll: ScrollView
+    private lateinit var topNavigation: LinearLayout
+    private lateinit var bottomActions: LinearLayout
     private var syncJob: Job? = null
     private var credentialJob: Job? = null
     private var restoreProjectId: String? = null
     private var dashboardSearchQuery: String = ""
+    private var transientDraftsToRestore: FormDrafts? = null
+    private var transientParkingToRestore: Boolean = false
     private var pendingCameraCover: PendingCameraCover? = null
     private var pendingCoverProjectId: String? = null
     private var renderGeneration = 0L
@@ -216,6 +230,10 @@ class MainActivity : ComponentActivity() {
         consumeTagIntent(intent, clearActivityIntent = true)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         restoreProjectId = savedInstanceState?.getString(STATE_PROJECT_ID)
+        transientDraftsToRestore = savedInstanceState?.getString(STATE_TRANSIENT_DRAFTS)?.let {
+            Gson().fromJson(it, FormDrafts::class.java)
+        }
+        transientParkingToRestore = savedInstanceState?.getBoolean(STATE_TRANSIENT_PARKING, false) ?: false
         pendingCoverProjectId = savedInstanceState?.getString(STATE_COVER_PROJECT_ID)
         val interruptedCapture = coverCaptureFiles.restore(savedInstanceState?.getString(STATE_CAMERA_COVER_PATH))
         if (interruptedCapture != null) pendingCoverProjectId = null
@@ -224,20 +242,36 @@ class MainActivity : ComponentActivity() {
             coverCaptureFiles.cleanupOrphans()
             coverImporter.cleanupAbandonedSources()
         }
+        val root = LinearLayout(this).apply {
+            id = ProjectUiIds.ROOT_CONTAINER
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(brandColor(R.color.blocks_paper))
+        }
+        topNavigation = LinearLayout(this).apply {
+            id = ProjectUiIds.TOP_NAVIGATION
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(8), dp(16), dp(6))
+        }
         content = LinearLayout(this).apply {
             id = ProjectUiIds.CONTENT
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.TOP
-            setPadding(dp(24), dp(24), dp(24), dp(24))
+            setPadding(dp(16), dp(8), dp(16), dp(8))
             setBackgroundColor(brandColor(R.color.blocks_paper))
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT,
             )
         }
-        ViewCompat.setOnApplyWindowInsetsListener(content) { view, insets ->
+        bottomActions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(dp(16), dp(6), dp(16), dp(8))
+        }
+        ViewCompat.setOnApplyWindowInsetsListener(root) { _, insets ->
             val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
-            view.setPadding(dp(24), systemBars.top + dp(24), dp(24), systemBars.bottom + dp(24))
+            topNavigation.setPadding(dp(16), systemBars.top + dp(8), dp(16), dp(6))
+            bottomActions.setPadding(dp(16), dp(6), dp(16), systemBars.bottom + dp(8))
             insets
         }
         rootScroll = ScrollView(this).apply {
@@ -246,8 +280,15 @@ class MainActivity : ComponentActivity() {
             setBackgroundColor(brandColor(R.color.blocks_paper))
             addView(content)
         }
-        setContentView(rootScroll)
-        ViewCompat.requestApplyInsets(content)
+        root.addView(topNavigation)
+        root.addView(rootScroll, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            0,
+            1f,
+        ))
+        root.addView(bottomActions)
+        setContentView(root)
+        ViewCompat.requestApplyInsets(root)
         onBackPressedDispatcher.addCallback(
             this,
             object : OnBackPressedCallback(true) {
@@ -303,6 +344,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onSaveInstanceState(outState: Bundle) {
         controller.state.projectPage?.project?.id?.let { outState.putString(STATE_PROJECT_ID, it) }
+        if (controller.isAuthenticated) {
+            outState.putString(STATE_TRANSIENT_DRAFTS, Gson().toJson(controller.state.drafts))
+            outState.putBoolean(STATE_TRANSIENT_PARKING, controller.state.showParkingForm)
+        }
         pendingCoverProjectId?.let { outState.putString(STATE_COVER_PROJECT_ID, it) }
         pendingCameraCover?.path?.let { outState.putString(STATE_CAMERA_COVER_PATH, it) }
         super.onSaveInstanceState(outState)
@@ -310,7 +355,7 @@ class MainActivity : ComponentActivity() {
 
     private fun productionDependencies(): ProjectAppDependencies {
         val draftStore = AndroidEncryptedDraftStore(this)
-        val syncStore = AndroidEncryptedSyncStateStore(this)
+        val syncStore = AndroidSyncStateStore(this)
         val baseUri = URI(BuildConfig.BLOCKS_API_BASE_URL)
         val sessionClient = BlocksApiClient(baseUri, BuildConfig.BLOCKS_SERVICE_API_VERSION)
         val sessionAuthenticator = ServiceSessionAuthenticator(sessionClient::exchangeSession)
@@ -336,6 +381,9 @@ class MainActivity : ComponentActivity() {
         coverJobs.forEach { it.cancel() }
         coverJobs.clear()
         content.removeAllViews()
+        topNavigation.removeAllViews()
+        bottomActions.removeAllViews()
+        if (!continuity.shouldRestore) restoreTransientDraftsIfReady()
         if (controller.state.screen == ProjectScreen.PROJECT && controller.state.showParkingForm) {
             renderParkingSheet()
             return
@@ -355,7 +403,6 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun renderTopBar() {
-        if (controller.state.screen == ProjectScreen.DASHBOARD) return
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -371,27 +418,28 @@ class MainActivity : ComponentActivity() {
                     marginStart = dp(8)
                 },
             )
-        } else {
+        } else if (controller.state.screen == ProjectScreen.PROJECT) {
             bar.addView(
-                iconTextButton("Projects", R.drawable.ic_back) {
+                iconOnlyButton(R.drawable.ic_back, "Dashboard") {
                     controller.backToDashboard()
                     render()
                 }.apply { id = ProjectUiIds.MAIN },
-                LinearLayout.LayoutParams(0, dp(48), 1f),
+                LinearLayout.LayoutParams(dp(48), dp(48)),
             )
         }
-        if (controller.state.pendingChanges) {
-            bar.addView(label("●", 16f, Color.rgb(96, 104, 100)).apply {
-                id = ProjectUiIds.PENDING_CHANGES
-                contentDescription = "Changes pending"
-            })
+        if (controller.state.screen == ProjectScreen.DASHBOARD) {
+            bar.addView(dashboardControls(), LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(48),
+            ))
         }
         if (controller.state.screen == ProjectScreen.PROJECT) {
+            bar.addView(View(this), LinearLayout.LayoutParams(0, 0, 1f))
             bar.addView(iconOnlyButton(R.drawable.ic_more, "Project settings") { showProjectSettings() }.apply {
                 id = ProjectUiIds.PROJECT_SETTINGS
             })
         }
-        content.addView(bar)
+        topNavigation.addView(bar)
     }
 
     private fun renderLogin() {
@@ -410,7 +458,6 @@ class MainActivity : ComponentActivity() {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
         }
-        body.addView(dashboardControls())
         if (archiveMode) body.addView(heading("Archive", 24f).apply { setPadding(0, dp(16), 0, dp(8)) })
 
         val collection = FrameLayout(this).apply {
@@ -438,26 +485,31 @@ class MainActivity : ComponentActivity() {
         populateDashboardCollection(collection, projects, archiveMode)
 
         if (archiveMode) {
-            body.addView(secondaryButton("Projects", R.drawable.ic_back) { source ->
+            bottomActions.addView(secondaryButton("Projects", R.drawable.ic_back) { source ->
                 runRepositoryAction(source = source) { controller.showMainDashboard() }
-            }.apply { id = ProjectUiIds.ARCHIVE_MAIN })
+            }.apply { id = ProjectUiIds.ARCHIVE_MAIN }, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(48),
+            ))
         } else {
             val actions = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER
-                setPadding(0, dp(16), 0, 0)
             }
             actions.addView(
                 primaryButton("Create project", R.drawable.ic_plus) { showCreateProject() }.apply {
                     id = ProjectUiIds.CREATE_PROJECT
                 },
-                LinearLayout.LayoutParams(0, dp(52), 1.6f).apply { marginEnd = dp(8) },
+                LinearLayout.LayoutParams(0, dp(48), 1.6f).apply { marginEnd = dp(6) },
             )
             actions.addView(
                 secondaryButton("Archive", R.drawable.ic_archive) { openArchiveMode() },
-                LinearLayout.LayoutParams(0, dp(52), 1f).apply { marginStart = dp(8) },
+                LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(6) },
             )
-            body.addView(actions)
+            bottomActions.addView(actions, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(48),
+            ))
         }
         content.addView(
             body,
@@ -478,7 +530,7 @@ class MainActivity : ComponentActivity() {
         val controls = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, 0, 0, dp(12))
+            setPadding(0, 0, 0, 0)
         }
         val search = EditText(this).apply {
             id = ProjectUiIds.SEARCH
@@ -490,7 +542,7 @@ class MainActivity : ComponentActivity() {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
             setTextColor(brandColor(R.color.blocks_ink))
             setHintTextColor(brandColor(R.color.blocks_muted))
-            textSize = 16f
+            textSize = 14f
             typeface = interTypeface
             setPadding(dp(14), 0, dp(10), 0)
             setCompoundDrawablesRelativeWithIntrinsicBounds(R.drawable.ic_search, 0, 0, 0)
@@ -508,7 +560,7 @@ class MainActivity : ComponentActivity() {
                 collection?.let { populateDashboardCollection(it, projects, controller.state.archiveMode) }
             })
         }
-        controls.addView(search, LinearLayout.LayoutParams(0, dp(52), 1f).apply { marginEnd = dp(8) })
+        controls.addView(search, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginEnd = dp(6) })
 
         val toggle = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -529,16 +581,8 @@ class MainActivity : ComponentActivity() {
         )
         controls.addView(toggle, LinearLayout.LayoutParams(dp(96), dp(48)).apply {
             marginStart = dp(4)
-            marginEnd = dp(8)
+            marginEnd = dp(4)
         })
-
-        if (controller.state.pendingChanges) {
-            controls.addView(label("●", 14f, brandColor(R.color.blocks_muted)).apply {
-                id = ProjectUiIds.PENDING_CHANGES
-                contentDescription = "Changes pending"
-                setPadding(0, 0, dp(4), 0)
-            })
-        }
         controls.addView(iconOnlyButton(R.drawable.ic_settings, "Settings") { showSettings() }.apply {
             id = ProjectUiIds.SETTINGS
         }, LinearLayout.LayoutParams(dp(48), dp(48)))
@@ -576,14 +620,14 @@ class MainActivity : ComponentActivity() {
         columnCount = dashboardColumnCount()
         alignmentMode = GridLayout.ALIGN_BOUNDS
         useDefaultMargins = false
-        setPadding(0, dp(4), 0, dp(4))
+        setPadding(0, dp(2), 0, dp(2))
         projects.forEach { project ->
             addView(
                 projectTile(project, archiveMode),
                 GridLayout.LayoutParams().apply {
                     width = 0
                     columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1, 1f)
-                    setMargins(dp(6), dp(6), dp(6), dp(6))
+                    setMargins(dp(4), dp(4), dp(4), dp(4))
                 },
             )
         }
@@ -604,31 +648,31 @@ class MainActivity : ComponentActivity() {
         clipToOutline = true
         configureProjectQuickLink(project, archiveMode)
         val image = projectImage(project, thumbnail = true)
-        addView(image, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(116)))
+        addView(image, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(92)))
         addView(
             projectButton(project, archiveMode).apply {
                 gravity = Gravity.START or Gravity.CENTER_VERTICAL
                 setPadding(dp(14), 0, dp(10), 0)
                 background = null
             },
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(58)),
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)),
         )
     }
 
     private fun projectRow(project: ProjectSummary, archiveMode: Boolean) = LinearLayout(this).apply {
         orientation = LinearLayout.HORIZONTAL
         gravity = Gravity.CENTER_VERTICAL
-        minimumHeight = dp(88)
-        setPadding(0, dp(8), 0, dp(8))
+        minimumHeight = dp(72)
+        setPadding(0, dp(4), 0, dp(4))
         configureProjectQuickLink(project, archiveMode)
-        addView(projectImage(project, thumbnail = true), LinearLayout.LayoutParams(dp(112), dp(72)).apply {
-            marginEnd = dp(14)
+        addView(projectImage(project, thumbnail = true), LinearLayout.LayoutParams(dp(88), dp(60)).apply {
+            marginEnd = dp(10)
         })
         addView(projectButton(project, archiveMode).apply {
             gravity = Gravity.START or Gravity.CENTER_VERTICAL
             background = null
             setPadding(0, 0, dp(8), 0)
-        }, LinearLayout.LayoutParams(0, dp(64), 1f))
+        }, LinearLayout.LayoutParams(0, dp(56), 1f))
         addView(ImageView(this@MainActivity).apply {
             setImageResource(R.drawable.ic_arrow)
             contentDescription = null
@@ -663,7 +707,7 @@ class MainActivity : ComponentActivity() {
 
     private fun projectImage(project: ProjectSummary, thumbnail: Boolean) = ImageView(this).apply {
         scaleType = ImageView.ScaleType.CENTER_INSIDE
-        setPadding(dp(18), dp(12), dp(18), dp(12))
+        setPadding(dp(12), dp(8), dp(12), dp(8))
         background = roundedBackground(brandColor(R.color.blocks_soft), Color.TRANSPARENT, 10f)
         setImageResource(R.drawable.blocks_foreground)
         contentDescription = null
@@ -765,7 +809,7 @@ class MainActivity : ComponentActivity() {
         content.tag = ProjectUiIds.SCREEN_PROJECT
         val page = requireNotNull(controller.state.projectPage)
         content.addView(heading(page.project.name, 30f).apply {
-            setPadding(0, dp(18), 0, dp(14))
+            setPadding(0, dp(6), 0, dp(8))
         })
 
         val coverFrame = FrameLayout(this).apply {
@@ -791,8 +835,8 @@ class MainActivity : ComponentActivity() {
         )
         content.addView(
             coverFrame,
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(210)).apply {
-                bottomMargin = dp(18)
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(112)).apply {
+                bottomMargin = dp(12)
             },
         )
 
@@ -813,13 +857,13 @@ class MainActivity : ComponentActivity() {
             parkingCard.addView(fieldValue("Must not forget", newestParking.mustNotForget))
         }
         content.addView(parkingCard)
-        content.addView(primaryButton("Park", R.drawable.ic_park) {
+        bottomActions.addView(primaryButton("Park", R.drawable.ic_park) {
             controller.showParkingForm()
             render()
         }.apply { id = ProjectUiIds.PARK }, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
-            dp(52),
-        ).apply { topMargin = dp(12); bottomMargin = dp(22) })
+            dp(48),
+        ))
 
         content.addView(heading("Notes", 22f))
         val notesValue = controller.state.drafts.projectNotes[page.project.id] ?: page.notes.body
@@ -828,11 +872,14 @@ class MainActivity : ComponentActivity() {
         }.apply {
             id = ProjectUiIds.NOTES
             minLines = 4
+            maxLines = 10
             gravity = Gravity.TOP
+            isVerticalScrollBarEnabled = true
+            ViewCompat.setNestedScrollingEnabled(this, true)
         }
         notes.markInvalid(ProjectFormField.NOTES)
         notes.background = roundedBackground(brandColor(R.color.blocks_white), brandColor(R.color.blocks_input), 10f)
-        content.addView(notes, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(132)))
+        content.addView(notes, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         content.addView(primaryButton("Save notes", R.drawable.ic_edit) { source ->
             runRepositoryAction(source = source, syncAfter = true) {
                 controller.saveNotes(notes.text.toString())
@@ -899,7 +946,7 @@ class MainActivity : ComponentActivity() {
             controller.hideParkingForm()
             render()
         }.apply { id = ProjectUiIds.BACK })
-        content.addView(heading)
+        topNavigation.addView(heading)
         val draft = controller.state.drafts.projectParking[projectId] ?: ParkingDraft()
         var locationValue = draft.location
         var nextActionValue = draft.nextAction
@@ -911,21 +958,50 @@ class MainActivity : ComponentActivity() {
 
         val location = input("Where I am", locationValue) { locationValue = it; persist() }.apply {
             id = ProjectUiIds.PARKING_LOCATION
+            minLines = 3
+            maxLines = 6
+            gravity = Gravity.TOP
+            isVerticalScrollBarEnabled = true
+            ViewCompat.setNestedScrollingEnabled(this, true)
+            background = roundedBackground(brandColor(R.color.blocks_white), brandColor(R.color.blocks_input), 10f)
         }
         val nextAction = input("Next physical action", nextActionValue) { nextActionValue = it; persist() }.apply {
             id = ProjectUiIds.PARKING_NEXT_ACTION
+            minLines = 3
+            maxLines = 6
+            gravity = Gravity.TOP
+            isVerticalScrollBarEnabled = true
+            ViewCompat.setNestedScrollingEnabled(this, true)
+            background = roundedBackground(brandColor(R.color.blocks_white), brandColor(R.color.blocks_input), 10f)
         }
         val mustNotForget = input("Must not forget", mustNotForgetValue) {
             mustNotForgetValue = it
             persist()
-        }.apply { id = ProjectUiIds.PARKING_MUST_NOT_FORGET }
+        }.apply {
+            id = ProjectUiIds.PARKING_MUST_NOT_FORGET
+            minLines = 3
+            maxLines = 6
+            gravity = Gravity.TOP
+            isVerticalScrollBarEnabled = true
+            ViewCompat.setNestedScrollingEnabled(this, true)
+            background = roundedBackground(brandColor(R.color.blocks_white), brandColor(R.color.blocks_input), 10f)
+        }
         location.markInvalid(ProjectFormField.PARKING_LOCATION)
         nextAction.markInvalid(ProjectFormField.PARKING_NEXT_ACTION)
         mustNotForget.markInvalid(ProjectFormField.PARKING_MUST_NOT_FORGET)
-        content.addView(location)
-        content.addView(nextAction)
-        content.addView(mustNotForget)
-        content.addView(button("Save park message") { source ->
+        content.addView(location, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ).apply { bottomMargin = dp(10) })
+        content.addView(nextAction, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ).apply { bottomMargin = dp(10) })
+        content.addView(mustNotForget, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ))
+        bottomActions.addView(primaryButton("Save park message", R.drawable.ic_park) { source ->
             runRepositoryAction(source = source, syncAfter = true) {
                 controller.addParking(
                     location.text.toString(),
@@ -933,7 +1009,10 @@ class MainActivity : ComponentActivity() {
                     mustNotForget.text.toString(),
                 )
             }
-        }.apply { id = ProjectUiIds.SAVE_PARKING })
+        }.apply { id = ProjectUiIds.SAVE_PARKING }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            dp(48),
+        ))
     }
 
     private fun openArchiveMode() {
@@ -965,7 +1044,11 @@ class MainActivity : ComponentActivity() {
                 return@setOnClickListener
             }
             dialog.dismiss()
-            runRepositoryAction(syncAfter = true) { controller.createProject(value) }
+            val previousProjectIds = controller.state.activeProjects.mapTo(mutableSetOf()) { it.id }
+            runRepositoryAction(
+                syncAfter = true,
+                renderCommitted = { renderCreatedProject(previousProjectIds) },
+            ) { controller.createProject(value) }
         }
         dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
             dialog.dismiss()
@@ -1009,11 +1092,16 @@ class MainActivity : ComponentActivity() {
         showManagedDialog(
             AlertDialog.Builder(this)
                 .setTitle("Project cover")
-                .setMessage("Choose how this project appears on your dashboard.")
                 .setItems(items.toTypedArray()) { _, which ->
                     when (items[which]) {
-                        "Take photo", "Take replacement photo" -> launchCoverCamera(page.project.id)
-                        "Choose image", "Choose replacement image" -> launchCoverPicker(page.project.id)
+                        "Take photo", "Take replacement photo" -> {
+                            dependencies.coverSourceActions?.takePhoto(page.project.id)
+                                ?: launchCoverCamera(page.project.id)
+                        }
+                        "Choose image", "Choose replacement image" -> {
+                            dependencies.coverSourceActions?.chooseImage(page.project.id)
+                                ?: launchCoverPicker(page.project.id)
+                        }
                         "Remove cover" -> confirmRemoveCover()
                     }
                 }
@@ -1833,6 +1921,7 @@ class MainActivity : ComponentActivity() {
                             controller.openProject(projectId)
                             restoreProjectId = null
                         }
+                        restoreTransientDraftsIfReady()
                     }
                     render()
                     resolvePendingTagLocator()
@@ -1892,6 +1981,7 @@ class MainActivity : ComponentActivity() {
             if (priorTenantId == authenticated.tenantId) {
                 restoreProjectId?.let(controller::openProject)
             }
+            restoreTransientDraftsIfReady()
             restoreProjectId = null
         }
         continuity.shouldRestore = true
@@ -2000,6 +2090,7 @@ class MainActivity : ComponentActivity() {
         afterRender: Boolean = true,
         syncAfter: Boolean = false,
         complete: (() -> Unit)? = null,
+        renderCommitted: (() -> Boolean)? = null,
         action: () -> Unit,
     ) {
         source?.let {
@@ -2007,15 +2098,41 @@ class MainActivity : ComponentActivity() {
             it.alpha = 0.55f
         }
         uiScope.launch {
+            var committed = false
             try {
                 withContext(NonCancellable + localStateDispatcher) { action() }
+                committed = true
             } catch (error: Exception) {
                 handleRepositoryError(error)
             }
-            if (afterRender) render()
+            if (afterRender && !(committed && renderCommitted?.invoke() == true)) render()
             complete?.invoke()
             if (syncAfter) synchronizeAutomatically()
         }
+    }
+
+    /** Adds one committed create result without rebuilding every existing dashboard row. */
+    private fun renderCreatedProject(previousProjectIds: Set<String>): Boolean {
+        if (
+            controller.state.screen != ProjectScreen.DASHBOARD ||
+            controller.state.archiveMode ||
+            dashboardSearchQuery.isNotEmpty() ||
+            controller.state.dashboardView != DashboardView.TILES
+        ) return false
+        val created = controller.state.activeProjects.singleOrNull { it.id !in previousProjectIds } ?: return false
+        val grid = content.findViewById<GridLayout>(ProjectUiIds.PROJECT_TILES) ?: return false
+        val position = controller.state.activeProjects.indexOfFirst { it.id == created.id }
+        if (position < 0 || grid.childCount != previousProjectIds.size) return false
+        grid.addView(
+            projectTile(created, archiveMode = false),
+            position,
+            GridLayout.LayoutParams().apply {
+                width = 0
+                columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1, 1f)
+                setMargins(dp(4), dp(4), dp(4), dp(4))
+            },
+        )
+        return true
     }
 
     private fun registerConnectivitySync() {
@@ -2045,16 +2162,17 @@ class MainActivity : ComponentActivity() {
         dialog.show()
     }
 
-    /** Serializes encrypted draft writes off the main thread without reordering keystrokes. */
+    /** Form edits are deliberately memory-only; explicit buttons own persistence. */
     private fun queueDraftUpdate(action: () -> Unit) {
-        uiScope.launch {
-            try {
-                withContext(NonCancellable + localStateDispatcher) { action() }
-            } catch (error: Exception) {
-                handleRepositoryError(error)
-                render()
-            }
-        }
+        action()
+    }
+
+    private fun restoreTransientDraftsIfReady() {
+        val drafts = transientDraftsToRestore ?: return
+        if (!controller.isAuthenticated) return
+        controller.restoreTransientDrafts(drafts, transientParkingToRestore)
+        transientDraftsToRestore = null
+        transientParkingToRestore = false
     }
 
     private suspend fun handleRepositoryError(error: Exception) {
@@ -2098,6 +2216,8 @@ class MainActivity : ComponentActivity() {
         private const val STATE_PROJECT_ID = "project_id"
         private const val STATE_COVER_PROJECT_ID = "cover_project_id"
         private const val STATE_CAMERA_COVER_PATH = "camera_cover_path"
+        private const val STATE_TRANSIENT_DRAFTS = "transient_form_drafts"
+        private const val STATE_TRANSIENT_PARKING = "transient_parking_form"
         private const val DASHBOARD_COLLECTION_TAG = "dashboard_collection"
 
         @Volatile

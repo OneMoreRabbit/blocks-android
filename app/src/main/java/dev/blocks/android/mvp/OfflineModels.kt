@@ -1,6 +1,7 @@
 package dev.blocks.android.mvp
 
 import dev.blocks.android.project.ProjectCacheState
+import dev.blocks.android.project.ProjectMutationType
 import dev.blocks.android.project.ProjectUiPreferences
 
 data class ChangeEvent(
@@ -74,6 +75,14 @@ data class SyncResult(
 interface SyncStateStore {
     fun loadSyncState(tenantId: String): TenantSyncState
     fun saveSyncState(tenantId: String, state: TenantSyncState)
+    fun saveSyncState(tenantId: String, previous: TenantSyncState, state: TenantSyncState) =
+        saveSyncState(tenantId, state)
+    fun saveProjectMutation(
+        tenantId: String,
+        previous: TenantSyncState,
+        state: TenantSyncState,
+        type: ProjectMutationType,
+    ) = saveSyncState(tenantId, previous, state)
     fun clearSyncState(tenantId: String)
 }
 

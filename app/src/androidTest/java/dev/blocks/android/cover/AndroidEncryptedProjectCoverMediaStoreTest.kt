@@ -9,7 +9,7 @@ import dev.blocks.android.project.ProjectLifecycle
 import dev.blocks.android.project.ProjectNotes
 import dev.blocks.android.project.ProjectPage
 import dev.blocks.android.project.ProjectSummary
-import dev.blocks.android.state.AndroidEncryptedSyncStateStore
+import dev.blocks.android.state.AndroidSyncStateStore
 import dev.blocks.android.tag.ProjectKey
 import dev.blocks.android.tag.ProjectLinkIdentity
 import java.security.KeyStore
@@ -28,7 +28,7 @@ class AndroidEncryptedProjectCoverMediaStoreTest {
     private val context
         get() = InstrumentationRegistry.getInstrumentation().targetContext
     private val media by lazy { AndroidEncryptedProjectCoverMediaStore(context) }
-    private val state by lazy { AndroidEncryptedSyncStateStore(context) }
+    private val state by lazy { AndroidSyncStateStore(context) }
 
     @Before
     @After

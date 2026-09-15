@@ -67,7 +67,7 @@ import dev.blocks.android.project.ProjectWorkspace
 import dev.blocks.android.project.RegisteredBlock
 import dev.blocks.android.project.SessionAuthenticator
 import dev.blocks.android.state.AndroidEncryptedDraftStore
-import dev.blocks.android.state.AndroidEncryptedSyncStateStore
+import dev.blocks.android.state.AndroidSyncStateStore
 import dev.blocks.android.state.SessionContinuity
 import dev.blocks.android.sync.NoOpLegacyQueueReplay
 import dev.blocks.android.sync.ProjectSyncRepository
@@ -116,6 +116,7 @@ class MainActivityPresentationTest {
     private lateinit var presentationController: ProjectPresentationController
     private lateinit var nfc: FakeNfcTagPlatform
     private lateinit var coverImporter: FakeCoverImporter
+    private lateinit var coverSourceActions: FakeCoverSourceActions
     @Volatile
     private var sessionExchangeOffline = false
     @Volatile
@@ -136,6 +137,7 @@ class MainActivityPresentationTest {
         sessionExchanges = AtomicInteger()
         nfc = FakeNfcTagPlatform()
         coverImporter = FakeCoverImporter(context)
+        coverSourceActions = FakeCoverSourceActions()
         MainActivity.dependencyFactory = { activity ->
             val drafts = AndroidEncryptedDraftStore(activity)
             presentationController = ProjectPresentationController(
@@ -159,6 +161,7 @@ class MainActivityPresentationTest {
                 observeConnectivity = false,
                 nfcTagPlatform = nfc,
                 coverImporter = coverImporter,
+                coverSourceActions = coverSourceActions,
             )
         }
     }
@@ -167,7 +170,7 @@ class MainActivityPresentationTest {
     fun tearDown() {
         MainActivity.dependencyFactory = null
         AndroidEncryptedDraftStore(context).clear(TENANT_ID)
-        AndroidEncryptedSyncStateStore(context).clearSyncState(TENANT_ID)
+        AndroidSyncStateStore(context).clearSyncState(TENANT_ID)
         AndroidEncryptedAcceptedTenantContinuityStore(context).clear()
     }
 
@@ -867,22 +870,23 @@ class MainActivityPresentationTest {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             scenario.onActivity { activity ->
-                val content = activity.findViewById<LinearLayout>(ProjectUiIds.CONTENT)
+                val root = activity.findViewById<LinearLayout>(ProjectUiIds.ROOT_CONTAINER)
                 val topInset = 37
                 ViewCompat.dispatchApplyWindowInsets(
-                    content,
+                    root,
                     WindowInsetsCompat.Builder()
                         .setInsets(WindowInsetsCompat.Type.systemBars(), Insets.of(0, topInset, 0, 11))
                         .build(),
                 )
-                val comfortableSpacing = (24 * activity.resources.displayMetrics.density).toInt()
-                assertEquals(topInset + comfortableSpacing, content.paddingTop)
+                val topNavigation = activity.findViewById<View>(ProjectUiIds.TOP_NAVIGATION)
+                val compactSpacing = (8 * activity.resources.displayMetrics.density).toInt()
+                assertEquals(topInset + compactSpacing, topNavigation.paddingTop)
 
                 activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
                 activity.selectDialogItem("About")
                 val about = activity.dialogTexts().joinToString("\n")
                 assertTrue(about.contains("Blocks Android"))
-                assertTrue(about.contains("Version 0.7.0 (11)"))
+                assertTrue(about.contains("Version 0.7.1 (12)"))
                 assertTrue(about.contains("dev.blocks.android/debug"))
                 assertFalse(about.contains("tenant", ignoreCase = true))
                 assertFalse(about.contains("token", ignoreCase = true))
@@ -1024,7 +1028,7 @@ class MainActivityPresentationTest {
 
     @Test
     fun slowBackgroundApiDoesNotBlockImmediateEncryptedLocalCreate() {
-        val syncStore = AndroidEncryptedSyncStateStore(context).apply {
+        val syncStore = AndroidSyncStateStore(context).apply {
             clearSyncState(TENANT_ID)
             saveSyncState(
                 TENANT_ID,
@@ -1053,7 +1057,7 @@ class MainActivityPresentationTest {
                     service,
                     NoOpLegacyQueueReplay,
                     drafts,
-                    AndroidEncryptedSyncStateStore(activity),
+                    AndroidSyncStateStore(activity),
                     coverMediaStore = AndroidEncryptedProjectCoverMediaStore(activity),
                 ),
                 newOperationId = { "slow-api-${operationIds.incrementAndGet()}" },
@@ -1112,7 +1116,7 @@ class MainActivityPresentationTest {
 
     @Test
     fun processStyleOfflineRestartReadsRealEncryptedDatabaseThenReconcilesOnlyAfterReconnect() {
-        val syncStore = AndroidEncryptedSyncStateStore(context)
+        val syncStore = AndroidSyncStateStore(context)
         syncStore.clearSyncState(TENANT_ID)
         syncStore.saveSyncState(
             TENANT_ID,
@@ -1134,7 +1138,7 @@ class MainActivityPresentationTest {
         val exchanges = AtomicInteger()
         MainActivity.dependencyFactory = { activity ->
             val drafts = AndroidEncryptedDraftStore(activity)
-            val persisted = AndroidEncryptedSyncStateStore(activity)
+            val persisted = AndroidSyncStateStore(activity)
             ProjectAppDependencies(
                 controller = ProjectPresentationController(
                     SessionAuthenticator {
@@ -1183,7 +1187,7 @@ class MainActivityPresentationTest {
 
     @Test
     fun emptyEncryptedCacheSupportsCreateNotesAndParkingAcrossAFullOfflineActivityRestart() {
-        AndroidEncryptedSyncStateStore(context).clearSyncState(TENANT_ID)
+        AndroidSyncStateStore(context).clearSyncState(TENANT_ID)
         AndroidEncryptedDraftStore(context).clear(TENANT_ID)
         val realAccepted = AndroidEncryptedAcceptedTenantContinuityStore(context).apply {
             clear()
@@ -1196,7 +1200,7 @@ class MainActivityPresentationTest {
                 service,
                 NoOpLegacyQueueReplay,
                 drafts,
-                AndroidEncryptedSyncStateStore(activity),
+                AndroidSyncStateStore(activity),
                 coverMediaStore = AndroidEncryptedProjectCoverMediaStore(activity),
             )
             presentationController = ProjectPresentationController(
@@ -1224,7 +1228,7 @@ class MainActivityPresentationTest {
             }
             waitFor(first) { it.hasButton("Offline project") }
             first.onActivity { activity ->
-                assertTrue(activity.findViewById<View>(ProjectUiIds.PENDING_CHANGES) != null)
+                assertTrue(activity.findViewById<View>(ProjectUiIds.PENDING_CHANGES) == null)
                 assertFalse(
                     activity.texts().any {
                         it.contains("service", ignoreCase = true) ||
@@ -1471,7 +1475,7 @@ class MainActivityPresentationTest {
     }
 
     @Test
-    fun notesAndAllThreeParkingFieldsSurviveConfigurationAndProcessStyleRecreation() {
+    fun notesAndAllThreeParkingFieldsSurviveConfigurationButNotProcessDeath() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             scenario.onActivity { it.button("Active project").performClick() }
@@ -1514,25 +1518,10 @@ class MainActivityPresentationTest {
         ActivityScenario.launch(MainActivity::class.java).use { restarted ->
             waitFor(restarted) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             restarted.onActivity { it.button("Active project").performClick() }
-            waitFor(restarted) {
-                it.screenTag() == ProjectUiIds.SCREEN_PROJECT &&
-                    it.findViewById<View>(ProjectUiIds.PARK_SHEET) != null
-            }
+            waitFor(restarted) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
             restarted.onActivity { activity ->
-                assertEquals("Shelf", activity.findViewById<EditText>(ProjectUiIds.PARKING_LOCATION).text.toString())
-                assertEquals(
-                    "Open notebook",
-                    activity.findViewById<EditText>(ProjectUiIds.PARKING_NEXT_ACTION).text.toString(),
-                )
-                assertEquals(
-                    "Bring cable",
-                    activity.findViewById<EditText>(ProjectUiIds.PARKING_MUST_NOT_FORGET).text.toString(),
-                )
-                activity.findViewById<Button>(ProjectUiIds.BACK).performClick()
-                assertEquals(
-                    "Draft after recreation",
-                    activity.findViewById<EditText>(ProjectUiIds.NOTES).text.toString(),
-                )
+                assertTrue(activity.findViewById<View>(ProjectUiIds.PARK_SHEET) == null)
+                assertEquals("Server notes", activity.findViewById<EditText>(ProjectUiIds.NOTES).text.toString())
             }
         }
     }
@@ -1622,7 +1611,7 @@ class MainActivityPresentationTest {
                     activity.findViewById<EditText>(ProjectUiIds.NOTES).text.toString(),
                 )
                 assertTrue(activity.findViewById<Button>(ProjectUiIds.RESOLVE_CONFLICT) != null)
-                assertTrue(activity.findViewById<View>(ProjectUiIds.PENDING_CHANGES) != null)
+                assertTrue(activity.findViewById<View>(ProjectUiIds.PENDING_CHANGES) == null)
                 assertFalse(activity.texts().any { it.contains("service", ignoreCase = true) })
                 assertTrue(activity.findViewById<Button>(ProjectUiIds.RESOLVE_CONFLICT) != null)
             }
@@ -1761,19 +1750,35 @@ class MainActivityPresentationTest {
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             scenario.onActivity { it.button("Active project").performClick() }
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            scenario.onActivity { it.findViewById<Button>(ProjectUiIds.EDIT_COVER).performClick() }
+            waitFor(scenario) { it.visibleDialogItems().containsAll(listOf("Take photo", "Choose image")) }
             scenario.onActivity { activity ->
-                activity.findViewById<Button>(ProjectUiIds.EDIT_COVER).performClick()
-                val texts = activity.dialogItems()
-                assertTrue(texts.containsAll(listOf("Take photo", "Choose image")))
-                assertFalse(texts.contains("Remove cover"))
+                val before = presentationController.state.projectCovers
+                assertFalse(activity.visibleDialogItems().contains("Remove cover"))
                 activity.dialogButton("Cancel").performClick()
+                assertEquals(before, presentationController.state.projectCovers)
+                activity.findViewById<Button>(ProjectUiIds.EDIT_COVER).performClick()
+            }
+            waitFor(scenario) { it.visibleDialogItems().contains("Take photo") }
+            scenario.onActivity { activity ->
+                activity.activateVisibleDialogItem("Take photo")
+                assertEquals(listOf(PROJECT_ID), coverSourceActions.cameraProjects)
+                assertTrue(presentationController.state.projectCovers.isEmpty())
+                activity.findViewById<Button>(ProjectUiIds.EDIT_COVER).performClick()
+            }
+            waitFor(scenario) { it.visibleDialogItems().contains("Choose image") }
+            scenario.onActivity { activity ->
+                activity.activateVisibleDialogItem("Choose image")
+                assertEquals(listOf(PROJECT_ID), coverSourceActions.pickerProjects)
+                assertTrue(presentationController.state.projectCovers.isEmpty())
                 activity.stagePendingCover(PROJECT_ID)
                 activity.handleCoverPickerResult(Uri.parse("content://test/cover"))
             }
             waitUntil { presentationController.state.projectCovers.isNotEmpty() }
+            scenario.onActivity { it.findViewById<Button>(ProjectUiIds.EDIT_COVER).performClick() }
+            waitFor(scenario) { it.visibleDialogItems().contains("Remove cover") }
             scenario.onActivity { activity ->
-                activity.findViewById<Button>(ProjectUiIds.EDIT_COVER).performClick()
-                val texts = activity.dialogItems()
+                val texts = activity.visibleDialogItems()
                 assertTrue(
                     texts.containsAll(
                         listOf("Take replacement photo", "Choose replacement image", "Remove cover"),
@@ -2036,7 +2041,8 @@ class MainActivityPresentationTest {
         val body = activity.findViewById<LinearLayout>(ProjectUiIds.DASHBOARD_BODY)
         val grid = activity.findViewById<GridLayout>(ProjectUiIds.PROJECT_TILES)
         assertEquals(windowContent.width, root.width)
-        assertEquals(windowContent.height, root.height)
+        assertTrue(root.height < windowContent.height)
+        assertTrue(root.height > windowContent.height / 2)
         assertEquals(body.width, grid.width)
         assertEquals(Gravity.CENTER, body.gravity)
         assertTrue(root.background != null)
@@ -2094,6 +2100,29 @@ class MainActivityPresentationTest {
         return (0 until adapter.count).map { adapter.getItem(it).toString() }
     }
 
+    private fun MainActivity.visibleDialogItems(): List<String> = requireNotNull(activeDialog).listView.run {
+        (0 until childCount).mapNotNull { index ->
+            getChildAt(index).descendants()
+                .filterIsInstance<android.widget.TextView>()
+                .firstOrNull { it.text.isNotBlank() && it.isShown && it.height > 0 }
+                ?.text
+                ?.toString()
+        }
+    }
+
+    private fun MainActivity.activateVisibleDialogItem(text: String) {
+        val list = requireNotNull(activeDialog).listView
+        val childIndex = (0 until list.childCount).single { index ->
+            list.getChildAt(index).descendants()
+                .filterIsInstance<android.widget.TextView>()
+                .any { it.text.toString() == text && it.isShown && it.height > 0 }
+        }
+        val child = list.getChildAt(childIndex)
+        val adapterPosition = list.firstVisiblePosition + childIndex
+        assertTrue(child.isShown && child.height > 0)
+        list.performItemClick(child, adapterPosition, list.adapter.getItemId(adapterPosition))
+    }
+
     private fun MainActivity.dialogInput(): EditText = requireNotNull(activeDialog)
         .window?.decorView?.descendants().orEmpty()
         .filterIsInstance<EditText>()
@@ -2103,6 +2132,19 @@ class MainActivityPresentationTest {
         yield(this@descendants)
         if (this@descendants is ViewGroup) {
             for (index in 0 until childCount) yieldAll(getChildAt(index).descendants())
+        }
+    }
+
+    private class FakeCoverSourceActions : CoverSourceActions {
+        val cameraProjects = mutableListOf<String>()
+        val pickerProjects = mutableListOf<String>()
+
+        override fun takePhoto(projectId: String) {
+            cameraProjects += projectId
+        }
+
+        override fun chooseImage(projectId: String) {
+            pickerProjects += projectId
         }
     }
 

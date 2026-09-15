@@ -450,6 +450,13 @@ class ProjectPresentationController(
         state = state.copy(showParkingForm = true)
     }
 
+    /** Restores configuration-only form state; this never crosses the persistence boundary. */
+    @Synchronized
+    fun restoreTransientDrafts(drafts: FormDrafts, showParkingForm: Boolean) {
+        activeSession()
+        state = state.copy(drafts = drafts, showParkingForm = showParkingForm)
+    }
+
     @Synchronized
     fun createProject(name: String) {
         persistDraft { it.copy(projectName = name) }
@@ -465,13 +472,12 @@ class ProjectPresentationController(
 
     @Synchronized
     fun discardCreateProjectDraft() {
-        val active = activeSession()
-        val current = workspace.projectDrafts(active)
+        activeSession()
+        val current = state.drafts
         val cleared = current.copy(
             projectName = "",
             pendingMutations = current.pendingMutations - CREATE_SLOT,
         )
-        workspace.updateProjectDrafts(active) { cleared }
         state = state.copy(drafts = cleared, invalidField = null, error = null)
     }
 
@@ -653,7 +659,21 @@ class ProjectPresentationController(
 
     private fun applyResult(result: BackgroundSyncResult) {
         val active = activeSession()
-        val drafts = workspace.projectDrafts(active)
+        var drafts = workspace.projectDrafts(active)
+        result.conflict?.let { conflict ->
+            drafts = when (conflict.type) {
+                ProjectMutationType.RENAME_PROJECT -> drafts.copy(
+                    projectRenames = drafts.projectRenames + (requireNotNull(conflict.projectId) to conflict.localProjectName.orEmpty()),
+                )
+                ProjectMutationType.SAVE_NOTES -> drafts.copy(
+                    projectNotes = drafts.projectNotes + (requireNotNull(conflict.projectId) to conflict.localNotes.orEmpty()),
+                )
+                ProjectMutationType.ADD_PARKING -> conflict.localParking?.let { parking ->
+                    drafts.copy(projectParking = drafts.projectParking + (requireNotNull(conflict.projectId) to parking))
+                } ?: drafts
+                else -> drafts
+            }
+        }
         val selectedId = state.projectPage?.project?.id
         val resolvedSelectedId = selectedId?.let { id ->
             result.cache.projectIdMappings.firstOrNull { it.provisionalId == id }?.serverId ?: id
@@ -704,23 +724,23 @@ class ProjectPresentationController(
     }
 
     private fun persistDraft(update: (FormDrafts) -> FormDrafts) {
-        val active = activeSession()
-        val updated = workspace.updateProjectDrafts(active, update)
-        state = state.copy(drafts = updated)
+        activeSession()
+        state = state.copy(drafts = update(state.drafts))
     }
 
     private fun mutation(slot: String, operation: String, targetId: String, payload: String): PendingMutation {
-        val active = activeSession()
+        activeSession()
         val payloadDigest = digest(payload)
-        lateinit var pending: PendingMutation
-        val updated = workspace.updateProjectDrafts(active) { drafts ->
-            val existing = drafts.pendingMutations[slot]?.takeIf {
-                it.operation == operation && it.targetId == targetId && it.payloadDigest == payloadDigest
-            }
-            pending = existing ?: PendingMutation(operation, targetId, payloadDigest, newOperationId())
-            drafts.copy(pendingMutations = drafts.pendingMutations + (slot to pending))
-        }
-        state = state.copy(drafts = updated, invalidField = null, error = null)
+        val pending = state.drafts.pendingMutations[slot]?.takeIf {
+            it.operation == operation && it.targetId == targetId && it.payloadDigest == payloadDigest
+        } ?: PendingMutation(operation, targetId, payloadDigest, newOperationId())
+        state = state.copy(
+            drafts = state.drafts.copy(
+                pendingMutations = state.drafts.pendingMutations + (slot to pending),
+            ),
+            invalidField = null,
+            error = null,
+        )
         return pending
     }
 

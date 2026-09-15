@@ -50,11 +50,11 @@ import org.junit.Test
 import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
-class AndroidEncryptedSyncStateStoreTest {
+class LegacyEncryptedSyncStateStoreTest {
     private val context: Context
         get() = InstrumentationRegistry.getInstrumentation().targetContext
-    private val store: AndroidEncryptedSyncStateStore
-        get() = AndroidEncryptedSyncStateStore(context)
+    private val store: LegacyEncryptedSyncStateStore
+        get() = LegacyEncryptedSyncStateStore(context)
 
     @Before
     @After
