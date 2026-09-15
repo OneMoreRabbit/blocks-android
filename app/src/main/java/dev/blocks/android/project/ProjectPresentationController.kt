@@ -37,10 +37,11 @@ data class ProjectPresentationState(
     val parkingHistory: List<ProjectParking> = emptyList(),
     val parkingHistoryHasMore: Boolean = false,
     val localBlocks: List<LocalBlockRecord> = emptyList(),
+    val projectCovers: List<ProjectCover> = emptyList(),
     val drafts: FormDrafts = FormDrafts(),
     val invalidField: ProjectFormField? = null,
     val showParkingForm: Boolean = false,
-    val dashboardView: DashboardView = DashboardView.LIST,
+    val dashboardView: DashboardView = DashboardView.TILES,
     val archiveMode: Boolean = false,
     val pendingChanges: Boolean = false,
     val syncing: Boolean = false,
@@ -188,6 +189,24 @@ class ProjectPresentationController(
             invalidField = null,
             error = null,
         )
+    }
+
+    fun readProjectCoverContent(cover: ProjectCover, thumbnail: Boolean): ByteArray {
+        val active = synchronized(this) { activeSession() }
+        return workspace.readProjectCoverContent(active, cover, thumbnail)
+    }
+
+    @Synchronized
+    fun saveProjectCover(cover: ProjectCoverContent) {
+        val page = requireNotNull(state.projectPage) { "No project is open" }
+        require(cover.projectId == page.project.id) { "The selected project changed during cover import" }
+        applyResult(workspace.saveProjectCover(activeSession(), cover))
+    }
+
+    @Synchronized
+    fun removeProjectCover() {
+        val page = requireNotNull(state.projectPage) { "No project is open" }
+        applyResult(workspace.removeProjectCover(activeSession(), page.project.id))
     }
 
     @Synchronized
@@ -656,6 +675,7 @@ class ProjectPresentationController(
             parkingHistory = history?.records.orEmpty(),
             parkingHistoryHasMore = history?.hasMore ?: false,
             localBlocks = result.cache.localBlocks,
+            projectCovers = result.cache.projectCovers,
             drafts = drafts,
             dashboardView = preferences.dashboardView,
             archiveMode = preferences.archiveMode,

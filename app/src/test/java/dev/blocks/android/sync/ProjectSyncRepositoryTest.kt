@@ -4,6 +4,8 @@ import dev.blocks.android.api.ApiError
 import dev.blocks.android.api.ApiErrorCode
 import dev.blocks.android.api.IncompatibleServiceApiException
 import dev.blocks.android.api.ServiceException
+import dev.blocks.android.cover.InMemoryProjectCoverMediaStore
+import dev.blocks.android.cover.ProjectCoverMediaStore
 import dev.blocks.android.mvp.BlocksRepository
 import dev.blocks.android.mvp.ChangeEvent
 import dev.blocks.android.mvp.ChangePage
@@ -28,6 +30,7 @@ import dev.blocks.android.project.BlockBinding
 import dev.blocks.android.project.BlockLookup
 import dev.blocks.android.project.PhysicalBlock
 import dev.blocks.android.project.ProjectCacheState
+import dev.blocks.android.project.ProjectCoverContent
 import dev.blocks.android.project.ProjectIdentityMapping
 import dev.blocks.android.project.ProjectLifecycle
 import dev.blocks.android.project.ProjectMutationType
@@ -47,6 +50,7 @@ import dev.blocks.android.tag.TagProgrammingFailure
 import java.io.IOException
 import java.net.ConnectException
 import java.net.SocketTimeoutException
+import java.security.MessageDigest
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
@@ -352,6 +356,8 @@ class ProjectSyncRepositoryTest {
         val token = OpaqueTagToken.fromBytes(ByteArray(32) { (it + 5).toByte() })
         repository.activate(SESSION_A)
         repository.queueCreateProject(SESSION_A, "Local project", "create-project", "local-project")
+        repository.saveProjectCover(SESSION_A, cover("local-project"))
+        val localCover = repository.projectCover(SESSION_A, "local-project")!!
         repository.beginTagProgramming(
             SESSION_A,
             "local-project",
@@ -370,7 +376,98 @@ class ProjectSyncRepositoryTest {
         assertEquals(PROJECT_ID, synced.cache.localBlockOperations.single {
             it.type == LocalBlockOperationType.BIND_BLOCK
         }.projectId)
+        assertEquals(PROJECT_ID, synced.cache.projectCovers.single().projectId)
+        assertEquals(localCover.coverId, synced.cache.projectCovers.single().coverId)
+        assertEquals(localCover.displayContentRef, synced.cache.projectCovers.single().displayContentRef)
+        assertEquals(localCover.thumbnailContentRef, synced.cache.projectCovers.single().thumbnailContentRef)
         assertEquals(listOf("list-active", "create", "changes", "list-archived", "blocks"), service.calls)
+    }
+
+    @Test
+    fun projectCoverCommitsAtomicallyAndSurvivesRestartUntilExplicitRemoval() {
+        val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
+        val media = InMemoryProjectCoverMediaStore()
+        val first = repository(FakeProjectService(), MemoryDrafts(), state, media)
+        first.activate(SESSION_A)
+
+        val content = cover(PROJECT_ID)
+        val expectedDigest = content.contentDigest
+        val committed = first.saveProjectCover(SESSION_A, content)
+
+        assertEquals(expectedDigest, committed.cache.projectCovers.single().contentDigest)
+        assertEquals(2, media.objectCount(TENANT_A))
+        val restarted = repository(FakeProjectService(), MemoryDrafts(), state, media)
+        restarted.activate(SESSION_A)
+        assertEquals(expectedDigest, restarted.projectCover(SESSION_A, PROJECT_ID)?.contentDigest)
+
+        restarted.removeProjectCover(SESSION_A, PROJECT_ID)
+        assertEquals(null, restarted.projectCover(SESSION_A, PROJECT_ID))
+        assertTrue(state.loadSyncState(TENANT_A).projectCache.projectCovers.isEmpty())
+        assertEquals(0, media.objectCount(TENANT_A))
+    }
+
+    @Test
+    fun coverReplacementIsTwoPhaseAndOrdinaryLocalWritesDoNotTouchMediaObjects() {
+        val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
+        val media = InMemoryProjectCoverMediaStore()
+        val repository = repository(FakeProjectService(), MemoryDrafts(), state, media)
+        repository.activate(SESSION_A)
+
+        repository.saveProjectCover(SESSION_A, cover(PROJECT_ID))
+        val first = repository.projectCover(SESSION_A, PROJECT_ID)!!
+        val objectCount = media.objectCount(TENANT_A)
+        val mediaCalls = media.stageCalls + media.readCalls + media.retireCalls
+
+        repository.updateProjectDrafts(SESSION_A) { it.copy(projectName = "Local draft") }
+        repository.queueSaveNotes(SESSION_A, PROJECT_ID, 4, "New notes", "notes-with-cover")
+        repository.backgroundSync(SESSION_A)
+
+        assertEquals(objectCount, media.objectCount(TENANT_A))
+        assertEquals(mediaCalls, media.stageCalls + media.readCalls + media.retireCalls)
+
+        repository.saveProjectCover(SESSION_A, cover(PROJECT_ID))
+        val replacement = repository.projectCover(SESSION_A, PROJECT_ID)!!
+        assertEquals(first.coverId, replacement.coverId)
+        assertEquals(first.revision + 1, replacement.revision)
+        assertEquals(2, media.objectCount(TENANT_A))
+    }
+
+    @Test
+    fun failedCoverMetadataCommitRetiresStagedObjectsAndKeepsPriorCover() {
+        val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
+        val media = InMemoryProjectCoverMediaStore()
+        val repository = repository(FakeProjectService(), MemoryDrafts(), state, media)
+        repository.activate(SESSION_A)
+        repository.saveProjectCover(SESSION_A, cover(PROJECT_ID))
+        val first = repository.projectCover(SESSION_A, PROJECT_ID)!!
+        state.failNextSave = true
+
+        val error = runCatching { repository.saveProjectCover(SESSION_A, cover(PROJECT_ID)) }.exceptionOrNull()
+
+        assertNotNull(error)
+        assertEquals(first, repository.projectCover(SESSION_A, PROJECT_ID))
+        assertEquals(2, media.objectCount(TENANT_A))
+    }
+
+    @Test
+    fun tenantErasureRemovesOnlyThatTenantsCoverObjects() {
+        val state = MemoryState().apply {
+            saveSyncState(TENANT_A, loadedState(TENANT_A))
+            saveSyncState(TENANT_B, loadedState(TENANT_B))
+        }
+        val media = InMemoryProjectCoverMediaStore()
+        val repository = repository(FakeProjectService(), MemoryDrafts(), state, media)
+        repository.activate(SESSION_A)
+        repository.saveProjectCover(SESSION_A, cover(PROJECT_ID))
+        repository.deactivate(SESSION_A)
+        repository.activate(SESSION_B)
+        repository.saveProjectCover(SESSION_B, cover(PROJECT_ID))
+
+        repository.clearLocalState(SESSION_B)
+
+        assertEquals(2, media.objectCount(TENANT_A))
+        assertEquals(0, media.objectCount(TENANT_B))
+        assertEquals(1, media.eraseCalls)
     }
 
     @Test
@@ -877,7 +974,13 @@ class ProjectSyncRepositoryTest {
                 hasMore = false,
             )
         }
-        val repository = ProjectSyncRepository(service, observer, MemoryDrafts(), state)
+        val repository = ProjectSyncRepository(
+            service,
+            observer,
+            MemoryDrafts(),
+            state,
+            coverMediaStore = InMemoryProjectCoverMediaStore(),
+        )
         repository.activate(SESSION_A)
 
         val result = repository.backgroundSync(SESSION_A)
@@ -920,7 +1023,13 @@ class ProjectSyncRepositoryTest {
         )
         val legacy = RecordingLegacyBlocks(active)
         val replayer = LegacyOperationReplayer(legacy, drafts, state)
-        val repository = ProjectSyncRepository(FakeProjectService(), replayer, drafts, state)
+        val repository = ProjectSyncRepository(
+            FakeProjectService(),
+            replayer,
+            drafts,
+            state,
+            coverMediaStore = InMemoryProjectCoverMediaStore(),
+        )
         repository.activate(SESSION_A)
 
         val result = repository.backgroundSync(SESSION_A)
@@ -1235,8 +1344,12 @@ class ProjectSyncRepositoryTest {
         assertEquals("Tenant A", state.loadSyncState(TENANT_A).projectDrafts.projectNotes[PROJECT_ID])
     }
 
-    private fun repository(service: FakeProjectService, drafts: MemoryDrafts, state: MemoryState) =
-        ProjectSyncRepository(service, NoOpLegacyQueueReplay, drafts, state)
+    private fun repository(
+        service: FakeProjectService,
+        drafts: MemoryDrafts,
+        state: MemoryState,
+        media: ProjectCoverMediaStore = InMemoryProjectCoverMediaStore(),
+    ) = ProjectSyncRepository(service, NoOpLegacyQueueReplay, drafts, state, coverMediaStore = media)
 
     private fun loadedState(tenantId: String = TENANT_A) = TenantSyncState(
         projectCache = ProjectCacheState(
@@ -1251,8 +1364,13 @@ class ProjectSyncRepositoryTest {
     private class MemoryState : SyncStateStore {
         private val values = mutableMapOf<String, TenantSyncState>()
         val saved = mutableListOf<TenantSyncState>()
+        var failNextSave = false
         override fun loadSyncState(tenantId: String) = values[tenantId] ?: TenantSyncState()
         override fun saveSyncState(tenantId: String, state: TenantSyncState) {
+            if (failNextSave) {
+                failNextSave = false
+                throw IllegalStateException("simulated metadata commit failure")
+            }
             values[tenantId] = state
             saved += state
         }
@@ -1568,6 +1686,30 @@ class ProjectSyncRepositoryTest {
             notes = ProjectNotes(PROJECT_ID, "Server notes", 4, NOW),
             newestParking = null,
         )
+
+        private fun cover(projectId: String): ProjectCoverContent {
+            val display = "display".toByteArray()
+            val thumbnail = "thumbnail".toByteArray()
+            return ProjectCoverContent(
+            projectId = projectId,
+            displayJpeg = display,
+            thumbnailJpeg = thumbnail,
+            displayWidth = 1200,
+            displayHeight = 675,
+            thumbnailWidth = 480,
+            thumbnailHeight = 270,
+            displayDigest = digest(display),
+            thumbnailDigest = digest(thumbnail),
+            contentDigest = digest(display, thumbnail),
+            importedAt = NOW,
+        )
+        }
+
+        private fun digest(vararg values: ByteArray): String {
+            val digest = MessageDigest.getInstance("SHA-256")
+            values.forEach(digest::update)
+            return digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        }
 
         private fun projectParking(
             id: String,

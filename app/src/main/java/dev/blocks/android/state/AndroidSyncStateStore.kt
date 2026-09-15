@@ -18,6 +18,7 @@ import dev.blocks.android.mvp.SyncStateStore
 import dev.blocks.android.mvp.TenantSyncState
 import dev.blocks.android.project.PhysicalBlock
 import dev.blocks.android.project.ProjectCacheState
+import dev.blocks.android.project.ProjectCover
 import dev.blocks.android.project.ProjectIdentityMapping
 import dev.blocks.android.project.ProjectMutation
 import dev.blocks.android.project.ProjectMutationType
@@ -65,6 +66,7 @@ internal data class EncodedSyncRows(
     val localBlocks: List<String> = emptyList(),
     val localBlockOperations: List<String> = emptyList(),
     val projectLinks: List<String> = emptyList(),
+    val projectCovers: List<String> = emptyList(),
     val projectCommands: List<String> = emptyList(),
     val retiredOperationIds: List<String> = emptyList(),
     val provisionalProjectIds: List<String> = emptyList(),
@@ -111,6 +113,7 @@ internal class SyncStateRowCodec(
             localBlocks = projectCache.localBlocks.map(gson::toJson),
             localBlockOperations = projectCache.localBlockOperations.map(gson::toJson),
             projectLinks = projectCache.projectLinks.map(gson::toJson),
+            projectCovers = projectCache.projectCovers.map(gson::toJson),
             projectCommands = projectCache.commands.map(gson::toJson),
             retiredOperationIds = projectCache.retiredOperationIds.distinct(),
             provisionalProjectIds = projectCache.provisionalProjectIds.distinct(),
@@ -170,6 +173,11 @@ internal class SyncStateRowCodec(
                 },
                 projectLinks = if (rows.schemaVersion >= PROJECT_LINK_SCHEMA_VERSION) {
                     rows.projectLinks.map { gson.fromJson(it, ProjectLinkIdentity::class.java) }
+                } else {
+                    emptyList()
+                },
+                projectCovers = if (rows.schemaVersion >= PROJECT_COVER_SCHEMA_VERSION) {
+                    rows.projectCovers.map { gson.fromJson(it, ProjectCover::class.java) }
                 } else {
                     emptyList()
                 },
@@ -236,7 +244,8 @@ internal class SyncStateRowCodec(
         const val PARKING_HISTORY_SCHEMA_VERSION = 6
         const val LOCAL_TAG_SCHEMA_VERSION = 7
         const val PROJECT_LINK_SCHEMA_VERSION = 8
-        const val CURRENT_SCHEMA_VERSION = PROJECT_LINK_SCHEMA_VERSION
+        const val PROJECT_COVER_SCHEMA_VERSION = 9
+        const val CURRENT_SCHEMA_VERSION = PROJECT_COVER_SCHEMA_VERSION
     }
 }
 
@@ -399,6 +408,32 @@ private fun validateProjectCache(cache: ProjectCacheState) {
     require(knownProjectIds.all { projectId -> cache.projectLinks.any { it.projectId == projectId } }) {
         "A cached project has no local navigation key"
     }
+    require(cache.projectCovers.map { it.projectId }.distinct().size == cache.projectCovers.size) {
+        "A project has more than one local cover"
+    }
+    cache.projectCovers.forEach { cover ->
+        require(
+            cover.coverId.matches(
+                Regex("[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"),
+            ),
+        ) { "A local cover identity is invalid" }
+        require(cover.tenantId.isNotBlank()) { "A local cover tenant is missing" }
+        require(cover.projectId in knownProjectIds) { "A local cover references an unknown project" }
+        require(cover.mediaType == "image/jpeg") { "A local cover media type is invalid" }
+        require(cover.displayContentRef.isNotBlank() && cover.thumbnailContentRef.isNotBlank()) {
+            "A local cover content reference is missing"
+        }
+        require(cover.displayWidth > 0 && cover.displayHeight > 0) { "A local display cover has invalid bounds" }
+        require(cover.thumbnailWidth > 0 && cover.thumbnailHeight > 0) {
+            "A local cover thumbnail has invalid bounds"
+        }
+        require(cover.displayByteSize > 0 && cover.thumbnailByteSize > 0) { "A local cover size is invalid" }
+        require(cover.displayDigest.matches(Regex("[0-9a-f]{64}"))) { "A display cover digest is invalid" }
+        require(cover.thumbnailDigest.matches(Regex("[0-9a-f]{64}"))) { "A thumbnail digest is invalid" }
+        require(cover.contentDigest.matches(Regex("[0-9a-f]{64}"))) { "A local cover digest is invalid" }
+        require(cover.revision > 0) { "A local cover revision is invalid" }
+        require(cover.createdAt.isNotBlank() && cover.updatedAt.isNotBlank()) { "A local cover timestamp is missing" }
+    }
     require(cache.localBlockOperations.map { it.operationId }.distinct().size == cache.localBlockOperations.size) {
         "Local block operation identities are not unique"
     }
@@ -521,6 +556,12 @@ private fun validateProjectMutation(command: ProjectMutation) {
     }
 }
 
+private fun requireCoverTenantScope(tenantId: String, state: TenantSyncState) {
+    require(state.projectCache.projectCovers.all { it.tenantId == tenantId }) {
+        "Encrypted cover metadata crosses a tenant boundary"
+    }
+}
+
 /**
  * One SQLite database per tenant. Every logical value is an independently authenticated
  * ciphertext; only table structure, row order, and non-secret metadata names remain visible.
@@ -534,7 +575,9 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
 
     @Synchronized
     override fun loadSyncState(tenantId: String): TenantSyncState {
-        if (!databaseFile(tenantId).exists()) return migrateLegacyState(tenantId)
+        if (!databaseFile(tenantId).exists()) return migrateLegacyState(tenantId).also {
+            requireCoverTenantScope(tenantId, it)
+        }
         val secretKey = requireNotNull(existingKey(databaseKeyAlias(tenantId))) {
             "Encrypted sync database key is unavailable"
         }
@@ -544,7 +587,7 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
             database.beginTransaction()
             try {
                 val rows = readStateRows(database, tenantId, secretKey)
-                val state = rowCodec.decode(rows)
+                val state = rowCodec.decode(rows).also { requireCoverTenantScope(tenantId, it) }
                 if (rows.schemaVersion < SyncStateRowCodec.CURRENT_SCHEMA_VERSION) {
                     replaceStateRows(database, tenantId, secretKey, rowCodec.encode(state))
                 }
@@ -565,6 +608,7 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
             clearSyncState(tenantId)
             return
         }
+        requireCoverTenantScope(tenantId, state)
         val rows = rowCodec.encode(state)
         val databaseExisted = databaseFile(tenantId).exists()
         val secretKey = existingKey(databaseKeyAlias(tenantId)) ?: run {
@@ -680,6 +724,7 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
             localBlocks = readRows(database, tenantId, secretKey, TABLE_LOCAL_BLOCKS),
             localBlockOperations = readRows(database, tenantId, secretKey, TABLE_LOCAL_BLOCK_OPERATIONS),
             projectLinks = readRows(database, tenantId, secretKey, TABLE_PROJECT_LINKS),
+            projectCovers = readRows(database, tenantId, secretKey, TABLE_PROJECT_COVERS),
             projectCommands = readRows(database, tenantId, secretKey, TABLE_PROJECT_COMMANDS),
             retiredOperationIds = readRows(database, tenantId, secretKey, TABLE_RETIRED_OPERATIONS),
             provisionalProjectIds = readRows(database, tenantId, secretKey, TABLE_PROVISIONAL_PROJECTS),
@@ -760,6 +805,7 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
         writeRows(database, tenantId, secretKey, TABLE_LOCAL_BLOCKS, rows.localBlocks)
         writeRows(database, tenantId, secretKey, TABLE_LOCAL_BLOCK_OPERATIONS, rows.localBlockOperations)
         writeRows(database, tenantId, secretKey, TABLE_PROJECT_LINKS, rows.projectLinks)
+        writeRows(database, tenantId, secretKey, TABLE_PROJECT_COVERS, rows.projectCovers)
         writeRows(database, tenantId, secretKey, TABLE_PROJECT_COMMANDS, rows.projectCommands)
         writeRows(database, tenantId, secretKey, TABLE_RETIRED_OPERATIONS, rows.retiredOperationIds)
         writeRows(database, tenantId, secretKey, TABLE_PROVISIONAL_PROJECTS, rows.provisionalProjectIds)
@@ -976,6 +1022,7 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
             if (oldVersion < 5) PARKING_HISTORY_TABLES.forEach { table -> createPositionTable(database, table) }
             if (oldVersion < 6) LOCAL_TAG_TABLES.forEach { table -> createPositionTable(database, table) }
             if (oldVersion < 7) PROJECT_LINK_TABLES.forEach { table -> createPositionTable(database, table) }
+            if (oldVersion < 8) PROJECT_COVER_TABLES.forEach { table -> createPositionTable(database, table) }
         }
 
         override fun onDowngrade(database: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -992,7 +1039,7 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
     }
 
     private companion object {
-        const val DATABASE_VERSION = 7
+        const val DATABASE_VERSION = 8
         const val DATABASE_PREFIX = "blocks_sync_"
         const val DATABASE_KEY_PREFIX = "blocks-sync-db-v1-"
         const val LEGACY_PREFERENCES_PREFIX = "encrypted_sync_state_v1_"
@@ -1014,6 +1061,7 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
         const val TABLE_LOCAL_BLOCKS = "local_blocks_v7"
         const val TABLE_LOCAL_BLOCK_OPERATIONS = "local_block_operations_v7"
         const val TABLE_PROJECT_LINKS = "project_links_v8"
+        const val TABLE_PROJECT_COVERS = "project_covers_v9"
         const val TABLE_PROJECT_COMMANDS = "pending_project_commands_v3"
         const val TABLE_RETIRED_OPERATIONS = "retired_project_operations_v3"
         const val TABLE_PROVISIONAL_PROJECTS = "provisional_projects_v4"
@@ -1052,13 +1100,14 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
         val PARKING_HISTORY_TABLES = listOf(TABLE_PARKING_RECORDS, TABLE_PARKING_LOADED_PROJECTS)
         val LOCAL_TAG_TABLES = listOf(TABLE_LOCAL_BLOCKS, TABLE_LOCAL_BLOCK_OPERATIONS)
         val PROJECT_LINK_TABLES = listOf(TABLE_PROJECT_LINKS)
+        val PROJECT_COVER_TABLES = listOf(TABLE_PROJECT_COVERS)
         val POSITION_TABLES = listOf(
             TABLE_PROJECTS,
             TABLE_REENTRY,
             TABLE_COMMANDS,
             TABLE_RETIRED_KEYS,
         ) + PROJECT_MODEL_TABLES + LOCAL_FIRST_TABLES + STANDALONE_TABLES +
-            PARKING_HISTORY_TABLES + LOCAL_TAG_TABLES + PROJECT_LINK_TABLES
+            PARKING_HISTORY_TABLES + LOCAL_TAG_TABLES + PROJECT_LINK_TABLES + PROJECT_COVER_TABLES
         val TABLES = listOf(
             TABLE_METADATA,
         ) + POSITION_TABLES

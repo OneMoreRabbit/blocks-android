@@ -262,7 +262,7 @@ class ProjectPresentationControllerTest {
         val restored = controller(workspace, drafts)
         restored.login("restored-token")
 
-        assertEquals(DashboardView.TILES, restored.state.dashboardView)
+        assertEquals(DashboardView.LIST, restored.state.dashboardView)
         assertTrue(restored.state.archiveMode)
         restored.openProject(PROJECT_ID)
         assertTrue(restored.state.showParkingForm)

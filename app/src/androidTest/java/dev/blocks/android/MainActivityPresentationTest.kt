@@ -4,6 +4,8 @@ import android.app.Activity
 import android.content.Intent
 import android.content.Context
 import android.content.res.Configuration
+import android.graphics.Bitmap
+import android.graphics.Color
 import android.net.Uri
 import android.nfc.NfcAdapter
 import android.os.ParcelFileDescriptor
@@ -29,6 +31,10 @@ import dev.blocks.android.auth.AcceptedTenantContinuity
 import dev.blocks.android.auth.AcceptedTenantContinuityStore
 import dev.blocks.android.auth.AndroidEncryptedAcceptedTenantContinuityStore
 import dev.blocks.android.auth.IdentityProvider
+import dev.blocks.android.cover.ProjectCoverImporter
+import dev.blocks.android.cover.CoverCaptureFiles
+import dev.blocks.android.cover.AndroidEncryptedProjectCoverMediaStore
+import dev.blocks.android.cover.CoverImportFiles
 import dev.blocks.android.mvp.AccountIdentity
 import dev.blocks.android.mvp.ChangePage
 import dev.blocks.android.mvp.FormDrafts
@@ -42,6 +48,8 @@ import dev.blocks.android.project.BlockLookup
 import dev.blocks.android.project.PhysicalBlock
 import dev.blocks.android.project.ParkingHistoryPage
 import dev.blocks.android.project.ProjectCacheState
+import dev.blocks.android.project.ProjectCover
+import dev.blocks.android.project.ProjectCoverContent
 import dev.blocks.android.project.ProjectLifecycle
 import dev.blocks.android.project.ProjectIdentityMapping
 import dev.blocks.android.project.ProjectMutation
@@ -85,6 +93,8 @@ import dev.blocks.android.tag.TagActivationMedium
 import dev.blocks.android.tag.TagLocator
 import dev.blocks.android.tag.TagProgrammingFailure
 import java.util.concurrent.atomic.AtomicInteger
+import java.io.ByteArrayOutputStream
+import java.security.MessageDigest
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import org.junit.After
@@ -105,6 +115,7 @@ class MainActivityPresentationTest {
     private lateinit var acceptedTenant: MemoryAcceptedTenantContinuityStore
     private lateinit var presentationController: ProjectPresentationController
     private lateinit var nfc: FakeNfcTagPlatform
+    private lateinit var coverImporter: FakeCoverImporter
     @Volatile
     private var sessionExchangeOffline = false
     @Volatile
@@ -124,6 +135,7 @@ class MainActivityPresentationTest {
         authenticatedTenant = TENANT_ID
         sessionExchanges = AtomicInteger()
         nfc = FakeNfcTagPlatform()
+        coverImporter = FakeCoverImporter(context)
         MainActivity.dependencyFactory = { activity ->
             val drafts = AndroidEncryptedDraftStore(activity)
             presentationController = ProjectPresentationController(
@@ -146,6 +158,7 @@ class MainActivityPresentationTest {
                 acceptedTenantStore = acceptedTenant,
                 observeConnectivity = false,
                 nfcTagPlatform = nfc,
+                coverImporter = coverImporter,
             )
         }
     }
@@ -695,6 +708,7 @@ class MainActivityPresentationTest {
 
     @Test
     fun signOutLocksThenSameAccountLoginRestoresWithoutErasingLocalData() {
+        workspace.cache = workspace.cache.copy(projectCovers = listOf(coverImporter.metadata(PROJECT_ID)))
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             scenario.onActivity { activity ->
@@ -713,12 +727,14 @@ class MainActivityPresentationTest {
 
             assertEquals(1, identity.signInCalls)
             assertEquals(AcceptedTenantContinuity(TENANT_ID, ACCOUNT_A), acceptedTenant.load())
+            assertEquals("1".repeat(64), presentationController.state.projectCovers.single().contentDigest)
             assertTrue(workspace.clearedTenants.isEmpty())
         }
     }
 
     @Test
     fun accountSwitchInBothDirectionsUsesSeparateRetainedPartitions() {
+        workspace.cache = workspace.cache.copy(projectCovers = listOf(coverImporter.metadata(PROJECT_ID)))
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD && it.hasButton("Active project") }
 
@@ -730,8 +746,9 @@ class MainActivityPresentationTest {
             waitFor(scenario) {
                 it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD &&
                     !it.hasButton("Active project") &&
-                    it.texts().contains("No active projects yet.")
+                    it.texts().contains("Your first project starts here.")
             }
+            assertTrue(presentationController.state.projectCovers.isEmpty())
             assertEquals(AcceptedTenantContinuity(TENANT_ID, ACCOUNT_A), acceptedTenant.find(ACCOUNT_A))
             assertEquals(AcceptedTenantContinuity(OTHER_TENANT_ID, ACCOUNT_B), acceptedTenant.find(ACCOUNT_B))
 
@@ -743,8 +760,56 @@ class MainActivityPresentationTest {
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD && it.hasButton("Active project") }
 
             assertEquals(AcceptedTenantContinuity(TENANT_ID, ACCOUNT_A), acceptedTenant.load())
+            assertEquals("1".repeat(64), presentationController.state.projectCovers.single().contentDigest)
             assertTrue(workspace.clearedTenants.isEmpty())
             assertTrue(workspace.activatedTenants.containsAll(listOf(TENANT_ID, OTHER_TENANT_ID)))
+        }
+    }
+
+    @Test
+    fun accountSwitchCannotReuseSameDigestOrInflightBitmapAcrossTenants() {
+        val bytes = coverImporter.imageBytes()
+        val tenantACover = coverImporter.metadata(PROJECT_ID, '7')
+        val tenantBCoverId = "223e4567-e89b-42d3-a456-426614174002"
+        val tenantBCover = coverImporter.metadata(OTHER_PROJECT_ID, '7').copy(
+            coverId = tenantBCoverId,
+            tenantId = OTHER_TENANT_ID,
+            projectId = OTHER_PROJECT_ID,
+            displayContentRef = "$tenantBCoverId-r1-display.enc",
+            thumbnailContentRef = "$tenantBCoverId-r1-thumbnail.enc",
+        )
+        workspace.seedTenantCover(TENANT_ID, PROJECT_ID, PROJECT_KEY, "Active project", tenantACover, bytes)
+        workspace.seedTenantCover(
+            OTHER_TENANT_ID,
+            OTHER_PROJECT_ID,
+            OTHER_PROJECT_KEY,
+            "Tenant B project",
+            tenantBCover,
+            bytes,
+        )
+        bytes.fill(0)
+        workspace.blockCoverReadTenant = TENANT_ID
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            assertTrue(workspace.coverReadEntered.await(2, TimeUnit.SECONDS))
+            authenticatedTenant = OTHER_TENANT_ID
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                activity.selectDialogItem("Switch account")
+            }
+            waitFor(scenario) {
+                presentationController.activeTenantId == OTHER_TENANT_ID && it.hasButton("Tenant B project")
+            }
+            workspace.allowCoverRead.countDown()
+            waitFor(scenario) { activity ->
+                activity.coverCacheKeysForTest().any { it.startsWith("$OTHER_TENANT_ID:") }
+            }
+            scenario.onActivity { activity ->
+                val keys = activity.coverCacheKeysForTest()
+                assertTrue(keys.none { it.startsWith("$TENANT_ID:") })
+                assertTrue(keys.all { it.startsWith("$OTHER_TENANT_ID:") })
+            }
         }
     }
 
@@ -773,20 +838,18 @@ class MainActivityPresentationTest {
     }
 
     @Test
-    fun dashboardBodyHasOneSettingsEntryInsteadOfArchiveAndAccountActions() {
+    fun dashboardUsesContainedArchiveActionAndOneAccountSettingsEntry() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
 
             scenario.onActivity { activity ->
                 assertTrue(activity.findViewById<Button>(ProjectUiIds.SETTINGS) != null)
-                assertFalse(activity.hasButton("Archive"))
+                assertTrue(activity.hasButton("Archive"))
                 assertFalse(activity.hasButton("Account"))
                 activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
                 val items = activity.activeDialog?.listView?.adapter ?: error("Settings menu is missing")
                 assertEquals(
                     listOf(
-                        "Archive",
-                        "Tile view",
                         "About",
                         "Reconnect Google account",
                         "Switch account",
@@ -819,7 +882,7 @@ class MainActivityPresentationTest {
                 activity.selectDialogItem("About")
                 val about = activity.dialogTexts().joinToString("\n")
                 assertTrue(about.contains("Blocks Android"))
-                assertTrue(about.contains("Version 0.6.2 (10)"))
+                assertTrue(about.contains("Version 0.7.0 (11)"))
                 assertTrue(about.contains("dev.blocks.android/debug"))
                 assertFalse(about.contains("tenant", ignoreCase = true))
                 assertFalse(about.contains("token", ignoreCase = true))
@@ -842,10 +905,6 @@ class MainActivityPresentationTest {
             )
             ActivityScenario.launch(MainActivity::class.java).use { scenario ->
                 waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
-                scenario.onActivity { activity ->
-                    activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
-                    activity.selectDialogItem("Tile view")
-                }
                 waitFor(scenario) { it.findViewById<GridLayout>(ProjectUiIds.PROJECT_TILES) != null }
                 waitFor(scenario) { it.resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT }
                 scenario.onActivity(::assertResponsiveDashboard)
@@ -884,16 +943,14 @@ class MainActivityPresentationTest {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             scenario.onActivity { activity ->
-                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
-                activity.selectDialogItem("Tile view")
+                activity.findViewById<Button>(ProjectUiIds.VIEW_LIST).performClick()
             }
-            waitFor(scenario) { it.findViewById<View>(ProjectUiIds.PROJECT_TILES) != null }
+            waitFor(scenario) { it.findViewById<View>(ProjectUiIds.PROJECT_LIST) != null }
 
             scenario.recreate()
-            waitFor(scenario) { it.findViewById<View>(ProjectUiIds.PROJECT_TILES) != null }
+            waitFor(scenario) { it.findViewById<View>(ProjectUiIds.PROJECT_LIST) != null }
             scenario.onActivity { activity ->
-                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
-                activity.selectDialogItem(0)
+                activity.button("Archive").performClick()
             }
             waitFor(scenario) { activity ->
                 activity.texts().contains("Archive") && activity.hasButton("Archived project")
@@ -992,7 +1049,13 @@ class MainActivityPresentationTest {
             val drafts = AndroidEncryptedDraftStore(activity)
             presentationController = ProjectPresentationController(
                 SessionAuthenticator { Session(TENANT_ID, it, ACCOUNT_A) },
-                ProjectSyncRepository(service, NoOpLegacyQueueReplay, drafts, AndroidEncryptedSyncStateStore(activity)),
+                ProjectSyncRepository(
+                    service,
+                    NoOpLegacyQueueReplay,
+                    drafts,
+                    AndroidEncryptedSyncStateStore(activity),
+                    coverMediaStore = AndroidEncryptedProjectCoverMediaStore(activity),
+                ),
                 newOperationId = { "slow-api-${operationIds.incrementAndGet()}" },
             )
             ProjectAppDependencies(
@@ -1079,7 +1142,13 @@ class MainActivityPresentationTest {
                         if (!exchangeOnline.get()) throw java.io.IOException("service unavailable")
                         Session(TENANT_ID, "service-session", ACCOUNT_A)
                     },
-                    ProjectSyncRepository(service, NoOpLegacyQueueReplay, drafts, persisted),
+                    ProjectSyncRepository(
+                        service,
+                        NoOpLegacyQueueReplay,
+                        drafts,
+                        persisted,
+                        coverMediaStore = AndroidEncryptedProjectCoverMediaStore(activity),
+                    ),
                 ),
                 identity = identity,
                 continuity = continuity,
@@ -1128,6 +1197,7 @@ class MainActivityPresentationTest {
                 NoOpLegacyQueueReplay,
                 drafts,
                 AndroidEncryptedSyncStateStore(activity),
+                coverMediaStore = AndroidEncryptedProjectCoverMediaStore(activity),
             )
             presentationController = ProjectPresentationController(
                 SessionAuthenticator { Session(TENANT_ID, it, ACCOUNT_A) },
@@ -1140,16 +1210,12 @@ class MainActivityPresentationTest {
                 continuity = continuity,
                 acceptedTenantStore = realAccepted,
                 observeConnectivity = false,
+                coverImporter = coverImporter,
             )
         }
 
         ActivityScenario.launch(MainActivity::class.java).use { first ->
             waitFor(first) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
-            first.onActivity { activity ->
-                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
-                activity.selectDialogItem("Tile view")
-            }
-            waitFor(first) { it.findViewById<View>(ProjectUiIds.PROJECT_TILES) != null }
             first.onActivity { activity ->
                 activity.findViewById<Button>(ProjectUiIds.CREATE_PROJECT).performClick()
                 activity.activeDialog?.findViewById<EditText>(ProjectUiIds.PROJECT_NAME)
@@ -1182,6 +1248,11 @@ class MainActivityPresentationTest {
                 activity.findViewById<Button>(ProjectUiIds.SAVE_PARKING).performClick()
             }
             waitUntil { presentationController.state.projectPage?.newestParking?.location == "Workbench" }
+            first.onActivity { activity ->
+                val projectId = requireNotNull(presentationController.state.projectPage).project.id
+                activity.importCover(projectId, Uri.parse("content://test/real-store-cover"))
+            }
+            waitUntil { presentationController.state.projectCovers.singleOrNull() != null }
         }
 
         ActivityScenario.launch(MainActivity::class.java).use { restarted ->
@@ -1194,6 +1265,7 @@ class MainActivityPresentationTest {
             waitFor(restarted) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
             restarted.onActivity { activity ->
                 assertEquals("Offline notes", activity.findViewById<EditText>(ProjectUiIds.NOTES).text.toString())
+                assertEquals(coverImporter.importedDigest(1), presentationController.state.projectCovers.single().contentDigest)
                 assertTrue(activity.texts().contains("Workbench"))
                 assertTrue(activity.texts().contains("Fit bracket"))
                 assertTrue(activity.texts().contains("Bring screws"))
@@ -1219,8 +1291,7 @@ class MainActivityPresentationTest {
                 it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD && !it.hasButton("Renamed offline project")
             }
             restarted.onActivity { activity ->
-                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
-                activity.selectDialogItem(0)
+                activity.button("Archive").performClick()
             }
             waitFor(restarted) { it.hasButton("Renamed offline project") }
 
@@ -1248,6 +1319,15 @@ class MainActivityPresentationTest {
                     it.hasButton("Renamed offline project") &&
                     it.findViewById<View>(ProjectUiIds.PROJECT_TILES) != null
             }
+            assertEquals(coverImporter.importedDigest(1), presentationController.state.projectCovers.single().contentDigest)
+            finalRestart.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                activity.selectDialogItem("Sign out")
+            }
+            waitFor(finalRestart) { it.screenTag() == ProjectUiIds.SCREEN_LOGIN }
+            finalRestart.onActivity { it.button("Sign in with Google").performClick() }
+            waitFor(finalRestart) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            assertEquals(coverImporter.importedDigest(1), presentationController.state.projectCovers.single().contentDigest)
         }
     }
 
@@ -1263,7 +1343,7 @@ class MainActivityPresentationTest {
             }
             waitFor(scenario) {
                 it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD &&
-                    it.texts().contains("No active projects yet.")
+                    it.texts().contains("Your first project starts here.")
             }
 
             assertTrue(continuity.shouldRestore)
@@ -1277,6 +1357,7 @@ class MainActivityPresentationTest {
     fun confirmedMembershipRevocationErasesOnlyTheAffectedPartition() {
         acceptedTenant.save(AcceptedTenantContinuity(OTHER_TENANT_ID, ACCOUNT_B))
         acceptedTenant.save(AcceptedTenantContinuity(TENANT_ID, ACCOUNT_A))
+        workspace.cache = workspace.cache.copy(projectCovers = listOf(coverImporter.metadata(PROJECT_ID)))
         workspace.membershipRevoked = true
 
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
@@ -1291,6 +1372,7 @@ class MainActivityPresentationTest {
             assertEquals(null, acceptedTenant.find(ACCOUNT_A))
             assertEquals(AcceptedTenantContinuity(OTHER_TENANT_ID, ACCOUNT_B), acceptedTenant.find(ACCOUNT_B))
             assertEquals(listOf(TENANT_ID), workspace.clearedTenants)
+            assertTrue(workspace.cacheFor(TENANT_ID).projectCovers.isEmpty())
             assertFalse(continuity.shouldRestore)
         }
     }
@@ -1299,6 +1381,7 @@ class MainActivityPresentationTest {
     fun explicitRemoveLocalDataErasesOnlyTheSelectedTenantAfterConfirmation() {
         acceptedTenant.save(AcceptedTenantContinuity(OTHER_TENANT_ID, ACCOUNT_B))
         acceptedTenant.save(AcceptedTenantContinuity(TENANT_ID, ACCOUNT_A))
+        workspace.cache = workspace.cache.copy(projectCovers = listOf(coverImporter.metadata(PROJECT_ID)))
 
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
@@ -1313,6 +1396,7 @@ class MainActivityPresentationTest {
             assertEquals(null, acceptedTenant.find(ACCOUNT_A))
             assertEquals(AcceptedTenantContinuity(OTHER_TENANT_ID, ACCOUNT_B), acceptedTenant.find(ACCOUNT_B))
             assertEquals(listOf(TENANT_ID), workspace.clearedTenants)
+            assertTrue(workspace.cacheFor(TENANT_ID).projectCovers.isEmpty())
         }
     }
 
@@ -1348,7 +1432,7 @@ class MainActivityPresentationTest {
                 val projectSettings = activity.activeDialog?.listView?.adapter
                     ?: error("Project Settings is missing")
                 assertEquals(
-                    listOf("Set Tag", "View QR", "Clear Tags", "Rename", "Archive"),
+                    listOf("Project cover", "Set Tag", "View QR", "Clear Tags", "Rename", "Archive"),
                     (0 until projectSettings.count).map { projectSettings.getItem(it).toString() },
                 )
                 activity.dialogButton("Cancel").callOnClick()
@@ -1578,6 +1662,348 @@ class MainActivityPresentationTest {
         }
     }
 
+    @Test
+    fun dashboardIsACompactSearchableQuickLinkSurfaceWithRememberedViewChoice() {
+        workspace.addProject(
+            "00000000-0000-0000-0000-000000000021",
+            ProjectKey.parse("323e4567-e89b-12d3-a456-426614174000")!!,
+            "Garden plan",
+        )
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { activity ->
+                val density = activity.resources.displayMetrics.density
+                val tiles = activity.findViewById<Button>(ProjectUiIds.VIEW_TILES)
+                val list = activity.findViewById<Button>(ProjectUiIds.VIEW_LIST)
+                assertTrue(tiles.isSelected)
+                assertFalse(list.isSelected)
+                assertTrue(tiles.width >= (48 * density).toInt())
+                assertTrue(list.width >= (48 * density).toInt())
+                assertTrue(activity.findViewById<View>(ProjectUiIds.DASHBOARD_WATERMARK) != null)
+                assertFalse(activity.texts().contains("Blocks"))
+                assertFalse(activity.texts().any { it.contains("park message", ignoreCase = true) })
+                assertFalse(activity.texts().contains("Notes"))
+                val quickLink = activity.findViewById<GridLayout>(ProjectUiIds.PROJECT_TILES).getChildAt(0)
+                assertTrue(quickLink.isClickable)
+                assertTrue(quickLink.isFocusable)
+                assertTrue(quickLink.contentDescription.toString().startsWith("Open "))
+                assertTrue(
+                    quickLink.descendants().filterIsInstance<android.widget.ImageView>().all {
+                        it.contentDescription == null &&
+                            it.importantForAccessibility == View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                    },
+                )
+                assertTrue(
+                    quickLink.descendants().filterIsInstance<Button>().all {
+                        it.importantForAccessibility == View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                    },
+                )
+                activity.findViewById<EditText>(ProjectUiIds.SEARCH).setText("gArDeN")
+            }
+            waitFor(scenario) { activity ->
+                activity.hasButton("Garden plan") && !activity.hasButton("Active project")
+            }
+            scenario.onActivity { activity ->
+                activity.findViewById<EditText>(ProjectUiIds.SEARCH).setText("")
+                activity.findViewById<Button>(ProjectUiIds.VIEW_LIST).performClick()
+            }
+            waitFor(scenario) { it.findViewById<View>(ProjectUiIds.PROJECT_LIST) != null }
+            scenario.onActivity { activity ->
+                assertTrue(activity.findViewById<Button>(ProjectUiIds.VIEW_LIST).isSelected)
+                val ordered = activity.findViewById<LinearLayout>(ProjectUiIds.PROJECT_LIST)
+                    .descendants()
+                    .filterIsInstance<Button>()
+                    .map { it.text.toString() }
+                    .toList()
+                assertEquals(listOf("Active project", "Garden plan"), ordered)
+                val firstRow = activity.findViewById<LinearLayout>(ProjectUiIds.PROJECT_LIST).getChildAt(0)
+                assertTrue(firstRow.isClickable)
+                assertTrue(firstRow.contentDescription.toString().startsWith("Open "))
+            }
+
+            scenario.recreate()
+            waitFor(scenario) { it.findViewById<View>(ProjectUiIds.PROJECT_LIST) != null }
+            scenario.onActivity { activity ->
+                assertTrue(activity.findViewById<Button>(ProjectUiIds.VIEW_LIST).isSelected)
+            }
+        }
+    }
+
+    @Test
+    fun searchIsEphemeralAcrossActivityRecreationAndAccountSwitch() {
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { it.findViewById<EditText>(ProjectUiIds.SEARCH).setText("Active project") }
+            scenario.recreate()
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity {
+                assertEquals("", it.findViewById<EditText>(ProjectUiIds.SEARCH).text.toString())
+                it.findViewById<EditText>(ProjectUiIds.SEARCH).setText("Active project")
+            }
+            authenticatedTenant = OTHER_TENANT_ID
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                activity.selectDialogItem("Switch account")
+            }
+            waitFor(scenario) {
+                it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD &&
+                    presentationController.activeTenantId == OTHER_TENANT_ID
+            }
+            scenario.onActivity {
+                assertEquals("", it.findViewById<EditText>(ProjectUiIds.SEARCH).text.toString())
+            }
+        }
+    }
+
+    @Test
+    fun coverActionsAreContextualWithoutDuplicatePickerMeanings() {
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { it.button("Active project").performClick() }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.EDIT_COVER).performClick()
+                val texts = activity.dialogItems()
+                assertTrue(texts.containsAll(listOf("Take photo", "Choose image")))
+                assertFalse(texts.contains("Remove cover"))
+                activity.dialogButton("Cancel").performClick()
+                activity.stagePendingCover(PROJECT_ID)
+                activity.handleCoverPickerResult(Uri.parse("content://test/cover"))
+            }
+            waitUntil { presentationController.state.projectCovers.isNotEmpty() }
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.EDIT_COVER).performClick()
+                val texts = activity.dialogItems()
+                assertTrue(
+                    texts.containsAll(
+                        listOf("Take replacement photo", "Choose replacement image", "Remove cover"),
+                    ),
+                )
+                assertFalse(texts.contains("Take photo"))
+                assertFalse(texts.contains("Choose image"))
+            }
+        }
+    }
+
+    @Test
+    fun coverImportFailureCancellationRestartAndExplicitRemovalPreserveAtomicUiState() {
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { it.button("Active project").performClick() }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            scenario.onActivity { activity ->
+                activity.stagePendingCover(PROJECT_ID)
+                activity.handleCoverPickerResult(Uri.parse("content://test/first"))
+            }
+            waitUntil { workspace.cache.projectCovers.singleOrNull()?.contentDigest == coverImporter.importedDigest(1) }
+            waitFor(scenario) { activity ->
+                activity.findViewById<ViewGroup>(ProjectUiIds.PROJECT_COVER)
+                    .descendants()
+                    .filterIsInstance<android.widget.ImageView>()
+                    .all { it.contentDescription == null }
+            }
+            lateinit var successfulCapturePath: String
+            scenario.onActivity { activity ->
+                val capture = CoverCaptureFiles(activity).create()
+                successfulCapturePath = capture.path
+                activity.stagePendingCover(PROJECT_ID, capture)
+                activity.handleCoverCameraResult(true)
+            }
+            waitUntil {
+                workspace.cache.projectCovers.singleOrNull()?.contentDigest == coverImporter.importedDigest(2) &&
+                    !java.io.File(successfulCapturePath).exists()
+            }
+
+            scenario.recreate()
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            assertEquals(coverImporter.importedDigest(2), workspace.cache.projectCovers.single().contentDigest)
+
+            coverImporter.failure = java.io.IOException("denied")
+            lateinit var cancelledCapturePath: String
+            scenario.onActivity { activity ->
+                activity.stagePendingCover(PROJECT_ID)
+                activity.handleCoverPickerResult(Uri.parse("content://test/denied"))
+                activity.stagePendingCover(PROJECT_ID)
+                activity.handleCoverPickerResult(null)
+                val capture = CoverCaptureFiles(activity).create()
+                cancelledCapturePath = capture.path
+                activity.stagePendingCover(PROJECT_ID, capture)
+                activity.handleCoverCameraResult(false)
+            }
+            waitUntil { !java.io.File(cancelledCapturePath).exists() }
+            waitFor(scenario) { it.texts().any { text -> text.contains("could not save", ignoreCase = true) } }
+            assertEquals(coverImporter.importedDigest(2), workspace.cache.projectCovers.single().contentDigest)
+
+            coverImporter.failure = null
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.EDIT_COVER).performClick()
+                activity.selectDialogItem("Remove cover")
+                activity.dialogButton("Remove").callOnClick()
+            }
+            waitUntil { workspace.cache.projectCovers.isEmpty() }
+            scenario.onActivity { activity ->
+                assertTrue(activity.texts().contains("Active project"))
+                assertTrue(activity.findViewById<View>(ProjectUiIds.PROJECT_COVER) != null)
+            }
+        }
+    }
+
+    @Test
+    fun cameraTempsAreCleanedForLostScopeRecreationAndFailedMetadataCommit() {
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { it.button("Active project").performClick() }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+
+            lateinit var orphanPath: String
+            scenario.onActivity { activity ->
+                orphanPath = CoverCaptureFiles(activity).create().path
+                java.io.File(orphanPath).writeBytes(byteArrayOf(1, 2, 3))
+            }
+            scenario.recreate()
+            waitUntil { !java.io.File(orphanPath).exists() }
+
+            lateinit var recreatedPath: String
+            scenario.onActivity { activity ->
+                val capture = CoverCaptureFiles(activity).create()
+                recreatedPath = capture.path
+                java.io.File(recreatedPath).writeBytes(byteArrayOf(4, 5, 6))
+                activity.stagePendingCover(PROJECT_ID, capture)
+            }
+            scenario.recreate()
+            waitUntil { !java.io.File(recreatedPath).exists() }
+
+            lateinit var changedProjectPath: String
+            workspace.addProject(OTHER_PROJECT_ID, OTHER_PROJECT_KEY, "Other project")
+            scenario.onActivity { activity ->
+                val capture = CoverCaptureFiles(activity).create()
+                changedProjectPath = capture.path
+                activity.stagePendingCover(PROJECT_ID, capture)
+                presentationController.openProject(OTHER_PROJECT_ID)
+                activity.importCover(PROJECT_ID, capture.uri, capture)
+            }
+            waitUntil { !java.io.File(changedProjectPath).exists() }
+
+            lateinit var failedCommitPath: String
+            scenario.onActivity { activity ->
+                presentationController.openProject(PROJECT_ID)
+                workspace.failCoverSave = true
+                val capture = CoverCaptureFiles(activity).create()
+                failedCommitPath = capture.path
+                activity.stagePendingCover(PROJECT_ID, capture)
+                activity.handleCoverCameraResult(true)
+            }
+            waitUntil { !java.io.File(failedCommitPath).exists() }
+            assertTrue(workspace.cache.projectCovers.isEmpty())
+            workspace.failCoverSave = false
+
+            lateinit var lostTenantPath: String
+            scenario.onActivity { activity ->
+                val capture = CoverCaptureFiles(activity).create()
+                lostTenantPath = capture.path
+                presentationController.lock()
+                activity.importCover(PROJECT_ID, capture.uri, capture)
+            }
+            assertFalse(java.io.File(lostTenantPath).exists())
+        }
+    }
+
+    @Test
+    fun activityStartupRemovesAbandonedImportSourcesWithoutTouchingOwnedExceptions() {
+        val imports = CoverImportFiles(context)
+        val directory = imports.directoryForTest().apply { mkdirs() }
+        val abandoned = java.io.File(directory, "123e4567-e89b-42d3-a456-426614174999.source").apply {
+            writeBytes(byteArrayOf(1, 2, 3))
+        }
+        val retained = imports.createRetained().apply { writeBytes(byteArrayOf(4, 5, 6)) }
+        val unrelatedInDirectory = java.io.File(directory, "not-owned.source").apply {
+            writeBytes(byteArrayOf(7, 8, 9))
+        }
+        val unrelatedCache = java.io.File(context.cacheDir, "unrelated-cover-cache.source").apply {
+            writeBytes(byteArrayOf(10, 11, 12))
+        }
+        try {
+            ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+                waitUntil { !abandoned.exists() }
+                assertTrue(retained.isFile)
+                assertTrue(unrelatedInDirectory.isFile)
+                assertTrue(unrelatedCache.isFile)
+            }
+        } finally {
+            imports.delete(retained)
+            unrelatedInDirectory.delete()
+            unrelatedCache.delete()
+        }
+    }
+
+    @Test
+    fun cachedDashboardAndProjectLinkOpenAreMeasuredWithoutWaitingForTransportOrCoverDecode() {
+        workspace.cache = workspace.cache.copy(projectCovers = listOf(coverImporter.metadata(PROJECT_ID)))
+        sessionExchangeOffline = true
+        val started = android.os.SystemClock.elapsedRealtime()
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            val coldDashboardMs = android.os.SystemClock.elapsedRealtime() - started
+            val openStarted = android.os.SystemClock.elapsedRealtime()
+            scenario.onActivity {
+                it.handleIncomingTagIntent(Intent(Intent.ACTION_VIEW, Uri.parse(PROJECT_LINK.encoded)))
+            }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            val coldProjectMs = android.os.SystemClock.elapsedRealtime() - openStarted
+            val returnStarted = android.os.SystemClock.elapsedRealtime()
+            scenario.onActivity { it.findViewById<Button>(ProjectUiIds.MAIN).performClick() }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            val warmDashboardMs = android.os.SystemClock.elapsedRealtime() - returnStarted
+            val reopenStarted = android.os.SystemClock.elapsedRealtime()
+            scenario.onActivity {
+                it.handleIncomingTagIntent(Intent(Intent.ACTION_VIEW, Uri.parse(PROJECT_LINK.encoded)))
+            }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            val warmProjectMs = android.os.SystemClock.elapsedRealtime() - reopenStarted
+            android.util.Log.i(
+                "BlocksTiming",
+                "cold_dashboard_ms=$coldDashboardMs warm_dashboard_ms=$warmDashboardMs " +
+                    "cold_project_link_open_ms=$coldProjectMs warm_project_link_open_ms=$warmProjectMs",
+            )
+            assertTrue("Cold dashboard local render took ${coldDashboardMs}ms", coldDashboardMs < 5_000)
+            assertTrue("Warm dashboard local render took ${warmDashboardMs}ms", warmDashboardMs < 2_000)
+            assertTrue("Cold project-link local open took ${coldProjectMs}ms", coldProjectMs < 2_000)
+            assertTrue("Warm project-link local open took ${warmProjectMs}ms", warmProjectMs < 2_000)
+            assertEquals(0, workspace.syncCalls)
+            assertEquals(0, sessionExchanges.get())
+        }
+    }
+
+    @Test
+    fun enlargedSystemTextKeepsQuickLinksAndProjectActionsReachableInTheScrollSurface() {
+        shell("settings put system font_scale 1.3")
+        try {
+            ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+                scenario.onActivity { activity ->
+                    assertTrue(activity.findViewById<ScrollView>(ProjectUiIds.ROOT_SCROLL) != null)
+                    assertTrue(activity.findViewById<Button>(ProjectUiIds.VIEW_TILES).contentDescription.toString().isNotBlank())
+                    assertTrue(activity.findViewById<Button>(ProjectUiIds.VIEW_LIST).contentDescription.toString().isNotBlank())
+                    assertTrue(activity.findViewById<Button>(ProjectUiIds.SETTINGS).contentDescription.toString().isNotBlank())
+                    activity.button("Active project").performClick()
+                }
+                waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+                scenario.onActivity { activity ->
+                    assertTrue(activity.findViewById<Button>(ProjectUiIds.EDIT_COVER) != null)
+                    assertTrue(activity.findViewById<Button>(ProjectUiIds.PARK) != null)
+                    assertTrue(activity.findViewById<Button>(ProjectUiIds.SAVE_NOTES) != null)
+                    assertTrue(
+                        activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS)
+                            .contentDescription.toString().isNotBlank(),
+                    )
+                }
+            }
+        } finally {
+            shell("settings put system font_scale 1.0")
+        }
+    }
+
     private fun waitFor(
         scenario: ActivityScenario<MainActivity>,
         condition: (MainActivity) -> Boolean,
@@ -1663,6 +2089,11 @@ class MainActivityPresentationTest {
         .window?.decorView?.descendants().orEmpty()
         .mapNotNull { (it as? android.widget.TextView)?.text?.toString() }
 
+    private fun MainActivity.dialogItems(): List<String> {
+        val adapter = requireNotNull(activeDialog).listView.adapter
+        return (0 until adapter.count).map { adapter.getItem(it).toString() }
+    }
+
     private fun MainActivity.dialogInput(): EditText = requireNotNull(activeDialog)
         .window?.decorView?.descendants().orEmpty()
         .filterIsInstance<EditText>()
@@ -1673,6 +2104,88 @@ class MainActivityPresentationTest {
         if (this@descendants is ViewGroup) {
             for (index in 0 until childCount) yieldAll(getChildAt(index).descendants())
         }
+    }
+
+    private class FakeCoverImporter(context: Context) : ProjectCoverImporter {
+        private val importFiles = CoverImportFiles(context)
+        @Volatile
+        var failure: Exception? = null
+        private var importCount = 0
+        private val encoded: ByteArray by lazy {
+            val bitmap = Bitmap.createBitmap(32, 18, Bitmap.Config.ARGB_8888).apply {
+                eraseColor(Color.rgb(23, 107, 99))
+            }
+            try {
+                ByteArrayOutputStream().use { output ->
+                    check(bitmap.compress(Bitmap.CompressFormat.JPEG, 90, output))
+                    output.toByteArray()
+                }
+            } finally {
+                bitmap.recycle()
+            }
+        }
+
+        override fun importCover(projectId: String, uri: Uri): ProjectCoverContent {
+            failure?.let { throw it }
+            importCount += 1
+            return content(projectId, (importCount.coerceAtMost(9) + '0'.code).toChar())
+        }
+
+        override fun cleanupAbandonedSources(): Int = importFiles.cleanupOrphans()
+
+        private fun content(projectId: String, digestCharacter: Char): ProjectCoverContent {
+            val display = encoded + byteArrayOf(digestCharacter.code.toByte())
+            val thumbnail = encoded + byteArrayOf((digestCharacter.code + 16).toByte())
+            return ProjectCoverContent(
+                projectId = projectId,
+                displayJpeg = display,
+                thumbnailJpeg = thumbnail,
+                displayWidth = 1200,
+                displayHeight = 675,
+                thumbnailWidth = 480,
+                thumbnailHeight = 270,
+                displayDigest = digest(display),
+                thumbnailDigest = digest(thumbnail),
+                contentDigest = digest(display, thumbnail),
+                importedAt = NOW,
+            )
+        }
+
+        fun importedDigest(number: Int): String {
+            val marker = (number.coerceAtMost(9) + '0'.code).toChar()
+            val display = encoded + byteArrayOf(marker.code.toByte())
+            val thumbnail = encoded + byteArrayOf((marker.code + 16).toByte())
+            return digest(display, thumbnail)
+        }
+
+        fun metadata(projectId: String, digestCharacter: Char = '1') = ProjectCover(
+            coverId = "123e4567-e89b-42d3-a456-426614174000",
+            tenantId = TENANT_ID,
+            projectId = projectId,
+            mediaType = "image/jpeg",
+            displayContentRef = "123e4567-e89b-42d3-a456-426614174000-r1-display.enc",
+            displayWidth = 1200,
+            displayHeight = 675,
+            displayByteSize = encoded.size.toLong(),
+            displayDigest = digest(encoded),
+            thumbnailContentRef = "123e4567-e89b-42d3-a456-426614174000-r1-thumbnail.enc",
+            thumbnailWidth = 480,
+            thumbnailHeight = 270,
+            thumbnailByteSize = encoded.size.toLong(),
+            thumbnailDigest = digest(encoded),
+            contentDigest = digestCharacter.toString().repeat(64),
+            revision = 1,
+            createdAt = NOW,
+            updatedAt = NOW,
+        )
+
+        fun imageBytes(): ByteArray = encoded.copyOf()
+
+        private fun digest(vararg values: ByteArray): String = MessageDigest.getInstance("SHA-256").run {
+            values.forEach(::update)
+            digest()
+        }
+            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
     }
 
     private class FakeNfcTagPlatform : NfcTagPlatform {
@@ -1815,6 +2328,10 @@ class MainActivityPresentationTest {
         private var activeTenantId = TENANT_ID
         private val draftsByTenant = mutableMapOf<String, FormDrafts>()
         private val preferencesByTenant = mutableMapOf<String, ProjectUiPreferences>()
+        private val coverBytes = mutableMapOf<Pair<String, String>, ByteArray>()
+        var blockCoverReadTenant: String? = null
+        val coverReadEntered = CountDownLatch(1)
+        val allowCoverRead = CountDownLatch(1)
         private val caches = mutableMapOf(
             TENANT_ID to ProjectCacheState(
                 activeProjects = listOf(project()),
@@ -1837,6 +2354,8 @@ class MainActivityPresentationTest {
         var rejectAuthentication = false
         @Volatile
         var membershipRevoked = false
+        @Volatile
+        var failCoverSave = false
         @Volatile
         var syncCalls = 0
         @Volatile
@@ -1880,6 +2399,9 @@ class MainActivityPresentationTest {
                 projectLinks = cache.projectLinks.map {
                     if (it.projectId == provisionalId) it.copy(projectId = serverId) else it
                 },
+                projectCovers = cache.projectCovers.map {
+                    if (it.projectId == provisionalId) it.copy(projectId = serverId) else it
+                },
                 localBlocks = cache.localBlocks.map { block ->
                     block.copy(
                         intendedProjectId = if (block.intendedProjectId == provisionalId) serverId else block.intendedProjectId,
@@ -1901,6 +2423,29 @@ class MainActivityPresentationTest {
                 ),
                 projectLinks = cache.projectLinks + ProjectLinkIdentity(projectId, key),
             )
+        }
+
+        @Synchronized
+        fun seedTenantCover(
+            tenantId: String,
+            projectId: String,
+            key: ProjectKey,
+            name: String,
+            cover: ProjectCover,
+            bytes: ByteArray,
+        ) {
+            val summary = project().copy(id = projectId, tenantId = tenantId, name = name)
+            val scopedCover = cover.copy(tenantId = tenantId, projectId = projectId)
+            caches[tenantId] = ProjectCacheState(
+                activeProjects = listOf(summary),
+                activeProjectsLoaded = true,
+                archivedProjectsLoaded = true,
+                pages = listOf(ProjectPage(summary, ProjectNotes(projectId, "", 1, NOW), null)),
+                projectLinks = listOf(ProjectLinkIdentity(projectId, key)),
+                projectCovers = listOf(scopedCover),
+            )
+            coverBytes[tenantId to scopedCover.displayContentRef] = bytes.copyOf()
+            coverBytes[tenantId to scopedCover.thumbnailContentRef] = bytes.copyOf()
         }
 
         override fun activate(session: Session) {
@@ -1937,6 +2482,69 @@ class MainActivityPresentationTest {
                 .sortedByDescending { it.occurredAt }
             val visible = records.drop(offset).take(limit)
             return ParkingHistoryPage(visible, offset + visible.size < records.size)
+        }
+        override fun projectCover(session: Session, projectId: String) =
+            cache.projectCovers.singleOrNull { it.projectId == projectId }
+        override fun readProjectCoverContent(
+            session: Session,
+            cover: ProjectCover,
+            thumbnail: Boolean,
+        ): ByteArray {
+            if (blockCoverReadTenant == session.tenantId) {
+                coverReadEntered.countDown()
+                check(allowCoverRead.await(5, TimeUnit.SECONDS)) { "timed out waiting to release cover read" }
+            }
+            return coverBytes[session.tenantId to if (thumbnail) {
+                cover.thumbnailContentRef
+            } else {
+                cover.displayContentRef
+            }]?.copyOf() ?: byteArrayOf()
+        }
+
+        override fun saveProjectCover(session: Session, cover: ProjectCoverContent): BackgroundSyncResult {
+            if (failCoverSave) throw IllegalStateException("simulated cover metadata failure")
+            val previous = cache.projectCovers.singleOrNull { it.projectId == cover.projectId }
+            val coverId = previous?.coverId ?: "123e4567-e89b-42d3-a456-426614174000"
+            val revision = (previous?.revision ?: 0) + 1
+            val metadata = ProjectCover(
+                coverId = coverId,
+                tenantId = session.tenantId,
+                projectId = cover.projectId,
+                mediaType = "image/jpeg",
+                displayContentRef = "$coverId-r$revision-display.enc",
+                displayWidth = cover.displayWidth,
+                displayHeight = cover.displayHeight,
+                displayByteSize = cover.displayJpeg.size.toLong(),
+                displayDigest = cover.displayDigest,
+                thumbnailContentRef = "$coverId-r$revision-thumbnail.enc",
+                thumbnailWidth = cover.thumbnailWidth,
+                thumbnailHeight = cover.thumbnailHeight,
+                thumbnailByteSize = cover.thumbnailJpeg.size.toLong(),
+                thumbnailDigest = cover.thumbnailDigest,
+                contentDigest = cover.contentDigest,
+                revision = revision,
+                createdAt = previous?.createdAt ?: cover.importedAt,
+                updatedAt = cover.importedAt,
+            )
+            coverBytes[session.tenantId to metadata.displayContentRef] = cover.displayJpeg.copyOf()
+            coverBytes[session.tenantId to metadata.thumbnailContentRef] = cover.thumbnailJpeg.copyOf()
+            cache = cache.copy(
+                projectCovers = cache.projectCovers.filterNot { it.projectId == cover.projectId } + metadata,
+            )
+            previous?.let {
+                coverBytes.remove(session.tenantId to it.displayContentRef)?.fill(0)
+                coverBytes.remove(session.tenantId to it.thumbnailContentRef)?.fill(0)
+            }
+            cover.clear()
+            return result()
+        }
+        override fun removeProjectCover(session: Session, projectId: String): BackgroundSyncResult {
+            cache.projectCovers.singleOrNull { it.projectId == projectId }?.let {
+                coverBytes.remove(session.tenantId to it.displayContentRef)?.fill(0)
+                coverBytes.remove(session.tenantId to it.thumbnailContentRef)?.fill(0)
+            }
+            cache = cache.copy(projectCovers = cache.projectCovers.filterNot { it.projectId == projectId })
+            return result()
         }
         override fun projectLink(session: Session, projectId: String): ProjectLink = cache.projectLinks
             .single { it.projectId == projectId }
@@ -2284,6 +2892,9 @@ class MainActivityPresentationTest {
             caches.remove(session.tenantId)
             draftsByTenant.remove(session.tenantId)
             preferencesByTenant.remove(session.tenantId)
+            coverBytes.keys.filter { it.first == session.tenantId }.toList().forEach { key ->
+                coverBytes.remove(key)?.fill(0)
+            }
         }
 
         private fun emptyCache() = ProjectCacheState(

@@ -1,0 +1,11 @@
+<resources>
+    <color name="blocks_teal">#176B63</color>
+    <color name="blocks_ink">#172C2C</color>
+    <color name="blocks_paper">#F6F5F0</color>
+    <color name="blocks_white">#FFFFFF</color>
+    <color name="blocks_muted">#526361</color>
+    <color name="blocks_line">#D5DDDA</color>
+    <color name="blocks_input">#7C8D87</color>
+    <color name="blocks_soft">#E7EFEB</color>
+    <color name="blocks_icon_background">#F6F5F0</color>
+</resources>

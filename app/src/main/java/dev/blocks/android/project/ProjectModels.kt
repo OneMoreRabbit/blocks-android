@@ -62,6 +62,48 @@ data class ProjectPage(
     val newestParking: ProjectParking?,
 )
 
+/** Encrypted metadata/reference for one immutable local-only cover revision. */
+data class ProjectCover(
+    val coverId: String,
+    val tenantId: String,
+    val projectId: String,
+    val mediaType: String,
+    val displayContentRef: String,
+    val displayWidth: Int,
+    val displayHeight: Int,
+    val displayByteSize: Long,
+    val displayDigest: String,
+    val thumbnailContentRef: String,
+    val thumbnailWidth: Int,
+    val thumbnailHeight: Int,
+    val thumbnailByteSize: Long,
+    val thumbnailDigest: String,
+    val contentDigest: String,
+    val revision: Long,
+    val createdAt: String,
+    val updatedAt: String,
+)
+
+/** Bounded metadata-free bytes passed once from the importer to the encrypted media store. */
+class ProjectCoverContent(
+    val projectId: String,
+    val displayJpeg: ByteArray,
+    val thumbnailJpeg: ByteArray,
+    val displayWidth: Int,
+    val displayHeight: Int,
+    val thumbnailWidth: Int,
+    val thumbnailHeight: Int,
+    val displayDigest: String,
+    val thumbnailDigest: String,
+    val contentDigest: String,
+    val importedAt: String,
+) {
+    fun clear() {
+        displayJpeg.fill(0)
+        thumbnailJpeg.fill(0)
+    }
+}
+
 data class ParkingHistoryPage(
     val records: List<ProjectParking>,
     val hasMore: Boolean,
@@ -108,7 +150,7 @@ enum class ProjectMutationStatus { PENDING, REQUIRES_RECONCILIATION }
 enum class DashboardView { LIST, TILES }
 
 data class ProjectUiPreferences(
-    val dashboardView: DashboardView = DashboardView.LIST,
+    val dashboardView: DashboardView = DashboardView.TILES,
     val archiveMode: Boolean = false,
 )
 
@@ -154,6 +196,7 @@ data class ProjectCacheState(
     val localBlocks: List<LocalBlockRecord> = emptyList(),
     val localBlockOperations: List<LocalBlockOperation> = emptyList(),
     val projectLinks: List<ProjectLinkIdentity> = emptyList(),
+    val projectCovers: List<ProjectCover> = emptyList(),
     val commands: List<ProjectMutation> = emptyList(),
     val retiredOperationIds: List<String> = emptyList(),
     val provisionalProjectIds: List<String> = emptyList(),
@@ -249,6 +292,14 @@ interface ProjectWorkspace {
         offset: Int,
         limit: Int,
     ): ParkingHistoryPage
+    fun projectCover(session: Session, projectId: String): ProjectCover? =
+        snapshot(session).cache.projectCovers.firstOrNull { it.projectId == projectId }
+    fun readProjectCoverContent(session: Session, cover: ProjectCover, thumbnail: Boolean): ByteArray =
+        throw UnsupportedOperationException("Project cover media is unavailable")
+    fun saveProjectCover(session: Session, cover: ProjectCoverContent): BackgroundSyncResult =
+        throw UnsupportedOperationException("Project covers are unavailable")
+    fun removeProjectCover(session: Session, projectId: String): BackgroundSyncResult =
+        throw UnsupportedOperationException("Project covers are unavailable")
     fun localBlocks(session: Session): List<LocalBlockRecord> = snapshot(session).cache.localBlocks
     fun projectLink(session: Session, projectId: String): ProjectLink =
         throw UnsupportedOperationException("Project links are unavailable")

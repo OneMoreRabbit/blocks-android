@@ -17,6 +17,7 @@ import dev.blocks.android.mvp.Project
 import dev.blocks.android.mvp.QueuedCommand
 import dev.blocks.android.mvp.TenantSyncState
 import dev.blocks.android.project.ProjectCacheState
+import dev.blocks.android.project.ProjectCover
 import dev.blocks.android.project.ProjectIdentityMapping
 import dev.blocks.android.project.ProjectLifecycle
 import dev.blocks.android.project.ProjectMutation
@@ -65,6 +66,7 @@ class AndroidEncryptedSyncStateStoreTest {
             PILOT_DATABASE_TENANT,
             CURRENT_PILOT_TENANT,
             SIGNED_061_TENANT,
+            SIGNED_062_TENANT,
         ).forEach { tenantId ->
             store.clearSyncState(tenantId)
         }
@@ -88,7 +90,7 @@ class AndroidEncryptedSyncStateStoreTest {
 
         val migrated = store.loadSyncState(SIGNED_061_TENANT)
 
-        assertEquals(7, databaseVersion(SIGNED_061_TENANT))
+        assertEquals(8, databaseVersion(SIGNED_061_TENANT))
         assertEquals(clientId, migrated.projectCache.projectLinks.single().key.encoded)
         assertEquals("server-project-061", migrated.projectCache.projectLinks.single().projectId)
         assertFalse(databaseFile(SIGNED_061_TENANT).readBytes().containsBytes(clientId.toByteArray()))
@@ -109,13 +111,42 @@ class AndroidEncryptedSyncStateStoreTest {
 
         val migrated = store.loadSyncState(CURRENT_PILOT_TENANT)
 
-        assertEquals(7, databaseVersion(CURRENT_PILOT_TENANT))
+        assertEquals(8, databaseVersion(CURRENT_PILOT_TENANT))
         assertEquals("current-pilot-operation", migrated.projectCache.commands.single().operationId)
         assertEquals("0.3", migrated.projectCache.commands.single().contractVersion)
         assertNull(migrated.projectCache.commands.single().clientResourceId)
         assertFalse(migrated.projectDraftsMigrated)
         assertEquals(FormDrafts(), migrated.projectDrafts)
         assertEquals(ProjectUiPreferences(), migrated.projectUiPreferences)
+    }
+
+    @Test
+    fun upgradesTheSigned062DatabaseWithoutChangingReleasedProjectData() {
+        val key = createKey(databaseKeyAlias(SIGNED_062_TENANT))
+        val project = ProjectSummary(
+            id = "server-project-062",
+            tenantId = SIGNED_062_TENANT,
+            name = "Released project",
+            lifecycle = ProjectLifecycle.ACTIVE,
+            rowVersion = 8,
+            createdAt = "2026-09-14T12:00:00Z",
+            updatedAt = "2026-09-14T13:00:00Z",
+            clientId = "client-project-062",
+        )
+        val link = ProjectLinkIdentity(
+            project.id,
+            ProjectKey.parse("223e4567-e89b-12d3-a456-426614174000")!!,
+        )
+        createSigned062Database(SIGNED_062_TENANT, key, project, link)
+
+        val migrated = store.loadSyncState(SIGNED_062_TENANT)
+
+        assertEquals(8, databaseVersion(SIGNED_062_TENANT))
+        assertEquals(listOf(project), migrated.projectCache.activeProjects)
+        assertEquals(listOf(link), migrated.projectCache.projectLinks)
+        assertEquals(ProjectUiPreferences(DashboardView.LIST), migrated.projectUiPreferences)
+        assertTrue(migrated.projectCache.projectCovers.isEmpty())
+        assertEquals(migrated, store.loadSyncState(SIGNED_062_TENANT))
     }
 
     @Test
@@ -220,6 +251,10 @@ class AndroidEncryptedSyncStateStoreTest {
                         ProjectKey.parse("123e4567-e89b-12d3-a456-426614174000")!!,
                     ),
                 ),
+                projectCovers = listOf(
+                    coverMetadata(TENANT_A, "sensitive-client-project-a", 'a',
+                        "123e4567-e89b-42d3-a456-426614174001"),
+                ),
                 commands = listOf(
                     ProjectMutation(
                         operationId = "sensitive-create-operation-a",
@@ -237,10 +272,39 @@ class AndroidEncryptedSyncStateStoreTest {
             projectDraftsMigrated = true,
             projectUiPreferences = ProjectUiPreferences(DashboardView.TILES, archiveMode = true),
         )
+        val tenantBProject = ProjectSummary(
+            id = "sensitive-client-project-b",
+            tenantId = TENANT_B,
+            name = "Sensitive local project B",
+            lifecycle = ProjectLifecycle.ACTIVE,
+            rowVersion = 1,
+            createdAt = "2026-09-11T13:00:00Z",
+            updatedAt = "2026-09-11T13:00:00Z",
+        )
         val tenantBState = TenantSyncState(
             projects = listOf(Project("project-b", "Sensitive project B")),
             projectsLoaded = true,
             changeCursor = "84",
+            projectCache = ProjectCacheState(
+                activeProjects = listOf(tenantBProject),
+                pages = listOf(
+                    ProjectPage(
+                        tenantBProject,
+                        ProjectNotes(tenantBProject.id, "Tenant B notes", 1, tenantBProject.updatedAt),
+                        null,
+                    ),
+                ),
+                projectLinks = listOf(
+                    ProjectLinkIdentity(
+                        tenantBProject.id,
+                        ProjectKey.parse("423e4567-e89b-12d3-a456-426614174000")!!,
+                    ),
+                ),
+                projectCovers = listOf(
+                    coverMetadata(TENANT_B, tenantBProject.id, 'b',
+                        "223e4567-e89b-42d3-a456-426614174002"),
+                ),
+            ),
         )
 
         store.saveSyncState(TENANT_A, tenantAState)
@@ -248,6 +312,12 @@ class AndroidEncryptedSyncStateStoreTest {
 
         assertEquals(tenantAState, store.loadSyncState(TENANT_A))
         assertEquals(tenantBState, store.loadSyncState(TENANT_B))
+        assertFalse(store.loadSyncState(TENANT_A).projectCache.projectCovers.any {
+            it.contentDigest == "b".repeat(64)
+        })
+        assertFalse(store.loadSyncState(TENANT_B).projectCache.projectCovers.any {
+            it.contentDigest == "a".repeat(64)
+        })
         assertTrue(databaseFile(TENANT_A).isFile)
         assertTrue(databaseFile(TENANT_B).isFile)
         assertTrue(keyStore().containsAlias(databaseKeyAlias(TENANT_A)))
@@ -267,10 +337,26 @@ class AndroidEncryptedSyncStateStoreTest {
         assertFalse(databaseBytes.containsBytes("Sensitive block label A".toByteArray()))
         assertFalse(databaseBytes.containsBytes("sensitive-register-operation-a".toByteArray()))
         assertFalse(databaseBytes.containsBytes("123e4567-e89b-12d3-a456-426614174000".toByteArray()))
+        assertFalse(databaseBytes.containsBytes("sensitive-display-cover-a".toByteArray()))
+        assertFalse(databaseBytes.containsBytes("sensitive-thumbnail-cover-a".toByteArray()))
 
         val invalid = tenantAState.copy(commands = listOf(command, command))
         assertTrue(runCatching { store.saveSyncState(TENANT_A, invalid) }.isFailure)
         assertEquals(tenantAState, store.loadSyncState(TENANT_A))
+
+        val invalidCoverReplacement = tenantAState.copy(
+            projectCache = tenantAState.projectCache.copy(
+                projectCovers = listOf(tenantAState.projectCache.projectCovers.single().copy(projectId = "unknown")),
+            ),
+        )
+        assertTrue(runCatching { store.saveSyncState(TENANT_A, invalidCoverReplacement) }.isFailure)
+        assertEquals(tenantAState, store.loadSyncState(TENANT_A))
+
+        val withoutCover = tenantAState.copy(
+            projectCache = tenantAState.projectCache.copy(projectCovers = emptyList()),
+        )
+        store.saveSyncState(TENANT_A, withoutCover)
+        assertTrue(store.loadSyncState(TENANT_A).projectCache.projectCovers.isEmpty())
 
         store.clearSyncState(TENANT_A)
 
@@ -278,6 +364,7 @@ class AndroidEncryptedSyncStateStoreTest {
         assertFalse(keyStore().containsAlias(databaseKeyAlias(TENANT_A)))
         assertEquals(TenantSyncState(), store.loadSyncState(TENANT_A))
         assertEquals(tenantBState, store.loadSyncState(TENANT_B))
+        assertEquals("b".repeat(64), store.loadSyncState(TENANT_B).projectCache.projectCovers.single().contentDigest)
         assertTrue(keyStore().containsAlias(databaseKeyAlias(TENANT_B)))
     }
 
@@ -353,7 +440,7 @@ class AndroidEncryptedSyncStateStoreTest {
         assertEquals("29", migrated.changeCursor)
         assertEquals(listOf(Project("pilot-project", "Pilot project")), migrated.projects)
         assertEquals(ProjectCacheState(), migrated.projectCache)
-        assertEquals(7, databaseVersion(PILOT_DATABASE_TENANT))
+        assertEquals(8, databaseVersion(PILOT_DATABASE_TENANT))
         assertFalse(databaseFile(PILOT_DATABASE_TENANT).readBytes().containsBytes("Pilot outcome".toByteArray()))
 
         val api03Command = ProjectMutation(
@@ -556,6 +643,77 @@ class AndroidEncryptedSyncStateStoreTest {
         }
     }
 
+    private fun createSigned062Database(
+        tenantId: String,
+        key: javax.crypto.SecretKey,
+        project: ProjectSummary,
+        link: ProjectLinkIdentity,
+    ) {
+        val database = context.openOrCreateDatabase(databaseName(tenantId), Context.MODE_PRIVATE, null)
+        try {
+            database.execSQL(
+                "CREATE TABLE sync_metadata (" +
+                    "name TEXT PRIMARY KEY NOT NULL, ciphertext BLOB NOT NULL)",
+            )
+            listOf(
+                "cached_projects",
+                "latest_reentry",
+                "pending_commands",
+                "retired_keys",
+                "active_projects_v3",
+                "archived_projects_v3",
+                "project_pages_v3",
+                "stale_project_pages_v3",
+                "blocks_v3",
+                "pending_project_commands_v3",
+                "retired_project_operations_v3",
+                "provisional_projects_v4",
+                "project_id_mappings_v4",
+                "projects_awaiting_notes_baseline_v4",
+                "project_drafts_v4",
+                "project_ui_preferences_v5",
+                "parking_records_v6",
+                "parking_loaded_projects_v6",
+                "local_blocks_v7",
+                "local_block_operations_v7",
+                "project_links_v8",
+            ).forEach { table ->
+                database.execSQL(
+                    "CREATE TABLE $table (" +
+                        "position INTEGER PRIMARY KEY NOT NULL, ciphertext BLOB NOT NULL)",
+                )
+            }
+            database.version = 7
+            writePilotMetadata(database, tenantId, key, "schema_version", "8")
+            writePilotMetadata(database, tenantId, key, "projects_loaded", "false")
+            writePilotMetadata(database, tenantId, key, "reentry_loaded", "false")
+            writePilotMetadata(database, tenantId, key, "active_projects_loaded_v3", "true")
+            writePilotMetadata(database, tenantId, key, "archived_projects_loaded_v3", "true")
+            writePilotMetadata(database, tenantId, key, "blocks_loaded_v3", "false")
+            writePilotMetadata(database, tenantId, key, "project_drafts_migrated_v4", "true")
+            writePilotRow(database, tenantId, key, "active_projects_v3", 0, Gson().toJson(project))
+            writePilotRow(
+                database,
+                tenantId,
+                key,
+                "project_pages_v3",
+                0,
+                Gson().toJson(ProjectPage(project, ProjectNotes(project.id, "Retained notes", 4, project.updatedAt), null)),
+            )
+            writePilotRow(
+                database,
+                tenantId,
+                key,
+                "project_ui_preferences_v5",
+                0,
+                Gson().toJson(ProjectUiPreferences(DashboardView.LIST)),
+            )
+            writePilotRow(database, tenantId, key, "project_links_v8", 0, Gson().toJson(link))
+        } finally {
+            database.close()
+        }
+    }
+
     private fun writePilotMetadata(
         database: SQLiteDatabase,
         tenantId: String,
@@ -603,6 +761,32 @@ class AndroidEncryptedSyncStateStoreTest {
         SQLiteDatabase.openDatabase(databaseFile(tenantId).path, null, SQLiteDatabase.OPEN_READONLY).use { database ->
             database.version
         }
+
+    private fun coverMetadata(
+        tenantId: String,
+        projectId: String,
+        digestCharacter: Char,
+        coverId: String,
+    ) = ProjectCover(
+        coverId = coverId,
+        tenantId = tenantId,
+        projectId = projectId,
+        mediaType = "image/jpeg",
+        displayContentRef = "$coverId-r1-display.enc",
+        displayWidth = 1200,
+        displayHeight = 675,
+        displayByteSize = 2048,
+        displayDigest = digestCharacter.toString().repeat(64),
+        thumbnailContentRef = "$coverId-r1-thumbnail.enc",
+        thumbnailWidth = 480,
+        thumbnailHeight = 270,
+        thumbnailByteSize = 512,
+        thumbnailDigest = digestCharacter.toString().repeat(64),
+        contentDigest = digestCharacter.toString().repeat(64),
+        revision = 1,
+        createdAt = "2026-09-11T12:20:00Z",
+        updatedAt = "2026-09-11T12:20:00Z",
+    )
 
     private fun createLegacyKey(tenantId: String) = createKey(legacyKeyAlias(tenantId))
 
@@ -652,6 +836,7 @@ class AndroidEncryptedSyncStateStoreTest {
         const val PILOT_DATABASE_TENANT = "00000000-0000-0000-0000-00000000000d"
         const val CURRENT_PILOT_TENANT = "00000000-0000-0000-0000-00000000000e"
         const val SIGNED_061_TENANT = "00000000-0000-0000-0000-00000000000f"
+        const val SIGNED_062_TENANT = "00000000-0000-0000-0000-000000000010"
         const val TRANSFORMATION = "AES/GCM/NoPadding"
     }
 }
