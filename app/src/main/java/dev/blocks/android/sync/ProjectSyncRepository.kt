@@ -2,6 +2,8 @@ package dev.blocks.android.sync
 
 import dev.blocks.android.api.IncompatibleServiceApiException
 import dev.blocks.android.api.ServiceException
+import dev.blocks.android.cover.ProjectCoverMediaStore
+import dev.blocks.android.cover.ProjectCoverVariant
 import dev.blocks.android.mvp.ChangeEvent
 import dev.blocks.android.mvp.ChangePage
 import dev.blocks.android.mvp.DraftStore
@@ -17,6 +19,7 @@ import dev.blocks.android.project.PhysicalBlock
 import dev.blocks.android.project.ProjectCacheState
 import dev.blocks.android.project.ProjectConflict
 import dev.blocks.android.project.ProjectCover
+import dev.blocks.android.project.ProjectCoverContent
 import dev.blocks.android.project.ProjectIdentityMapping
 import dev.blocks.android.project.ProjectLifecycle
 import dev.blocks.android.project.ProjectMutation
@@ -60,6 +63,7 @@ class ProjectSyncRepository(
     private val syncStore: SyncStateStore,
     private val now: () -> String = { Instant.now().toString() },
     private val projectKeyFactory: ProjectKeyFactory = ProjectKeyFactory(),
+    private val coverMediaStore: ProjectCoverMediaStore,
 ) : ProjectWorkspace {
     @Volatile
     private var activeTenantId: String? = null
@@ -72,7 +76,11 @@ class ProjectSyncRepository(
         migrateProjectDrafts(session)
         val state = activeState(session)
         val withProjectLinks = state.withProjectLinks()
-        if (withProjectLinks != state) save(session, withProjectLinks)
+        val active = if (withProjectLinks != state) save(session, withProjectLinks) else state
+        require(active.projectCache.projectCovers.all { it.tenantId == session.tenantId }) {
+            "Encrypted cover metadata crosses a tenant boundary"
+        }
+        coverMediaStore.cleanupOrphans(session.tenantId, active.projectCache.projectCovers)
     }
 
     @Synchronized
@@ -135,8 +143,26 @@ class ProjectSyncRepository(
         return state.projectCache.projectCovers.firstOrNull { it.projectId == resolvedId }
     }
 
+    override fun readProjectCoverContent(
+        session: Session,
+        cover: ProjectCover,
+        thumbnail: Boolean,
+    ): ByteArray {
+        synchronized(this) {
+            checkActive(session)
+            require(cover.tenantId == session.tenantId) { "Cover belongs to another tenant" }
+            val current = projectCover(session, cover.projectId)
+            require(current == cover) { "Cover metadata is no longer current" }
+        }
+        return coverMediaStore.read(
+            session.tenantId,
+            cover,
+            if (thumbnail) ProjectCoverVariant.THUMBNAIL else ProjectCoverVariant.DISPLAY,
+        )
+    }
+
     @Synchronized
-    override fun saveProjectCover(session: Session, cover: ProjectCover): BackgroundSyncResult {
+    override fun saveProjectCover(session: Session, cover: ProjectCoverContent): BackgroundSyncResult {
         val state = activeState(session)
         val resolvedId = state.projectCache.resolveProjectId(cover.projectId)
         require(state.projectCache.pages.any { it.project.id == resolvedId }) {
@@ -144,18 +170,28 @@ class ProjectSyncRepository(
         }
         require(cover.displayWidth > 0 && cover.displayHeight > 0) { "The display cover is invalid" }
         require(cover.thumbnailWidth > 0 && cover.thumbnailHeight > 0) { "The cover thumbnail is invalid" }
-        require(cover.displayJpegBase64.isNotBlank() && cover.thumbnailJpegBase64.isNotBlank()) {
+        require(cover.displayJpeg.isNotEmpty() && cover.thumbnailJpeg.isNotEmpty()) {
             "The project cover has no display content"
         }
-        val committed = cover.copy(projectId = resolvedId)
-        val updated = state.copy(
-            projectCache = state.projectCache.copy(
-                projectCovers = state.projectCache.projectCovers
-                    .filterNot { it.projectId == resolvedId } + committed,
-            ),
-        )
-        save(session, updated)
-        return updated.toResult()
+        val previous = state.projectCache.projectCovers.firstOrNull { it.projectId == resolvedId }
+        var staged: ProjectCover? = null
+        var persisted = false
+        try {
+            staged = coverMediaStore.stage(session.tenantId, resolvedId, cover, previous)
+            val updated = state.copy(
+                projectCache = state.projectCache.copy(
+                    projectCovers = state.projectCache.projectCovers
+                        .filterNot { it.projectId == resolvedId } + staged,
+                ),
+            )
+            save(session, updated)
+            persisted = true
+            previous?.let { runCatching { coverMediaStore.retire(session.tenantId, it) } }
+            return updated.toResult()
+        } finally {
+            if (!persisted) staged?.let { runCatching { coverMediaStore.retire(session.tenantId, it) } }
+            cover.clear()
+        }
     }
 
     @Synchronized
@@ -168,6 +204,9 @@ class ProjectSyncRepository(
             ),
         )
         save(session, updated)
+        state.projectCache.projectCovers.firstOrNull { it.projectId == resolvedId }?.let {
+            runCatching { coverMediaStore.retire(session.tenantId, it) }
+        }
         return updated.toResult()
     }
 
@@ -1779,7 +1818,11 @@ class ProjectSyncRepository(
 
     private fun activeState(session: Session): TenantSyncState {
         checkActive(session)
-        return syncStore.loadSyncState(session.tenantId)
+        return syncStore.loadSyncState(session.tenantId).also { state ->
+            require(state.projectCache.projectCovers.all { it.tenantId == session.tenantId }) {
+                "Encrypted cover metadata crosses a tenant boundary"
+            }
+        }
     }
 
     private fun save(session: Session, state: TenantSyncState): TenantSyncState {
@@ -1842,6 +1885,19 @@ class ProjectSyncRepository(
             },
             projectCache = proposed.projectCache.copy(
                 commands = commands,
+                projectCovers = if (current.projectCache.projectCovers != baseline.projectCache.projectCovers) {
+                    current.projectCache.projectCovers.map { cover ->
+                        mappings.fold(cover) { mapped, identity ->
+                            if (mapped.projectId == identity.provisionalId) {
+                                mapped.copy(projectId = identity.serverId)
+                            } else {
+                                mapped
+                            }
+                        }
+                    }
+                } else {
+                    proposed.projectCache.projectCovers
+                },
                 localBlocks = if (current.projectCache.localBlocks != baseline.projectCache.localBlocks) {
                     current.projectCache.localBlocks.map { local ->
                         mappings.fold(local) { mapped, identity ->
@@ -1943,10 +1999,13 @@ class ProjectSyncRepository(
     }
 
     private fun purge(tenantId: String) {
+        val mediaFailure = runCatching { coverMediaStore.eraseTenant(tenantId) }.exceptionOrNull()
         val syncFailure = runCatching { syncStore.clearSyncState(tenantId) }.exceptionOrNull()
         val draftFailure = runCatching { legacyDraftStore.clear(tenantId) }.exceptionOrNull()
-        (syncFailure ?: draftFailure)?.let { failure ->
-            listOfNotNull(syncFailure, draftFailure).filterNot { it === failure }.forEach(failure::addSuppressed)
+        (mediaFailure ?: syncFailure ?: draftFailure)?.let { failure ->
+            listOfNotNull(mediaFailure, syncFailure, draftFailure)
+                .filterNot { it === failure }
+                .forEach(failure::addSuppressed)
             throw IllegalStateException("Could not clear local tenant project data", failure)
         }
     }

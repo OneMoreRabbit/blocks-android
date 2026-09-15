@@ -252,17 +252,8 @@ class AndroidEncryptedSyncStateStoreTest {
                     ),
                 ),
                 projectCovers = listOf(
-                    ProjectCover(
-                        projectId = "sensitive-client-project-a",
-                        displayJpegBase64 = "sensitive-display-cover-a",
-                        thumbnailJpegBase64 = "sensitive-thumbnail-cover-a",
-                        displayWidth = 1200,
-                        displayHeight = 675,
-                        thumbnailWidth = 480,
-                        thumbnailHeight = 270,
-                        contentDigest = "a".repeat(64),
-                        importedAt = "2026-09-11T12:20:00Z",
-                    ),
+                    coverMetadata(TENANT_A, "sensitive-client-project-a", 'a',
+                        "123e4567-e89b-42d3-a456-426614174001"),
                 ),
                 commands = listOf(
                     ProjectMutation(
@@ -310,17 +301,8 @@ class AndroidEncryptedSyncStateStoreTest {
                     ),
                 ),
                 projectCovers = listOf(
-                    ProjectCover(
-                        projectId = tenantBProject.id,
-                        displayJpegBase64 = "tenant-b-display",
-                        thumbnailJpegBase64 = "tenant-b-thumbnail",
-                        displayWidth = 1200,
-                        displayHeight = 675,
-                        thumbnailWidth = 480,
-                        thumbnailHeight = 270,
-                        contentDigest = "b".repeat(64),
-                        importedAt = "2026-09-11T13:20:00Z",
-                    ),
+                    coverMetadata(TENANT_B, tenantBProject.id, 'b',
+                        "223e4567-e89b-42d3-a456-426614174002"),
                 ),
             ),
         )
@@ -779,6 +761,32 @@ class AndroidEncryptedSyncStateStoreTest {
         SQLiteDatabase.openDatabase(databaseFile(tenantId).path, null, SQLiteDatabase.OPEN_READONLY).use { database ->
             database.version
         }
+
+    private fun coverMetadata(
+        tenantId: String,
+        projectId: String,
+        digestCharacter: Char,
+        coverId: String,
+    ) = ProjectCover(
+        coverId = coverId,
+        tenantId = tenantId,
+        projectId = projectId,
+        mediaType = "image/jpeg",
+        displayContentRef = "$coverId-r1-display.enc",
+        displayWidth = 1200,
+        displayHeight = 675,
+        displayByteSize = 2048,
+        displayDigest = digestCharacter.toString().repeat(64),
+        thumbnailContentRef = "$coverId-r1-thumbnail.enc",
+        thumbnailWidth = 480,
+        thumbnailHeight = 270,
+        thumbnailByteSize = 512,
+        thumbnailDigest = digestCharacter.toString().repeat(64),
+        contentDigest = digestCharacter.toString().repeat(64),
+        revision = 1,
+        createdAt = "2026-09-11T12:20:00Z",
+        updatedAt = "2026-09-11T12:20:00Z",
+    )
 
     private fun createLegacyKey(tenantId: String) = createKey(legacyKeyAlias(tenantId))
 

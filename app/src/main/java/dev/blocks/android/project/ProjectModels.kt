@@ -62,21 +62,47 @@ data class ProjectPage(
     val newestParking: ProjectParking?,
 )
 
-/**
- * App-owned, metadata-free display derivatives for one local-only project cover.
- * Encoded bytes live inside the encrypted tenant database and never enter the wire contract.
- */
+/** Encrypted metadata/reference for one immutable local-only cover revision. */
 data class ProjectCover(
+    val coverId: String,
+    val tenantId: String,
     val projectId: String,
-    val displayJpegBase64: String,
-    val thumbnailJpegBase64: String,
+    val mediaType: String,
+    val displayContentRef: String,
+    val displayWidth: Int,
+    val displayHeight: Int,
+    val displayByteSize: Long,
+    val displayDigest: String,
+    val thumbnailContentRef: String,
+    val thumbnailWidth: Int,
+    val thumbnailHeight: Int,
+    val thumbnailByteSize: Long,
+    val thumbnailDigest: String,
+    val contentDigest: String,
+    val revision: Long,
+    val createdAt: String,
+    val updatedAt: String,
+)
+
+/** Bounded metadata-free bytes passed once from the importer to the encrypted media store. */
+class ProjectCoverContent(
+    val projectId: String,
+    val displayJpeg: ByteArray,
+    val thumbnailJpeg: ByteArray,
     val displayWidth: Int,
     val displayHeight: Int,
     val thumbnailWidth: Int,
     val thumbnailHeight: Int,
+    val displayDigest: String,
+    val thumbnailDigest: String,
     val contentDigest: String,
     val importedAt: String,
-)
+) {
+    fun clear() {
+        displayJpeg.fill(0)
+        thumbnailJpeg.fill(0)
+    }
+}
 
 data class ParkingHistoryPage(
     val records: List<ProjectParking>,
@@ -268,7 +294,9 @@ interface ProjectWorkspace {
     ): ParkingHistoryPage
     fun projectCover(session: Session, projectId: String): ProjectCover? =
         snapshot(session).cache.projectCovers.firstOrNull { it.projectId == projectId }
-    fun saveProjectCover(session: Session, cover: ProjectCover): BackgroundSyncResult =
+    fun readProjectCoverContent(session: Session, cover: ProjectCover, thumbnail: Boolean): ByteArray =
+        throw UnsupportedOperationException("Project cover media is unavailable")
+    fun saveProjectCover(session: Session, cover: ProjectCoverContent): BackgroundSyncResult =
         throw UnsupportedOperationException("Project covers are unavailable")
     fun removeProjectCover(session: Session, projectId: String): BackgroundSyncResult =
         throw UnsupportedOperationException("Project covers are unavailable")

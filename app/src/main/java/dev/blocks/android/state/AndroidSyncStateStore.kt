@@ -412,16 +412,27 @@ private fun validateProjectCache(cache: ProjectCacheState) {
         "A project has more than one local cover"
     }
     cache.projectCovers.forEach { cover ->
+        require(
+            cover.coverId.matches(
+                Regex("[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"),
+            ),
+        ) { "A local cover identity is invalid" }
+        require(cover.tenantId.isNotBlank()) { "A local cover tenant is missing" }
         require(cover.projectId in knownProjectIds) { "A local cover references an unknown project" }
+        require(cover.mediaType == "image/jpeg") { "A local cover media type is invalid" }
+        require(cover.displayContentRef.isNotBlank() && cover.thumbnailContentRef.isNotBlank()) {
+            "A local cover content reference is missing"
+        }
         require(cover.displayWidth > 0 && cover.displayHeight > 0) { "A local display cover has invalid bounds" }
         require(cover.thumbnailWidth > 0 && cover.thumbnailHeight > 0) {
             "A local cover thumbnail has invalid bounds"
         }
-        require(cover.displayJpegBase64.isNotBlank() && cover.thumbnailJpegBase64.isNotBlank()) {
-            "A local project cover is empty"
-        }
+        require(cover.displayByteSize > 0 && cover.thumbnailByteSize > 0) { "A local cover size is invalid" }
+        require(cover.displayDigest.matches(Regex("[0-9a-f]{64}"))) { "A display cover digest is invalid" }
+        require(cover.thumbnailDigest.matches(Regex("[0-9a-f]{64}"))) { "A thumbnail digest is invalid" }
         require(cover.contentDigest.matches(Regex("[0-9a-f]{64}"))) { "A local cover digest is invalid" }
-        require(cover.importedAt.isNotBlank()) { "A local cover import time is missing" }
+        require(cover.revision > 0) { "A local cover revision is invalid" }
+        require(cover.createdAt.isNotBlank() && cover.updatedAt.isNotBlank()) { "A local cover timestamp is missing" }
     }
     require(cache.localBlockOperations.map { it.operationId }.distinct().size == cache.localBlockOperations.size) {
         "Local block operation identities are not unique"
@@ -545,6 +556,12 @@ private fun validateProjectMutation(command: ProjectMutation) {
     }
 }
 
+private fun requireCoverTenantScope(tenantId: String, state: TenantSyncState) {
+    require(state.projectCache.projectCovers.all { it.tenantId == tenantId }) {
+        "Encrypted cover metadata crosses a tenant boundary"
+    }
+}
+
 /**
  * One SQLite database per tenant. Every logical value is an independently authenticated
  * ciphertext; only table structure, row order, and non-secret metadata names remain visible.
@@ -558,7 +575,9 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
 
     @Synchronized
     override fun loadSyncState(tenantId: String): TenantSyncState {
-        if (!databaseFile(tenantId).exists()) return migrateLegacyState(tenantId)
+        if (!databaseFile(tenantId).exists()) return migrateLegacyState(tenantId).also {
+            requireCoverTenantScope(tenantId, it)
+        }
         val secretKey = requireNotNull(existingKey(databaseKeyAlias(tenantId))) {
             "Encrypted sync database key is unavailable"
         }
@@ -568,7 +587,7 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
             database.beginTransaction()
             try {
                 val rows = readStateRows(database, tenantId, secretKey)
-                val state = rowCodec.decode(rows)
+                val state = rowCodec.decode(rows).also { requireCoverTenantScope(tenantId, it) }
                 if (rows.schemaVersion < SyncStateRowCodec.CURRENT_SCHEMA_VERSION) {
                     replaceStateRows(database, tenantId, secretKey, rowCodec.encode(state))
                 }
@@ -589,6 +608,7 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
             clearSyncState(tenantId)
             return
         }
+        requireCoverTenantScope(tenantId, state)
         val rows = rowCodec.encode(state)
         val databaseExisted = databaseFile(tenantId).exists()
         val secretKey = existingKey(databaseKeyAlias(tenantId)) ?: run {

@@ -48,6 +48,7 @@ import dev.blocks.android.auth.AndroidEncryptedAcceptedTenantContinuityStore
 import dev.blocks.android.auth.GoogleIdentityClient
 import dev.blocks.android.auth.IdentityProvider
 import dev.blocks.android.cover.AndroidProjectCoverImporter
+import dev.blocks.android.cover.AndroidEncryptedProjectCoverMediaStore
 import dev.blocks.android.cover.CoverCaptureFiles
 import dev.blocks.android.cover.PendingCameraCover
 import dev.blocks.android.cover.ProjectCoverImporter
@@ -83,7 +84,6 @@ import dev.blocks.android.tag.TagShareIntent
 import com.google.zxing.BarcodeFormat
 import com.journeyapps.barcodescanner.BarcodeEncoder
 import java.net.URI
-import java.util.Base64
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -216,10 +216,13 @@ class MainActivity : ComponentActivity() {
         consumeTagIntent(intent, clearActivityIntent = true)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         restoreProjectId = savedInstanceState?.getString(STATE_PROJECT_ID)
-        dashboardSearchQuery = savedInstanceState?.getString(STATE_DASHBOARD_SEARCH).orEmpty()
         pendingCoverProjectId = savedInstanceState?.getString(STATE_COVER_PROJECT_ID)
-        pendingCameraCover = coverCaptureFiles.restore(savedInstanceState?.getString(STATE_CAMERA_COVER_PATH))
-        uiScope.launch(Dispatchers.IO) { coverCaptureFiles.cleanupOrphans(pendingCameraCover?.path) }
+        val interruptedCapture = coverCaptureFiles.restore(savedInstanceState?.getString(STATE_CAMERA_COVER_PATH))
+        if (interruptedCapture != null) pendingCoverProjectId = null
+        uiScope.launch(Dispatchers.IO) {
+            coverCaptureFiles.delete(interruptedCapture)
+            coverCaptureFiles.cleanupOrphans()
+        }
         content = LinearLayout(this).apply {
             id = ProjectUiIds.CONTENT
             orientation = LinearLayout.VERTICAL
@@ -299,7 +302,6 @@ class MainActivity : ComponentActivity() {
 
     override fun onSaveInstanceState(outState: Bundle) {
         controller.state.projectPage?.project?.id?.let { outState.putString(STATE_PROJECT_ID, it) }
-        outState.putString(STATE_DASHBOARD_SEARCH, dashboardSearchQuery)
         pendingCoverProjectId?.let { outState.putString(STATE_COVER_PROJECT_ID, it) }
         pendingCameraCover?.path?.let { outState.putString(STATE_CAMERA_COVER_PATH, it) }
         super.onSaveInstanceState(outState)
@@ -317,6 +319,7 @@ class MainActivity : ComponentActivity() {
             LegacyOperationReplayer(legacyService, draftStore, syncStore),
             draftStore,
             syncStore,
+            coverMediaStore = AndroidEncryptedProjectCoverMediaStore(this),
         )
         return ProjectAppDependencies(
             controller = ProjectPresentationController(sessionAuthenticator, workspace),
@@ -598,6 +601,7 @@ class MainActivity : ComponentActivity() {
         orientation = LinearLayout.VERTICAL
         background = roundedBackground(brandColor(R.color.blocks_white), Color.TRANSPARENT, 12f)
         clipToOutline = true
+        configureProjectQuickLink(project, archiveMode)
         val image = projectImage(project, thumbnail = true)
         addView(image, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(116)))
         addView(
@@ -615,6 +619,7 @@ class MainActivity : ComponentActivity() {
         gravity = Gravity.CENTER_VERTICAL
         minimumHeight = dp(88)
         setPadding(0, dp(8), 0, dp(8))
+        configureProjectQuickLink(project, archiveMode)
         addView(projectImage(project, thumbnail = true), LinearLayout.LayoutParams(dp(112), dp(72)).apply {
             marginEnd = dp(14)
         })
@@ -635,6 +640,18 @@ class MainActivity : ComponentActivity() {
         textSize = 17f
         typeface = manropeTypeface
         setTextColor(brandColor(R.color.blocks_ink))
+        contentDescription = null
+        importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        setOnClickListener { source ->
+            if (archiveMode) confirmReopen(project) else runRepositoryAction(source = source) {
+                controller.openProject(project.id)
+            }
+        }
+    }
+
+    private fun View.configureProjectQuickLink(project: ProjectSummary, archiveMode: Boolean) {
+        isClickable = true
+        isFocusable = true
         contentDescription = if (archiveMode) "Reopen ${project.name}" else "Open ${project.name}"
         setOnClickListener { source ->
             if (archiveMode) confirmReopen(project) else runRepositoryAction(source = source) {
@@ -648,10 +665,10 @@ class MainActivity : ComponentActivity() {
         setPadding(dp(18), dp(12), dp(18), dp(12))
         background = roundedBackground(brandColor(R.color.blocks_soft), Color.TRANSPARENT, 10f)
         setImageResource(R.drawable.blocks_foreground)
-        contentDescription = "No cover for ${project.name}"
+        contentDescription = null
+        importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         controller.state.projectCovers.firstOrNull { it.projectId == project.id }?.let { cover ->
-            contentDescription = "Cover for ${project.name}"
-            loadCover(this, project, cover, thumbnail)
+            loadCover(this, cover, thumbnail)
         }
     }
 
@@ -984,9 +1001,8 @@ class MainActivity : ComponentActivity() {
         val page = controller.state.projectPage ?: return
         val hasCover = controller.state.projectCovers.any { it.projectId == page.project.id }
         val items = buildList {
-            add("Take photo")
-            add("Choose image")
-            if (hasCover) add("Replace cover")
+            add(if (hasCover) "Take replacement photo" else "Take photo")
+            add(if (hasCover) "Choose replacement image" else "Choose image")
             if (hasCover) add("Remove cover")
         }
         showManagedDialog(
@@ -995,8 +1011,8 @@ class MainActivity : ComponentActivity() {
                 .setMessage("Choose how this project appears on your dashboard.")
                 .setItems(items.toTypedArray()) { _, which ->
                     when (items[which]) {
-                        "Take photo" -> launchCoverCamera(page.project.id)
-                        "Choose image", "Replace cover" -> launchCoverPicker(page.project.id)
+                        "Take photo", "Take replacement photo" -> launchCoverCamera(page.project.id)
+                        "Choose image", "Choose replacement image" -> launchCoverPicker(page.project.id)
                         "Remove cover" -> confirmRemoveCover()
                     }
                 }
@@ -1056,24 +1072,29 @@ class MainActivity : ComponentActivity() {
     }
 
     internal fun importCover(projectId: String, uri: Uri, capture: PendingCameraCover? = null) {
-        val tenantId = controller.activeTenantId ?: return
+        val tenantId = controller.activeTenantId
+        if (tenantId == null) {
+            coverCaptureFiles.delete(capture)
+            return
+        }
         uiScope.launch {
+            var imported: dev.blocks.android.project.ProjectCoverContent? = null
             try {
-                val cover = withContext(Dispatchers.IO) {
-                    val processed = coverImporter.importCover(projectId, uri)
-                    if (capture != null) coverCaptureFiles.delete(capture)
-                    processed
-                }
+                imported = withContext(Dispatchers.IO) { coverImporter.importCover(projectId, uri) }
                 withContext(NonCancellable + localStateDispatcher) {
                     check(controller.activeTenantId == tenantId) { "The active account changed during cover import" }
                     check(controller.state.projectPage?.project?.id == projectId) {
                         "The selected project changed during cover import"
                     }
-                    controller.saveProjectCover(cover)
+                    controller.saveProjectCover(requireNotNull(imported))
                 }
             } catch (_: Exception) {
-                if (capture != null) withContext(Dispatchers.IO) { runCatching { coverCaptureFiles.delete(capture) } }
                 controller.reportError("Blocks could not save that cover on this device. Your current cover is unchanged.")
+            } finally {
+                imported?.clear()
+                if (capture != null) withContext(NonCancellable + Dispatchers.IO) {
+                    coverCaptureFiles.delete(capture)
+                }
             }
             render()
         }
@@ -1687,28 +1708,34 @@ class MainActivity : ComponentActivity() {
             setOnClickListener(action)
         }
 
-    private fun loadCover(image: ImageView, project: ProjectSummary, cover: ProjectCover, thumbnail: Boolean) {
-        val cacheKey = "${cover.contentDigest}:${if (thumbnail) "thumb" else "display"}"
+    private fun loadCover(image: ImageView, cover: ProjectCover, thumbnail: Boolean) {
+        val tenantId = controller.activeTenantId ?: return
+        if (cover.tenantId != tenantId) return
+        val cacheKey = "$tenantId:${cover.coverId}:${cover.revision}:${if (thumbnail) "thumb" else "display"}"
         coverBitmaps.get(cacheKey)?.let {
+            if (tenantId != controller.activeTenantId || cover.tenantId != tenantId) return
             image.scaleType = ImageView.ScaleType.CENTER_CROP
             image.setPadding(0, 0, 0, 0)
             image.setImageBitmap(it)
-            image.contentDescription = "Cover for ${project.name}"
             return
         }
         val generation = renderGeneration
-        val tenantId = controller.activeTenantId
-        val encoded = if (thumbnail) cover.thumbnailJpegBase64 else cover.displayJpegBase64
         val job = uiScope.launch {
-            val bitmap = withContext(Dispatchers.Default) {
-                val bytes = Base64.getDecoder().decode(encoded)
-                try {
-                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                } finally {
-                    bytes.fill(0)
+            val bitmap = runCatching {
+                withContext(Dispatchers.IO) {
+                    val bytes = controller.readProjectCoverContent(cover, thumbnail)
+                    try {
+                        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    } finally {
+                        bytes.fill(0)
+                    }
                 }
-            } ?: return@launch
-            if (generation != renderGeneration || tenantId != controller.activeTenantId) {
+            }.getOrNull() ?: return@launch
+            if (
+                generation != renderGeneration ||
+                tenantId != controller.activeTenantId ||
+                cover.tenantId != tenantId
+            ) {
                 bitmap.recycle()
                 return@launch
             }
@@ -1716,12 +1743,12 @@ class MainActivity : ComponentActivity() {
             image.scaleType = ImageView.ScaleType.CENTER_CROP
             image.setPadding(0, 0, 0, 0)
             image.setImageBitmap(bitmap)
-            image.contentDescription = "Cover for ${project.name}"
         }
         coverJobs += job
     }
 
     private fun clearCoverMemory() {
+        dashboardSearchQuery = ""
         coverJobs.forEach { it.cancel() }
         coverJobs.clear()
         coverBitmaps.evictAll()
@@ -1730,6 +1757,8 @@ class MainActivity : ComponentActivity() {
         pendingCoverProjectId = null
         uiScope.launch(Dispatchers.IO) { runCatching { coverCaptureFiles.delete(capture) } }
     }
+
+    internal fun coverCacheKeysForTest(): Set<String> = coverBitmaps.snapshot().keys
 
     private fun label(text: String, size: Float, color: Int = Color.DKGRAY) = TextView(this).apply {
         this.text = text
@@ -1855,6 +1884,7 @@ class MainActivity : ComponentActivity() {
         val accountIdentity = requireNotNull(authenticated.accountIdentity) {
             "Service accepted a session without a stable account identity"
         }
+        if (priorTenantId != null && priorTenantId != authenticated.tenantId) clearCoverMemory()
         withContext(localStateDispatcher) {
             acceptedTenantStore.save(AcceptedTenantContinuity(authenticated.tenantId, accountIdentity))
             controller.activateAuthenticated(authenticated)
@@ -2046,6 +2076,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         nfcTagPlatform.stopReader()
+        coverJobs.forEach { it.cancel() }
+        coverJobs.clear()
+        coverBitmaps.evictAll()
+        coverCaptureFiles.delete(pendingCameraCover)
         uiScope.cancel()
         localStateDispatcher.close()
         super.onDestroy()
@@ -2061,7 +2095,6 @@ class MainActivity : ComponentActivity() {
 
     internal companion object {
         private const val STATE_PROJECT_ID = "project_id"
-        private const val STATE_DASHBOARD_SEARCH = "dashboard_search"
         private const val STATE_COVER_PROJECT_ID = "cover_project_id"
         private const val STATE_CAMERA_COVER_PATH = "camera_cover_path"
         private const val DASHBOARD_COLLECTION_TAG = "dashboard_collection"

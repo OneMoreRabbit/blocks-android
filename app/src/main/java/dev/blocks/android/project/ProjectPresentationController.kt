@@ -191,8 +191,13 @@ class ProjectPresentationController(
         )
     }
 
+    fun readProjectCoverContent(cover: ProjectCover, thumbnail: Boolean): ByteArray {
+        val active = synchronized(this) { activeSession() }
+        return workspace.readProjectCoverContent(active, cover, thumbnail)
+    }
+
     @Synchronized
-    fun saveProjectCover(cover: ProjectCover) {
+    fun saveProjectCover(cover: ProjectCoverContent) {
         val page = requireNotNull(state.projectPage) { "No project is open" }
         require(cover.projectId == page.project.id) { "The selected project changed during cover import" }
         applyResult(workspace.saveProjectCover(activeSession(), cover))

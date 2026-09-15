@@ -8,7 +8,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import java.io.File
 import java.io.FileOutputStream
-import java.util.Base64
+import java.io.RandomAccessFile
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -44,11 +44,11 @@ class ProjectCoverImagesTest {
 
             val cover = ProjectCoverImageProcessor().process(
                 "project-cover",
-                sourceFile.readBytes(),
+                sourceFile,
                 "2026-09-15T09:00:00Z",
             )
-            val displayBytes = Base64.getDecoder().decode(cover.displayJpegBase64)
-            val thumbnailBytes = Base64.getDecoder().decode(cover.thumbnailJpegBase64)
+            val displayBytes = cover.displayJpeg
+            val thumbnailBytes = cover.thumbnailJpeg
             val display = BitmapFactory.decodeByteArray(displayBytes, 0, displayBytes.size)
             val thumbnail = BitmapFactory.decodeByteArray(thumbnailBytes, 0, thumbnailBytes.size)
 
@@ -71,6 +71,47 @@ class ProjectCoverImagesTest {
             sourceFile.delete()
             sanitizedFile.delete()
         }
+    }
+
+    @Test
+    fun processorRejectsOverLimitCompressedAndExtremeAspectSourcesBeforePixelDecode() {
+        val overLimit = File(context.cacheDir, "cover-over-limit.jpg")
+        val extreme = File(context.cacheDir, "cover-extreme.jpg")
+        try {
+            RandomAccessFile(overLimit, "rw").use {
+                it.setLength(ProjectCoverImageProcessor.MAX_COMPRESSED_BYTES + 1)
+            }
+            assertTrue(
+                runCatching {
+                    ProjectCoverImageProcessor().process("project", overLimit, "2026-09-15T09:00:00Z")
+                }.isFailure,
+            )
+            val extremeBitmap = Bitmap.createBitmap(1_300, 100, Bitmap.Config.ARGB_8888)
+            try {
+                extreme.outputStream().use { output ->
+                    assertTrue(extremeBitmap.compress(Bitmap.CompressFormat.JPEG, 80, output))
+                }
+            } finally {
+                extremeBitmap.recycle()
+            }
+            assertTrue(
+                runCatching {
+                    ProjectCoverImageProcessor().process("project", extreme, "2026-09-15T09:00:00Z")
+                }.exceptionOrNull()?.message?.contains("too narrow") == true,
+            )
+        } finally {
+            overLimit.delete()
+            extreme.delete()
+        }
+    }
+
+    @Test
+    fun processorSamplesMaximumPermittedDimensionsWithinDecodedAndCropCaps() {
+        val processor = ProjectCoverImageProcessor()
+
+        assertEquals(16, processor.sampleSize(20_000, 20_000))
+        assertEquals(4, processor.sampleSize(20_000, 2_000))
+        assertEquals(4, processor.sampleSize(2_000, 20_000))
     }
 
     @Test
