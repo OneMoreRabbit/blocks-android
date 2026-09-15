@@ -25,11 +25,15 @@ import dev.blocks.android.project.ProjectPage
 import dev.blocks.android.project.ProjectParking
 import dev.blocks.android.project.ProjectSummary
 import dev.blocks.android.project.ProjectUiPreferences
+import dev.blocks.android.project.ensureProjectLinks
 import dev.blocks.android.tag.LocalBlockOperation
 import dev.blocks.android.tag.LocalBlockOperationType
 import dev.blocks.android.tag.LocalBlockRecord
 import dev.blocks.android.tag.LocalBlockState
 import dev.blocks.android.tag.OpaqueTagToken
+import dev.blocks.android.tag.ProjectKey
+import dev.blocks.android.tag.ProjectKeyFactory
+import dev.blocks.android.tag.ProjectLinkIdentity
 import java.io.File
 import java.security.KeyStore
 import java.security.MessageDigest
@@ -60,6 +64,7 @@ internal data class EncodedSyncRows(
     val blocks: List<String> = emptyList(),
     val localBlocks: List<String> = emptyList(),
     val localBlockOperations: List<String> = emptyList(),
+    val projectLinks: List<String> = emptyList(),
     val projectCommands: List<String> = emptyList(),
     val retiredOperationIds: List<String> = emptyList(),
     val provisionalProjectIds: List<String> = emptyList(),
@@ -70,7 +75,10 @@ internal data class EncodedSyncRows(
     val projectUiPreferences: String? = null,
 )
 
-internal class SyncStateRowCodec(private val gson: Gson = Gson()) {
+internal class SyncStateRowCodec(
+    private val gson: Gson = Gson(),
+    private val projectKeyFactory: ProjectKeyFactory = ProjectKeyFactory(),
+) {
     fun encode(state: TenantSyncState): EncodedSyncRows {
         validateProjects(state.projects)
         validateCommands(state.commands)
@@ -78,7 +86,8 @@ internal class SyncStateRowCodec(private val gson: Gson = Gson()) {
         require(state.commands.none { it.idempotencyKey in retiredKeys }) {
             "A queued idempotency key is already retired"
         }
-        validateProjectCache(state.projectCache)
+        val projectCache = state.projectCache.ensureProjectLinks(projectKeyFactory)
+        validateProjectCache(projectCache)
         return EncodedSyncRows(
             schemaVersion = CURRENT_SCHEMA_VERSION,
             projectsLoaded = state.projectsLoaded,
@@ -89,23 +98,24 @@ internal class SyncStateRowCodec(private val gson: Gson = Gson()) {
             reentry = state.reentry?.let(gson::toJson),
             commands = state.commands.map(gson::toJson),
             retiredIdempotencyKeys = retiredKeys,
-            activeProjectsLoaded = state.projectCache.activeProjectsLoaded,
-            archivedProjectsLoaded = state.projectCache.archivedProjectsLoaded,
-            blocksLoaded = state.projectCache.blocksLoaded,
-            activeProjects = state.projectCache.activeProjects.map(gson::toJson),
-            archivedProjects = state.projectCache.archivedProjects.map(gson::toJson),
-            projectPages = state.projectCache.pages.map(gson::toJson),
-            parkingRecords = state.projectCache.parkingRecords.map(gson::toJson),
-            parkingLoadedProjectIds = state.projectCache.parkingLoadedProjectIds.distinct(),
-            stalePageIds = state.projectCache.stalePageIds.distinct(),
-            blocks = state.projectCache.blocks.map(gson::toJson),
-            localBlocks = state.projectCache.localBlocks.map(gson::toJson),
-            localBlockOperations = state.projectCache.localBlockOperations.map(gson::toJson),
-            projectCommands = state.projectCache.commands.map(gson::toJson),
-            retiredOperationIds = state.projectCache.retiredOperationIds.distinct(),
-            provisionalProjectIds = state.projectCache.provisionalProjectIds.distinct(),
-            projectIdMappings = state.projectCache.projectIdMappings.map(gson::toJson),
-            projectsAwaitingNotesBaseline = state.projectCache.projectsAwaitingNotesBaseline.distinct(),
+            activeProjectsLoaded = projectCache.activeProjectsLoaded,
+            archivedProjectsLoaded = projectCache.archivedProjectsLoaded,
+            blocksLoaded = projectCache.blocksLoaded,
+            activeProjects = projectCache.activeProjects.map(gson::toJson),
+            archivedProjects = projectCache.archivedProjects.map(gson::toJson),
+            projectPages = projectCache.pages.map(gson::toJson),
+            parkingRecords = projectCache.parkingRecords.map(gson::toJson),
+            parkingLoadedProjectIds = projectCache.parkingLoadedProjectIds.distinct(),
+            stalePageIds = projectCache.stalePageIds.distinct(),
+            blocks = projectCache.blocks.map(gson::toJson),
+            localBlocks = projectCache.localBlocks.map(gson::toJson),
+            localBlockOperations = projectCache.localBlockOperations.map(gson::toJson),
+            projectLinks = projectCache.projectLinks.map(gson::toJson),
+            projectCommands = projectCache.commands.map(gson::toJson),
+            retiredOperationIds = projectCache.retiredOperationIds.distinct(),
+            provisionalProjectIds = projectCache.provisionalProjectIds.distinct(),
+            projectIdMappings = projectCache.projectIdMappings.map(gson::toJson),
+            projectsAwaitingNotesBaseline = projectCache.projectsAwaitingNotesBaseline.distinct(),
             projectDrafts = gson.toJson(state.projectDrafts),
             projectDraftsMigrated = state.projectDraftsMigrated,
             projectUiPreferences = gson.toJson(state.projectUiPreferences),
@@ -158,6 +168,11 @@ internal class SyncStateRowCodec(private val gson: Gson = Gson()) {
                 } else {
                     emptyList()
                 },
+                projectLinks = if (rows.schemaVersion >= PROJECT_LINK_SCHEMA_VERSION) {
+                    rows.projectLinks.map { gson.fromJson(it, ProjectLinkIdentity::class.java) }
+                } else {
+                    emptyList()
+                },
                 commands = rows.projectCommands.map {
                     gson.fromJson(it, ProjectMutation::class.java).migrateFrom(rows.schemaVersion)
                 },
@@ -177,7 +192,7 @@ internal class SyncStateRowCodec(private val gson: Gson = Gson()) {
                 } else {
                     emptyList()
                 },
-            ).also(::validateProjectCache)
+            ).ensureProjectLinks(projectKeyFactory).also(::validateProjectCache)
         }
         return TenantSyncState(
             projects = projects,
@@ -220,7 +235,8 @@ internal class SyncStateRowCodec(private val gson: Gson = Gson()) {
         const val STANDALONE_SCHEMA_VERSION = 5
         const val PARKING_HISTORY_SCHEMA_VERSION = 6
         const val LOCAL_TAG_SCHEMA_VERSION = 7
-        const val CURRENT_SCHEMA_VERSION = LOCAL_TAG_SCHEMA_VERSION
+        const val PROJECT_LINK_SCHEMA_VERSION = 8
+        const val CURRENT_SCHEMA_VERSION = PROJECT_LINK_SCHEMA_VERSION
     }
 }
 
@@ -362,6 +378,26 @@ private fun validateProjectCache(cache: ProjectCacheState) {
                 "An unbound local block cannot retain a binding"
             }
         }
+    }
+    require(cache.projectLinks.map { it.projectId }.distinct().size == cache.projectLinks.size) {
+        "A project has more than one local navigation key"
+    }
+    require(cache.projectLinks.map { it.key }.distinct().size == cache.projectLinks.size) {
+        "Local project navigation keys are not unique"
+    }
+    cache.projectLinks.forEach { identity ->
+        require(identity.projectId.isNotBlank()) { "A project navigation identity has no project" }
+        require(ProjectKey.parse(identity.key.encoded) == identity.key) {
+            "A local project navigation key is not canonical"
+        }
+    }
+    val knownProjectIds = (
+        cache.activeProjects.map { it.id } +
+            cache.archivedProjects.map { it.id } +
+            cache.pages.map { it.project.id }
+        ).toSet()
+    require(knownProjectIds.all { projectId -> cache.projectLinks.any { it.projectId == projectId } }) {
+        "A cached project has no local navigation key"
     }
     require(cache.localBlockOperations.map { it.operationId }.distinct().size == cache.localBlockOperations.size) {
         "Local block operation identities are not unique"
@@ -643,6 +679,7 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
             blocks = readRows(database, tenantId, secretKey, TABLE_BLOCKS),
             localBlocks = readRows(database, tenantId, secretKey, TABLE_LOCAL_BLOCKS),
             localBlockOperations = readRows(database, tenantId, secretKey, TABLE_LOCAL_BLOCK_OPERATIONS),
+            projectLinks = readRows(database, tenantId, secretKey, TABLE_PROJECT_LINKS),
             projectCommands = readRows(database, tenantId, secretKey, TABLE_PROJECT_COMMANDS),
             retiredOperationIds = readRows(database, tenantId, secretKey, TABLE_RETIRED_OPERATIONS),
             provisionalProjectIds = readRows(database, tenantId, secretKey, TABLE_PROVISIONAL_PROJECTS),
@@ -722,6 +759,7 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
         writeRows(database, tenantId, secretKey, TABLE_BLOCKS, rows.blocks)
         writeRows(database, tenantId, secretKey, TABLE_LOCAL_BLOCKS, rows.localBlocks)
         writeRows(database, tenantId, secretKey, TABLE_LOCAL_BLOCK_OPERATIONS, rows.localBlockOperations)
+        writeRows(database, tenantId, secretKey, TABLE_PROJECT_LINKS, rows.projectLinks)
         writeRows(database, tenantId, secretKey, TABLE_PROJECT_COMMANDS, rows.projectCommands)
         writeRows(database, tenantId, secretKey, TABLE_RETIRED_OPERATIONS, rows.retiredOperationIds)
         writeRows(database, tenantId, secretKey, TABLE_PROVISIONAL_PROJECTS, rows.provisionalProjectIds)
@@ -937,6 +975,7 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
             if (oldVersion < 4) STANDALONE_TABLES.forEach { table -> createPositionTable(database, table) }
             if (oldVersion < 5) PARKING_HISTORY_TABLES.forEach { table -> createPositionTable(database, table) }
             if (oldVersion < 6) LOCAL_TAG_TABLES.forEach { table -> createPositionTable(database, table) }
+            if (oldVersion < 7) PROJECT_LINK_TABLES.forEach { table -> createPositionTable(database, table) }
         }
 
         override fun onDowngrade(database: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -953,7 +992,7 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
     }
 
     private companion object {
-        const val DATABASE_VERSION = 6
+        const val DATABASE_VERSION = 7
         const val DATABASE_PREFIX = "blocks_sync_"
         const val DATABASE_KEY_PREFIX = "blocks-sync-db-v1-"
         const val LEGACY_PREFERENCES_PREFIX = "encrypted_sync_state_v1_"
@@ -974,6 +1013,7 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
         const val TABLE_BLOCKS = "blocks_v3"
         const val TABLE_LOCAL_BLOCKS = "local_blocks_v7"
         const val TABLE_LOCAL_BLOCK_OPERATIONS = "local_block_operations_v7"
+        const val TABLE_PROJECT_LINKS = "project_links_v8"
         const val TABLE_PROJECT_COMMANDS = "pending_project_commands_v3"
         const val TABLE_RETIRED_OPERATIONS = "retired_project_operations_v3"
         const val TABLE_PROVISIONAL_PROJECTS = "provisional_projects_v4"
@@ -1011,13 +1051,14 @@ class AndroidEncryptedSyncStateStore(context: Context) : SyncStateStore {
         val STANDALONE_TABLES = listOf(TABLE_PROJECT_UI_PREFERENCES)
         val PARKING_HISTORY_TABLES = listOf(TABLE_PARKING_RECORDS, TABLE_PARKING_LOADED_PROJECTS)
         val LOCAL_TAG_TABLES = listOf(TABLE_LOCAL_BLOCKS, TABLE_LOCAL_BLOCK_OPERATIONS)
+        val PROJECT_LINK_TABLES = listOf(TABLE_PROJECT_LINKS)
         val POSITION_TABLES = listOf(
             TABLE_PROJECTS,
             TABLE_REENTRY,
             TABLE_COMMANDS,
             TABLE_RETIRED_KEYS,
         ) + PROJECT_MODEL_TABLES + LOCAL_FIRST_TABLES + STANDALONE_TABLES +
-            PARKING_HISTORY_TABLES + LOCAL_TAG_TABLES
+            PARKING_HISTORY_TABLES + LOCAL_TAG_TABLES + PROJECT_LINK_TABLES
         val TABLES = listOf(
             TABLE_METADATA,
         ) + POSITION_TABLES

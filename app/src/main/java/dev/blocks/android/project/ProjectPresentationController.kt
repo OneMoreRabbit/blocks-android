@@ -11,6 +11,8 @@ import dev.blocks.android.tag.LocalBlockRecord
 import dev.blocks.android.tag.LocalTagResolution
 import dev.blocks.android.tag.DirectTagWritePlan
 import dev.blocks.android.tag.OpaqueTagToken
+import dev.blocks.android.tag.ProjectKey
+import dev.blocks.android.tag.ProjectLink
 import dev.blocks.android.tag.TagActivationMedium
 import dev.blocks.android.tag.TagProgrammingFailure
 import java.io.IOException
@@ -48,6 +50,12 @@ data class ProjectPresentationState(
     val sessionConfirmationRequired: Boolean = false,
     val status: String? = null,
     val error: String? = null,
+)
+
+/** In-memory scope for one foreground NFC attempt; no credential or physical tag identity. */
+data class DirectTagAttemptScope(
+    val tenantId: String,
+    val projectKey: ProjectKey,
 )
 
 /** UI state machine for the standalone Dashboard and Project product surface. */
@@ -280,13 +288,40 @@ class ProjectPresentationController(
     }
 
     @Synchronized
-    fun commitVerifiedDirectTagWrite(plan: DirectTagWritePlan, replacedToken: OpaqueTagToken?) {
-        applyResult(workspace.commitVerifiedDirectTagWrite(activeSession(), plan, replacedToken))
+    fun currentProjectLink(): ProjectLink {
+        val project = requireNotNull(state.projectPage).project
+        return workspace.projectLink(activeSession(), project.id)
     }
 
     @Synchronized
-    fun commitVerifiedDirectTagClear(erasedToken: OpaqueTagToken?) {
-        applyResult(workspace.commitVerifiedDirectTagClear(activeSession(), erasedToken, newOperationId()))
+    fun captureDirectTagAttemptScope(): DirectTagAttemptScope {
+        val active = activeSession()
+        val project = requireNotNull(state.projectPage).project
+        return DirectTagAttemptScope(active.tenantId, workspace.projectLink(active, project.id).key)
+    }
+
+    @Synchronized
+    fun matchesDirectTagAttemptScope(scope: DirectTagAttemptScope): Boolean {
+        val active = session ?: return false
+        val project = state.projectPage?.project ?: return false
+        if (active.tenantId != scope.tenantId) return false
+        return runCatching { workspace.projectLink(active, project.id).key == scope.projectKey }.getOrDefault(false)
+    }
+
+    @Synchronized
+    fun commitVerifiedDirectTagWrite(
+        scope: DirectTagAttemptScope,
+        plan: DirectTagWritePlan,
+        replacedToken: OpaqueTagToken?,
+    ) {
+        applyResult(workspace.commitVerifiedDirectTagWrite(scopedTagSession(scope), plan, replacedToken))
+    }
+
+    @Synchronized
+    fun commitVerifiedDirectTagClear(scope: DirectTagAttemptScope, erasedToken: OpaqueTagToken?) {
+        applyResult(
+            workspace.commitVerifiedDirectTagClear(scopedTagSession(scope), erasedToken, newOperationId()),
+        )
     }
 
     @Synchronized
@@ -340,6 +375,10 @@ class ProjectPresentationController(
     @Synchronized
     fun resolveTagLocally(token: OpaqueTagToken): LocalTagResolution =
         workspace.resolveTagLocally(activeSession(), token)
+
+    @Synchronized
+    fun resolveProjectLinkLocally(key: ProjectKey): String? =
+        workspace.resolveProjectLinkLocally(activeSession(), key)
 
     fun resolveTagThroughService(token: OpaqueTagToken): LocalTagResolution {
         val active = synchronized(this) { activeSession() }
@@ -670,6 +709,16 @@ class ProjectPresentationController(
     }
 
     private fun activeSession(): Session = checkNotNull(session) { "No authenticated project session" }
+
+    private fun scopedTagSession(scope: DirectTagAttemptScope): Session {
+        val active = activeSession()
+        check(active.tenantId == scope.tenantId) { "The NFC attempt account changed" }
+        val project = requireNotNull(state.projectPage) { "The NFC attempt project is no longer open" }.project
+        check(workspace.projectLink(active, project.id).key == scope.projectKey) {
+            "The NFC attempt project changed"
+        }
+        return active
+    }
 
     private fun ParkingDraft.hasContent() = location.isNotEmpty() || nextAction.isNotEmpty() || mustNotForget.isNotEmpty()
 

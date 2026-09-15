@@ -4,6 +4,65 @@ import java.net.URI
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.Base64
+import java.util.UUID
+
+sealed interface BlocksNavigationAddress {
+    val encoded: String
+}
+
+/** Stable per-project UUID. String rendering is redacted to keep navigation keys out of logs. */
+class ProjectKey private constructor(val encoded: String) {
+    override fun equals(other: Any?) = other is ProjectKey && encoded == other.encoded
+    override fun hashCode() = encoded.hashCode()
+    override fun toString() = "[redacted project key]"
+
+    companion object {
+        fun parse(value: String): ProjectKey? = runCatching { UUID.fromString(value) }
+            .getOrNull()
+            ?.toString()
+            ?.takeIf { it == value }
+            ?.let(::ProjectKey)
+
+        fun fromUuid(value: UUID): ProjectKey = ProjectKey(value.toString())
+    }
+}
+
+class ProjectKeyFactory(private val nextUuid: () -> UUID = UUID::randomUUID) {
+    fun create(): ProjectKey = ProjectKey.fromUuid(nextUuid())
+}
+
+/** Canonical HTTPS address shared by a project's QR and every newly programmed NFC tag. */
+class ProjectLink private constructor(val key: ProjectKey) : BlocksNavigationAddress {
+    override val encoded: String
+        get() = "https://api.blocks.onemorerabbit.co.uk/p/v1/${key.encoded}"
+
+    override fun equals(other: Any?) = other is ProjectLink && key == other.key
+    override fun hashCode() = key.hashCode()
+    override fun toString() = "https://api.blocks.onemorerabbit.co.uk/p/v1/[redacted]"
+
+    companion object {
+        fun create(key: ProjectKey) = ProjectLink(key)
+
+        fun parse(value: String): ProjectLink? {
+            val uri = runCatching { URI(value) }.getOrNull() ?: return null
+            if (uri.scheme != "https" || uri.rawAuthority != "api.blocks.onemorerabbit.co.uk") return null
+            if (uri.userInfo != null || uri.port != -1 || uri.rawQuery != null || uri.rawFragment != null) return null
+            val segments = uri.rawPath?.split('/')?.filter(String::isNotEmpty) ?: return null
+            if (segments.size != 3 || segments[0] != "p" || segments[1] != "v1") return null
+            val key = ProjectKey.parse(segments[2]) ?: return null
+            return ProjectLink(key).takeIf { it.encoded == value }
+        }
+    }
+}
+
+data class ProjectLinkIdentity(
+    val projectId: String,
+    val key: ProjectKey,
+)
+
+object BlocksNavigationAddressParser {
+    fun parse(value: String): BlocksNavigationAddress? = ProjectLink.parse(value) ?: TagLocator.parse(value)
+}
 
 /** A raw tag token whose string form is deliberately always redacted. */
 class OpaqueTagToken private constructor(val encoded: String) {
@@ -44,8 +103,8 @@ class OpaqueTagTokenFactory(private val random: SecureRandom = SecureRandom()) {
 }
 
 /** Canonical, versioned NFC/QR locator. Its string form never exposes the token. */
-class TagLocator private constructor(val token: OpaqueTagToken) {
-    val encoded: String
+class TagLocator private constructor(val token: OpaqueTagToken) : BlocksNavigationAddress {
+    override val encoded: String
         get() = "blocks://tag/v1/${token.encoded}"
 
     override fun equals(other: Any?) = other is TagLocator && token == other.token

@@ -9,6 +9,10 @@ import dev.blocks.android.tag.LocalTagResolution
 import dev.blocks.android.tag.DirectTagWritePlan
 import dev.blocks.android.tag.OpaqueTagToken
 import dev.blocks.android.tag.OpaqueTagTokenFactory
+import dev.blocks.android.tag.ProjectKey
+import dev.blocks.android.tag.ProjectKeyFactory
+import dev.blocks.android.tag.ProjectLink
+import dev.blocks.android.tag.ProjectLinkIdentity
 import dev.blocks.android.tag.TagActivationMedium
 import dev.blocks.android.tag.TagProgrammingFailure
 import dev.blocks.android.tag.LocalBlockOperation
@@ -149,6 +153,7 @@ data class ProjectCacheState(
     val blocksLoaded: Boolean = false,
     val localBlocks: List<LocalBlockRecord> = emptyList(),
     val localBlockOperations: List<LocalBlockOperation> = emptyList(),
+    val projectLinks: List<ProjectLinkIdentity> = emptyList(),
     val commands: List<ProjectMutation> = emptyList(),
     val retiredOperationIds: List<String> = emptyList(),
     val provisionalProjectIds: List<String> = emptyList(),
@@ -245,6 +250,9 @@ interface ProjectWorkspace {
         limit: Int,
     ): ParkingHistoryPage
     fun localBlocks(session: Session): List<LocalBlockRecord> = snapshot(session).cache.localBlocks
+    fun projectLink(session: Session, projectId: String): ProjectLink =
+        throw UnsupportedOperationException("Project links are unavailable")
+    fun resolveProjectLinkLocally(session: Session, key: ProjectKey): String? = null
     fun prepareDirectTagWrite(
         session: Session,
         projectId: String,
@@ -360,3 +368,20 @@ interface ProjectWorkspace {
 }
 
 fun newOperationIdentity(): String = UUID.randomUUID().toString()
+
+internal fun ProjectCacheState.ensureProjectLinks(
+    keyFactory: ProjectKeyFactory,
+): ProjectCacheState {
+    val knownProjects = (activeProjects + archivedProjects + pages.map { it.project }).distinctBy { it.id }
+    if (knownProjects.isEmpty()) return this
+
+    val links = projectLinks.toMutableList()
+    val usedKeys = links.map { it.key }.toMutableSet()
+    knownProjects.forEach { project ->
+        if (links.any { it.projectId == project.id }) return@forEach
+        val preferred = project.clientId?.let(ProjectKey::parse)?.takeIf(usedKeys::add)
+        val key = preferred ?: generateSequence(keyFactory::create).first(usedKeys::add)
+        links += ProjectLinkIdentity(project.id, key)
+    }
+    return copy(projectLinks = links)
+}

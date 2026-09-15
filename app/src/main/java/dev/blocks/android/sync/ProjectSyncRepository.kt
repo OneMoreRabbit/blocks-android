@@ -29,6 +29,7 @@ import dev.blocks.android.project.ProjectService
 import dev.blocks.android.project.ProjectSummary
 import dev.blocks.android.project.ProjectUiPreferences
 import dev.blocks.android.project.ProjectWorkspace
+import dev.blocks.android.project.ensureProjectLinks
 import dev.blocks.android.project.newOperationIdentity
 import dev.blocks.android.tag.LocalBlockOperation
 import dev.blocks.android.tag.LocalBlockOperationType
@@ -37,6 +38,9 @@ import dev.blocks.android.tag.LocalBlockState
 import dev.blocks.android.tag.LocalTagResolution
 import dev.blocks.android.tag.DirectTagWritePlan
 import dev.blocks.android.tag.OpaqueTagToken
+import dev.blocks.android.tag.ProjectKey
+import dev.blocks.android.tag.ProjectKeyFactory
+import dev.blocks.android.tag.ProjectLink
 import dev.blocks.android.tag.TagActivationMedium
 import dev.blocks.android.tag.TagProgrammingFailure
 import java.io.IOException
@@ -54,6 +58,7 @@ class ProjectSyncRepository(
     private val legacyDraftStore: DraftStore,
     private val syncStore: SyncStateStore,
     private val now: () -> String = { Instant.now().toString() },
+    private val projectKeyFactory: ProjectKeyFactory = ProjectKeyFactory(),
 ) : ProjectWorkspace {
     @Volatile
     private var activeTenantId: String? = null
@@ -64,6 +69,9 @@ class ProjectSyncRepository(
     override fun activate(session: Session) {
         activeTenantId = session.tenantId
         migrateProjectDrafts(session)
+        val state = activeState(session)
+        val withProjectLinks = state.withProjectLinks()
+        if (withProjectLinks != state) save(session, withProjectLinks)
     }
 
     @Synchronized
@@ -138,6 +146,26 @@ class ProjectSyncRepository(
 
     @Synchronized
     override fun localBlocks(session: Session): List<LocalBlockRecord> = activeState(session).projectCache.localBlocks
+
+    @Synchronized
+    override fun projectLink(session: Session, projectId: String): ProjectLink {
+        val state = activeState(session)
+        val resolvedProjectId = state.projectCache.resolveProjectId(projectId)
+        require(state.projectCache.pages.any { it.project.id == resolvedProjectId }) {
+            "The selected project is not available in saved local data"
+        }
+        val identity = requireNotNull(
+            state.projectCache.projectLinks.firstOrNull { it.projectId == resolvedProjectId },
+        ) { "The selected project has no local navigation key" }
+        return ProjectLink.create(identity.key)
+    }
+
+    @Synchronized
+    override fun resolveProjectLinkLocally(session: Session, key: ProjectKey): String? {
+        val state = activeState(session)
+        val projectId = state.projectCache.projectLinks.firstOrNull { it.key == key }?.projectId ?: return null
+        return projectId.takeIf { candidate -> state.projectCache.pages.any { it.project.id == candidate } }
+    }
 
     @Synchronized
     override fun prepareDirectTagWrite(
@@ -1325,6 +1353,9 @@ class ProjectSyncRepository(
                 localBlockOperations = projectCache.localBlockOperations.map {
                     it.remapProject(provisionalId, serverId)
                 },
+                projectLinks = projectCache.projectLinks.map { identity ->
+                    if (identity.projectId == provisionalId) identity.copy(projectId = serverId) else identity
+                }.distinctBy { it.projectId },
             ),
             projectDrafts = mappedDrafts,
         ).withProjectedLists()
@@ -1705,20 +1736,25 @@ class ProjectSyncRepository(
     }
 
     private fun save(session: Session, state: TenantSyncState): TenantSyncState {
+        val stateWithLinks = state.withProjectLinks()
         val context = backgroundSaveContext.get()
         if (context == null) {
-            syncStore.saveSyncState(session.tenantId, state)
-            return state
+            syncStore.saveSyncState(session.tenantId, stateWithLinks)
+            return stateWithLinks
         }
         return synchronized(this) {
             checkActive(session)
             val current = syncStore.loadSyncState(session.tenantId)
-            val merged = mergeConcurrentLocalChanges(context.baseline, state, current)
+            val merged = mergeConcurrentLocalChanges(context.baseline, stateWithLinks, current).withProjectLinks()
             syncStore.saveSyncState(session.tenantId, merged)
             context.baseline = merged
             merged
         }
     }
+
+    private fun TenantSyncState.withProjectLinks(): TenantSyncState = copy(
+        projectCache = projectCache.ensureProjectLinks(projectKeyFactory),
+    )
 
     /** Keeps local commits made while transport is waiting when a background snapshot is saved. */
     private fun mergeConcurrentLocalChanges(

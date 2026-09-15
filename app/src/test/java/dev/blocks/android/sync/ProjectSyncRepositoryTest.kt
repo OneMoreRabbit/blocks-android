@@ -57,6 +57,22 @@ import org.junit.Test
 
 class ProjectSyncRepositoryTest {
     @Test
+    fun legacyProjectGetsOneStableCollisionCheckedKeyWithoutCreatingWireOperations() {
+        val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
+        val first = repository(FakeProjectService(), MemoryDrafts(), state)
+        first.activate(SESSION_A)
+
+        val link = first.projectLink(SESSION_A, PROJECT_ID)
+        assertNotNull(java.util.UUID.fromString(link.key.encoded))
+        assertTrue(first.snapshot(SESSION_A).cache.localBlockOperations.isEmpty())
+
+        val restarted = repository(FakeProjectService(), MemoryDrafts(), state)
+        restarted.activate(SESSION_A)
+        assertEquals(link, restarted.projectLink(SESSION_A, PROJECT_ID))
+        assertEquals(PROJECT_ID, restarted.resolveProjectLinkLocally(SESSION_A, link.key))
+    }
+
+    @Test
     fun directTagPlanIsTransientAndVerifiedOverwriteCommitsNewAndPriorAssociationsAtomically() {
         val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
         val repository = repository(FakeProjectService(), MemoryDrafts(), state)
@@ -489,6 +505,7 @@ class ProjectSyncRepositoryTest {
 
         val created = first.queueCreateProject(SESSION_A, "Offline project", "create-project-key")
         val provisionalId = created.cache.activeProjects.single().id
+        val localProjectLink = first.projectLink(SESSION_A, provisionalId)
         assertEquals("create-project-key", provisionalId)
         assertEquals("Offline project", first.projectPage(SESSION_A, provisionalId).project.name)
         state.saveSyncState(
@@ -528,6 +545,7 @@ class ProjectSyncRepositoryTest {
         val restarted = repository(service, drafts, state)
         restarted.activate(SESSION_A)
         assertEquals("Offline notes", restarted.projectPage(SESSION_A, provisionalId).notes.body)
+        assertEquals(localProjectLink, restarted.projectLink(SESSION_A, provisionalId))
         assertEquals(3, restarted.snapshot(SESSION_A).pendingProjectOperations)
 
         service.offline = false
@@ -542,6 +560,9 @@ class ProjectSyncRepositoryTest {
         assertNotNull(service.parkingOccurredAt.single())
         assertTrue(converged.cache.commands.isEmpty())
         assertEquals(PROJECT_ID, converged.cache.pages.single().project.id)
+        assertEquals(localProjectLink, restarted.projectLink(SESSION_A, PROJECT_ID))
+        assertEquals(PROJECT_ID, restarted.resolveProjectLinkLocally(SESSION_A, localProjectLink.key))
+        assertTrue(converged.cache.localBlockOperations.isEmpty())
         assertEquals("Offline notes", converged.cache.pages.single().notes.body)
         assertEquals("parking-1", converged.cache.pages.single().newestParking?.id)
         assertEquals(
@@ -1187,8 +1208,12 @@ class ProjectSyncRepositoryTest {
         val repository = repository(service, drafts, state)
 
         repository.activate(SESSION_A)
+        val tenantALink = repository.projectLink(SESSION_A, PROJECT_ID)
         repository.activate(SESSION_B)
+        val tenantBLink = repository.projectLink(SESSION_B, PROJECT_ID)
 
+        assertFalse(tenantALink == tenantBLink)
+        assertEquals(null, repository.resolveProjectLinkLocally(SESSION_B, tenantALink.key))
         assertFalse(state.loadSyncState(TENANT_A) == TenantSyncState())
         assertEquals("Tenant A", state.loadSyncState(TENANT_A).projectDrafts.projectNotes[PROJECT_ID])
         assertFalse(state.loadSyncState(TENANT_B) == TenantSyncState())
@@ -1196,6 +1221,7 @@ class ProjectSyncRepositoryTest {
 
         repository.deactivate(SESSION_B)
         repository.activate(SESSION_A)
+        assertEquals(PROJECT_ID, repository.resolveProjectLinkLocally(SESSION_A, tenantALink.key))
         assertEquals("Tenant A", repository.projectDrafts(SESSION_A).projectNotes[PROJECT_ID])
 
         service.membershipRevoked = true
