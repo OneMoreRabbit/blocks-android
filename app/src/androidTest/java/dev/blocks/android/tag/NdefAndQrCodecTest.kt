@@ -22,6 +22,10 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.IOException
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.concurrent.thread
 
 @RunWith(AndroidJUnit4::class)
 class NdefAndQrCodecTest {
@@ -49,14 +53,171 @@ class NdefAndQrCodecTest {
         val factory = FakeTechnologies(formatable = formatable)
         val io = NfcTagIo(factory)
 
-        assertEquals(NfcProgrammingResult.AwaitingReadBack, io.programAndVerify(FakeHandle, link))
+        assertEquals(
+            NfcProgrammingResult.AwaitingReadBack(requireNotNull(FakeHandle.presentationCorrelation)),
+            io.programAndVerify(FakeHandle, link),
+        )
         assertEquals(listOf("format-connect", "format-write", "format-close"), events)
         assertEquals(link, NdefLocatorCodec.parse(formatable.formatted))
 
         events.clear()
         factory.ndef = FakeNdef(events, message = formatable.formatted)
-        assertEquals(NfcProgrammingResult.Verified(), io.verifyWritten(FakeHandle, link))
+        assertEquals(
+            NfcProgrammingResult.Verified(),
+            io.verifyWritten(FakeHandle, link, requireNotNull(FakeHandle.presentationCorrelation)),
+        )
         assertEquals(listOf("ndef-connect", "ndef-read", "ndef-close"), events)
+    }
+
+    @Test
+    fun formatableWriteAndClearRejectAnotherMatchingTagBeforeSameTagReadBack() {
+        val link = projectLink()
+        val handleA = FakeHandleWithCorrelation(1)
+        val handleB = FakeHandleWithCorrelation(2)
+        val expected = requireNotNull(handleA.presentationCorrelation)
+
+        val writeEvents = mutableListOf<String>()
+        val writeFormatable = FakeFormatable(writeEvents)
+        val writeFactory = FakeTechnologies(formatable = writeFormatable)
+        val writeIo = NfcTagIo(writeFactory)
+        assertEquals(
+            NfcProgrammingResult.AwaitingReadBack(expected),
+            writeIo.programAndVerify(handleA, link),
+        )
+        writeEvents.clear()
+        writeFactory.ndef = FakeNdef(writeEvents, message = writeFormatable.formatted)
+        assertEquals(
+            NfcProgrammingResult.AwaitingReadBack(expected),
+            writeIo.verifyWritten(handleB, link, expected),
+        )
+        assertTrue(writeEvents.isEmpty())
+        assertEquals(NfcProgrammingResult.Verified(), writeIo.verifyWritten(handleA, link, expected))
+
+        val clearEvents = mutableListOf<String>()
+        val clearFormatable = FakeFormatable(clearEvents)
+        val clearFactory = FakeTechnologies(formatable = clearFormatable)
+        val clearIo = NfcTagIo(clearFactory)
+        assertEquals(
+            NfcClearResult.AwaitingReadBack(expected),
+            clearIo.clearAndVerify(handleA),
+        )
+        clearEvents.clear()
+        clearFactory.ndef = FakeNdef(clearEvents, message = clearFormatable.formatted)
+        assertEquals(
+            NfcClearResult.AwaitingReadBack(expected),
+            clearIo.verifyCleared(handleB, expected),
+        )
+        assertTrue(clearEvents.isEmpty())
+        assertEquals(NfcClearResult.Verified(), clearIo.verifyCleared(handleA, expected))
+    }
+
+    @Test
+    fun missingOrUnstableFormatableCorrelationNeverClaimsVerification() {
+        val link = projectLink()
+        assertEquals(
+            NfcProgrammingResult.WriteUncertain,
+            NfcTagIo(FakeTechnologies(formatable = FakeFormatable(mutableListOf())))
+                .programAndVerify(NoCorrelationHandle, link),
+        )
+        assertEquals(
+            NfcClearResult.WriteUncertain,
+            NfcTagIo(FakeTechnologies(formatable = FakeFormatable(mutableListOf())))
+                .clearAndVerify(NoCorrelationHandle),
+        )
+
+        val handleA = FakeHandleWithCorrelation(3)
+        val handleAWithChangedIdentifier = FakeHandleWithCorrelation(4)
+        val expected = requireNotNull(handleA.presentationCorrelation)
+        val events = mutableListOf<String>()
+        val factory = FakeTechnologies(ndef = FakeNdef(events, message = NdefLocatorCodec.message(link)))
+        assertEquals(
+            NfcProgrammingResult.AwaitingReadBack(expected),
+            NfcTagIo(factory).verifyWritten(handleAWithChangedIdentifier, link, expected),
+        )
+        assertTrue(events.isEmpty())
+    }
+
+    @Test
+    fun cancellationBeforeDispatchAndDuringPreWriteIoPreventsWriteAndClear() {
+        val link = projectLink()
+        val beforeDispatch = NfcIoCancellation().also(NfcIoCancellation::cancel)
+        val untouchedEvents = mutableListOf<String>()
+        val untouchedIo = NfcTagIo(FakeTechnologies(ndef = FakeNdef(untouchedEvents)))
+        assertEquals(NfcProgrammingResult.Cancelled, untouchedIo.programAndVerify(FakeHandle, link, beforeDispatch))
+        assertEquals(NfcClearResult.Cancelled, untouchedIo.clearAndVerify(FakeHandle, beforeDispatch))
+        assertTrue(untouchedEvents.isEmpty())
+
+        val connectBlocked = BlockingNdef(IoBlock.CONNECT)
+        val connectCancellation = NfcIoCancellation()
+        val connectResult = runCancelled(connectBlocked.entered, connectCancellation) {
+            NfcTagIo(FakeTechnologies(ndef = connectBlocked)).programAndVerify(FakeHandle, link, connectCancellation)
+        }
+        assertEquals(NfcProgrammingResult.Cancelled, connectResult)
+        assertFalse(connectBlocked.events.contains("ndef-write"))
+
+        val readBlocked = BlockingNdef(IoBlock.READ, NdefLocatorCodec.message(link))
+        val readCancellation = NfcIoCancellation()
+        val readResult = runCancelled(readBlocked.entered, readCancellation) {
+            NfcTagIo(FakeTechnologies(ndef = readBlocked)).clearAndVerify(FakeHandle, readCancellation)
+        }
+        assertEquals(NfcClearResult.Cancelled, readResult)
+        assertFalse(readBlocked.events.contains("ndef-write"))
+
+        val formatConnectBlocked = BlockingFormatable(IoBlock.CONNECT)
+        val formatCancellation = NfcIoCancellation()
+        val formatResult = runCancelled(formatConnectBlocked.entered, formatCancellation) {
+            NfcTagIo(FakeTechnologies(formatable = formatConnectBlocked))
+                .programAndVerify(FakeHandle, link, formatCancellation)
+        }
+        assertEquals(NfcProgrammingResult.Cancelled, formatResult)
+        assertFalse(formatConnectBlocked.events.contains("format-write"))
+
+        val clearFormatConnectBlocked = BlockingFormatable(IoBlock.CONNECT)
+        val clearFormatCancellation = NfcIoCancellation()
+        val clearFormatResult = runCancelled(clearFormatConnectBlocked.entered, clearFormatCancellation) {
+            NfcTagIo(FakeTechnologies(formatable = clearFormatConnectBlocked))
+                .clearAndVerify(FakeHandle, clearFormatCancellation)
+        }
+        assertEquals(NfcClearResult.Cancelled, clearFormatResult)
+        assertFalse(clearFormatConnectBlocked.events.contains("format-write"))
+    }
+
+    @Test
+    fun cancellationAfterPhysicalMutationStartsReportsUncertainForWriteClearAndFormat() {
+        val link = projectLink()
+        val writeBlocked = BlockingNdef(IoBlock.WRITE)
+        val writeCancellation = NfcIoCancellation()
+        val writeResult = runCancelled(writeBlocked.entered, writeCancellation) {
+            NfcTagIo(FakeTechnologies(ndef = writeBlocked)).programAndVerify(FakeHandle, link, writeCancellation)
+        }
+        assertEquals(NfcProgrammingResult.WriteUncertain, writeResult)
+        assertTrue(writeCancellation.mutationHasStarted())
+
+        val clearBlocked = BlockingNdef(IoBlock.WRITE, NdefLocatorCodec.message(link))
+        val clearCancellation = NfcIoCancellation()
+        val clearResult = runCancelled(clearBlocked.entered, clearCancellation) {
+            NfcTagIo(FakeTechnologies(ndef = clearBlocked)).clearAndVerify(FakeHandle, clearCancellation)
+        }
+        assertEquals(NfcClearResult.WriteUncertain, clearResult)
+        assertTrue(clearCancellation.mutationHasStarted())
+
+        val formatBlocked = BlockingFormatable(IoBlock.WRITE)
+        val formatCancellation = NfcIoCancellation()
+        val formatResult = runCancelled(formatBlocked.entered, formatCancellation) {
+            NfcTagIo(FakeTechnologies(formatable = formatBlocked))
+                .clearAndVerify(FakeHandle, formatCancellation)
+        }
+        assertEquals(NfcClearResult.WriteUncertain, formatResult)
+        assertTrue(formatCancellation.mutationHasStarted())
+
+        val formatWriteBlocked = BlockingFormatable(IoBlock.WRITE)
+        val formatWriteCancellation = NfcIoCancellation()
+        val formatWriteResult = runCancelled(formatWriteBlocked.entered, formatWriteCancellation) {
+            NfcTagIo(FakeTechnologies(formatable = formatWriteBlocked))
+                .programAndVerify(FakeHandle, link, formatWriteCancellation)
+        }
+        assertEquals(NfcProgrammingResult.WriteUncertain, formatWriteResult)
+        assertTrue(formatWriteCancellation.mutationHasStarted())
     }
 
     @Test
@@ -261,7 +422,16 @@ class NdefAndQrCodecTest {
         ProjectKey.fromUuid(UUID.fromString("123e4567-e89b-12d3-a456-426614174000")),
     )
 
-    private data object FakeHandle : NfcTagHandle
+    private data object FakeHandle : NfcTagHandle {
+        override val presentationCorrelation = NfcPresentationCorrelation.create(byteArrayOf(1))
+    }
+
+    private data object NoCorrelationHandle : NfcTagHandle
+
+    private data class FakeHandleWithCorrelation(private val seed: Byte) : NfcTagHandle {
+        constructor(seed: Int) : this(seed.toByte())
+        override val presentationCorrelation = NfcPresentationCorrelation.create(byteArrayOf(seed))
+    }
 
     private class FakeTechnologies(
         var ndef: NdefConnection? = null,
@@ -303,5 +473,91 @@ class NdefAndQrCodecTest {
             formatted = message
         }
         override fun close() { events += "format-close" }
+    }
+
+    private enum class IoBlock { CONNECT, READ, WRITE }
+
+    private class BlockingNdef(
+        private val blockedAt: IoBlock,
+        var message: NdefMessage? = null,
+    ) : NdefConnection {
+        val events = mutableListOf<String>()
+        val entered = CountDownLatch(1)
+        private val released = CountDownLatch(1)
+        override val isWritable = true
+        override val maxSize = 4096
+
+        override fun connect() {
+            events += "ndef-connect"
+            blockIf(IoBlock.CONNECT)
+        }
+
+        override fun readMessage(): NdefMessage? {
+            events += "ndef-read"
+            blockIf(IoBlock.READ)
+            return message
+        }
+
+        override fun writeMessage(message: NdefMessage) {
+            events += "ndef-write"
+            this.message = message
+            blockIf(IoBlock.WRITE)
+        }
+
+        override fun close() {
+            events += "ndef-close"
+            released.countDown()
+        }
+
+        private fun blockIf(phase: IoBlock) {
+            if (blockedAt != phase) return
+            entered.countDown()
+            check(released.await(2, TimeUnit.SECONDS)) { "Timed out waiting for cancellation" }
+        }
+    }
+
+    private class BlockingFormatable(private val blockedAt: IoBlock) : NdefFormatableConnection {
+        val events = mutableListOf<String>()
+        val entered = CountDownLatch(1)
+        private val released = CountDownLatch(1)
+
+        override fun connect() {
+            events += "format-connect"
+            blockIf(IoBlock.CONNECT)
+        }
+
+        override fun format(message: NdefMessage) {
+            events += "format-write"
+            blockIf(IoBlock.WRITE)
+        }
+
+        override fun close() {
+            events += "format-close"
+            released.countDown()
+        }
+
+        private fun blockIf(phase: IoBlock) {
+            if (blockedAt != phase) return
+            entered.countDown()
+            check(released.await(2, TimeUnit.SECONDS)) { "Timed out waiting for cancellation" }
+        }
+    }
+
+    private fun <T> runCancelled(
+        entered: CountDownLatch,
+        cancellation: NfcIoCancellation,
+        operation: () -> T,
+    ): T {
+        val result = AtomicReference<T>()
+        val failure = AtomicReference<Throwable>()
+        val worker = thread(start = true) {
+            runCatching(operation).onSuccess(result::set).onFailure(failure::set)
+        }
+        assertTrue(entered.await(2, TimeUnit.SECONDS))
+        cancellation.cancel()
+        worker.join(2_000)
+        assertFalse(worker.isAlive)
+        failure.get()?.let { throw AssertionError("NFC I/O failed", it) }
+        return requireNotNull(result.get())
     }
 }

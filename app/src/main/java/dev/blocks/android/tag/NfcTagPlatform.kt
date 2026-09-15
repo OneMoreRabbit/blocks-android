@@ -9,17 +9,86 @@ import android.nfc.Tag
 import android.nfc.tech.Ndef
 import android.nfc.tech.NdefFormatable
 import android.os.Build
+import java.security.MessageDigest
 
 internal const val BLOCKS_NFC_READER_FLAGS = NfcAdapter.FLAG_READER_NFC_A or
     NfcAdapter.FLAG_READER_NFC_B or
     NfcAdapter.FLAG_READER_NFC_F or
     NfcAdapter.FLAG_READER_NFC_V
 
-internal interface NfcTagHandle
+/**
+ * Short-lived correlation for one physical tag presentation. It is never persisted or logged.
+ * A missing or changing Android tag identifier deliberately makes formatted-tag verification
+ * uncertain instead of allowing content on another copy to prove the original mutation.
+ */
+internal class NfcPresentationCorrelation private constructor(private val digest: ByteArray) {
+    override fun equals(other: Any?) = other is NfcPresentationCorrelation &&
+        MessageDigest.isEqual(digest, other.digest)
+
+    override fun hashCode() = digest.contentHashCode()
+    override fun toString() = "[redacted NFC presentation]"
+
+    companion object {
+        fun create(identifier: ByteArray): NfcPresentationCorrelation? {
+            if (identifier.isEmpty()) return null
+            val hash = MessageDigest.getInstance("SHA-256")
+            hash.update(identifier.copyOf())
+            return NfcPresentationCorrelation(hash.digest())
+        }
+    }
+}
+
+internal interface NfcTagHandle {
+    val presentationCorrelation: NfcPresentationCorrelation?
+        get() = null
+}
+
+/** Cancellation shared by Activity lifecycle ownership and the blocking NFC technology calls. */
+internal class NfcIoCancellation(private val mutationStillAllowed: () -> Boolean = { true }) {
+    private val lock = Any()
+    private var cancelled = false
+    private var mutationStarted = false
+    private var closeActiveConnection: (() -> Unit)? = null
+
+    fun isCancelled(): Boolean = synchronized(lock) { cancelled }
+
+    fun registerConnection(close: () -> Unit): Boolean = synchronized(lock) {
+        if (cancelled) false else {
+            closeActiveConnection = close
+            true
+        }
+    }
+
+    fun clearConnection() = synchronized(lock) {
+        closeActiveConnection = null
+    }
+
+    /** Atomically orders cancellation before, or mutation before, the first physical write. */
+    fun beginMutation(): Boolean {
+        val scopeAllowsMutation = runCatching(mutationStillAllowed).getOrDefault(false)
+        return synchronized(lock) {
+            if (cancelled || !scopeAllowsMutation) false else {
+                mutationStarted = true
+                true
+            }
+        }
+    }
+
+    fun cancel() {
+        val close = synchronized(lock) {
+            cancelled = true
+            closeActiveConnection
+        }
+        runCatching { close?.invoke() }
+    }
+
+    fun mutationHasStarted(): Boolean = synchronized(lock) { mutationStarted }
+}
 
 internal sealed interface NfcProgrammingResult {
     data class Verified(val replacedAddress: BlocksNavigationAddress? = null) : NfcProgrammingResult
-    data object AwaitingReadBack : NfcProgrammingResult
+    data class AwaitingReadBack(val correlation: NfcPresentationCorrelation) : NfcProgrammingResult
+    data object Cancelled : NfcProgrammingResult
     data object Unsupported : NfcProgrammingResult
     data object ReadOnly : NfcProgrammingResult
     data object TooSmall : NfcProgrammingResult
@@ -30,7 +99,8 @@ internal sealed interface NfcProgrammingResult {
 
 internal sealed interface NfcClearResult {
     data class Verified(val erasedAddress: BlocksNavigationAddress? = null) : NfcClearResult
-    data object AwaitingReadBack : NfcClearResult
+    data class AwaitingReadBack(val correlation: NfcPresentationCorrelation) : NfcClearResult
+    data object Cancelled : NfcClearResult
     data object Unsupported : NfcClearResult
     data object ReadOnly : NfcClearResult
     data object Removed : NfcClearResult
@@ -46,10 +116,23 @@ internal interface NfcTagPlatform {
     fun programAndVerify(
         handle: NfcTagHandle,
         address: BlocksNavigationAddress,
+        cancellation: NfcIoCancellation = NfcIoCancellation(),
     ): NfcProgrammingResult
-    fun verifyWritten(handle: NfcTagHandle, address: BlocksNavigationAddress): NfcProgrammingResult
-    fun clearAndVerify(handle: NfcTagHandle): NfcClearResult
-    fun verifyCleared(handle: NfcTagHandle): NfcClearResult
+    fun verifyWritten(
+        handle: NfcTagHandle,
+        address: BlocksNavigationAddress,
+        expectedCorrelation: NfcPresentationCorrelation,
+        cancellation: NfcIoCancellation = NfcIoCancellation(),
+    ): NfcProgrammingResult
+    fun clearAndVerify(
+        handle: NfcTagHandle,
+        cancellation: NfcIoCancellation = NfcIoCancellation(),
+    ): NfcClearResult
+    fun verifyCleared(
+        handle: NfcTagHandle,
+        expectedCorrelation: NfcPresentationCorrelation,
+        cancellation: NfcIoCancellation = NfcIoCancellation(),
+    ): NfcClearResult
 }
 
 internal class AndroidNfcTagPlatform(private val activity: Activity) : NfcTagPlatform {
@@ -81,19 +164,31 @@ internal class AndroidNfcTagPlatform(private val activity: Activity) : NfcTagPla
     override fun programAndVerify(
         handle: NfcTagHandle,
         address: BlocksNavigationAddress,
-    ): NfcProgrammingResult = io.programAndVerify(handle, address)
+        cancellation: NfcIoCancellation,
+    ): NfcProgrammingResult = io.programAndVerify(handle, address, cancellation)
 
     override fun verifyWritten(
         handle: NfcTagHandle,
         address: BlocksNavigationAddress,
-    ): NfcProgrammingResult = io.verifyWritten(handle, address)
+        expectedCorrelation: NfcPresentationCorrelation,
+        cancellation: NfcIoCancellation,
+    ): NfcProgrammingResult = io.verifyWritten(handle, address, expectedCorrelation, cancellation)
 
-    override fun clearAndVerify(handle: NfcTagHandle): NfcClearResult = io.clearAndVerify(handle)
+    override fun clearAndVerify(
+        handle: NfcTagHandle,
+        cancellation: NfcIoCancellation,
+    ): NfcClearResult = io.clearAndVerify(handle, cancellation)
 
-    override fun verifyCleared(handle: NfcTagHandle): NfcClearResult = io.verifyCleared(handle)
+    override fun verifyCleared(
+        handle: NfcTagHandle,
+        expectedCorrelation: NfcPresentationCorrelation,
+        cancellation: NfcIoCancellation,
+    ): NfcClearResult = io.verifyCleared(handle, expectedCorrelation, cancellation)
 }
 
-private data class AndroidNfcTagHandle(val tag: Tag) : NfcTagHandle
+private data class AndroidNfcTagHandle(val tag: Tag) : NfcTagHandle {
+    override val presentationCorrelation = NfcPresentationCorrelation.create(tag.id)
+}
 
 internal interface NdefConnection {
     val isWritable: Boolean
@@ -147,17 +242,24 @@ internal class NfcTagIo(private val technologies: NfcTechnologyFactory) {
     fun programAndVerify(
         handle: NfcTagHandle,
         address: BlocksNavigationAddress,
+        cancellation: NfcIoCancellation = NfcIoCancellation(),
     ): NfcProgrammingResult {
+        if (cancellation.isCancelled()) return NfcProgrammingResult.Cancelled
         val message = NdefLocatorCodec.message(address)
         technologies.ndef(handle)?.let { ndef ->
             var writeStarted = false
             return try {
+                if (!cancellation.registerConnection(ndef::close)) return NfcProgrammingResult.Cancelled
                 ndef.connect()
+                if (cancellation.isCancelled()) return NfcProgrammingResult.Cancelled
                 val replacedAddress = NdefLocatorCodec.parse(ndef.readMessage())
+                if (cancellation.isCancelled()) return NfcProgrammingResult.Cancelled
                 if (!ndef.isWritable) return NfcProgrammingResult.ReadOnly
                 if (ndef.maxSize < message.toByteArray().size) return NfcProgrammingResult.TooSmall
+                if (!cancellation.beginMutation()) return NfcProgrammingResult.Cancelled
                 writeStarted = true
                 ndef.writeMessage(message)
+                if (cancellation.isCancelled()) return NfcProgrammingResult.WriteUncertain
                 if (NdefLocatorCodec.parse(ndef.readMessage()) == address) {
                     NfcProgrammingResult.Verified(replacedAddress)
                 } else {
@@ -166,19 +268,26 @@ internal class NfcTagIo(private val technologies: NfcTechnologyFactory) {
             } catch (_: Exception) {
                 if (writeStarted) NfcProgrammingResult.WriteUncertain else NfcProgrammingResult.Removed
             } finally {
+                cancellation.clearConnection()
                 runCatching(ndef::close)
             }
         }
         val formatable = technologies.formatable(handle) ?: return NfcProgrammingResult.Unsupported
         var formatStarted = false
         return try {
+            if (!cancellation.registerConnection(formatable::close)) return NfcProgrammingResult.Cancelled
             formatable.connect()
+            if (cancellation.isCancelled()) return NfcProgrammingResult.Cancelled
+            if (!cancellation.beginMutation()) return NfcProgrammingResult.Cancelled
             formatStarted = true
             formatable.format(message)
-            NfcProgrammingResult.AwaitingReadBack
+            if (cancellation.isCancelled()) return NfcProgrammingResult.WriteUncertain
+            handle.presentationCorrelation?.let(NfcProgrammingResult::AwaitingReadBack)
+                ?: NfcProgrammingResult.WriteUncertain
         } catch (_: Exception) {
             if (formatStarted) NfcProgrammingResult.WriteUncertain else NfcProgrammingResult.Removed
         } finally {
+            cancellation.clearConnection()
             runCatching(formatable::close)
         }
     }
@@ -186,10 +295,18 @@ internal class NfcTagIo(private val technologies: NfcTechnologyFactory) {
     fun verifyWritten(
         handle: NfcTagHandle,
         address: BlocksNavigationAddress,
+        expectedCorrelation: NfcPresentationCorrelation,
+        cancellation: NfcIoCancellation = NfcIoCancellation(),
     ): NfcProgrammingResult {
+        if (cancellation.isCancelled()) return NfcProgrammingResult.Cancelled
+        if (handle.presentationCorrelation != expectedCorrelation) {
+            return NfcProgrammingResult.AwaitingReadBack(expectedCorrelation)
+        }
         val ndef = technologies.ndef(handle) ?: return NfcProgrammingResult.WriteUncertain
         return try {
+            if (!cancellation.registerConnection(ndef::close)) return NfcProgrammingResult.Cancelled
             ndef.connect()
+            if (cancellation.isCancelled()) return NfcProgrammingResult.Cancelled
             if (NdefLocatorCodec.parse(ndef.readMessage()) == address) {
                 NfcProgrammingResult.Verified()
             } else {
@@ -198,19 +315,29 @@ internal class NfcTagIo(private val technologies: NfcTechnologyFactory) {
         } catch (_: Exception) {
             NfcProgrammingResult.WriteUncertain
         } finally {
+            cancellation.clearConnection()
             runCatching(ndef::close)
         }
     }
 
-    fun clearAndVerify(handle: NfcTagHandle): NfcClearResult {
+    fun clearAndVerify(
+        handle: NfcTagHandle,
+        cancellation: NfcIoCancellation = NfcIoCancellation(),
+    ): NfcClearResult {
+        if (cancellation.isCancelled()) return NfcClearResult.Cancelled
         technologies.ndef(handle)?.let { ndef ->
             var writeStarted = false
             return try {
+                if (!cancellation.registerConnection(ndef::close)) return NfcClearResult.Cancelled
                 ndef.connect()
+                if (cancellation.isCancelled()) return NfcClearResult.Cancelled
                 val erasedAddress = NdefLocatorCodec.parse(ndef.readMessage())
+                if (cancellation.isCancelled()) return NfcClearResult.Cancelled
                 if (!ndef.isWritable) return NfcClearResult.ReadOnly
+                if (!cancellation.beginMutation()) return NfcClearResult.Cancelled
                 writeStarted = true
                 ndef.writeMessage(NdefLocatorCodec.emptyMessage())
+                if (cancellation.isCancelled()) return NfcClearResult.WriteUncertain
                 if (NdefLocatorCodec.isEmpty(ndef.readMessage())) {
                     NfcClearResult.Verified(erasedAddress)
                 } else {
@@ -219,27 +346,44 @@ internal class NfcTagIo(private val technologies: NfcTechnologyFactory) {
             } catch (_: Exception) {
                 if (writeStarted) NfcClearResult.WriteUncertain else NfcClearResult.Removed
             } finally {
+                cancellation.clearConnection()
                 runCatching(ndef::close)
             }
         }
         val formatable = technologies.formatable(handle) ?: return NfcClearResult.Unsupported
         var formatStarted = false
         return try {
+            if (!cancellation.registerConnection(formatable::close)) return NfcClearResult.Cancelled
             formatable.connect()
+            if (cancellation.isCancelled()) return NfcClearResult.Cancelled
+            if (!cancellation.beginMutation()) return NfcClearResult.Cancelled
             formatStarted = true
             formatable.format(NdefLocatorCodec.emptyMessage())
-            NfcClearResult.AwaitingReadBack
+            if (cancellation.isCancelled()) return NfcClearResult.WriteUncertain
+            handle.presentationCorrelation?.let(NfcClearResult::AwaitingReadBack)
+                ?: NfcClearResult.WriteUncertain
         } catch (_: Exception) {
             if (formatStarted) NfcClearResult.WriteUncertain else NfcClearResult.Removed
         } finally {
+            cancellation.clearConnection()
             runCatching(formatable::close)
         }
     }
 
-    fun verifyCleared(handle: NfcTagHandle): NfcClearResult {
+    fun verifyCleared(
+        handle: NfcTagHandle,
+        expectedCorrelation: NfcPresentationCorrelation,
+        cancellation: NfcIoCancellation = NfcIoCancellation(),
+    ): NfcClearResult {
+        if (cancellation.isCancelled()) return NfcClearResult.Cancelled
+        if (handle.presentationCorrelation != expectedCorrelation) {
+            return NfcClearResult.AwaitingReadBack(expectedCorrelation)
+        }
         val ndef = technologies.ndef(handle) ?: return NfcClearResult.WriteUncertain
         return try {
+            if (!cancellation.registerConnection(ndef::close)) return NfcClearResult.Cancelled
             ndef.connect()
+            if (cancellation.isCancelled()) return NfcClearResult.Cancelled
             if (NdefLocatorCodec.isEmpty(ndef.readMessage())) {
                 NfcClearResult.Verified()
             } else {
@@ -248,6 +392,7 @@ internal class NfcTagIo(private val technologies: NfcTechnologyFactory) {
         } catch (_: Exception) {
             NfcClearResult.WriteUncertain
         } finally {
+            cancellation.clearConnection()
             runCatching(ndef::close)
         }
     }

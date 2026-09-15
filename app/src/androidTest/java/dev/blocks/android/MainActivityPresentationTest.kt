@@ -43,6 +43,7 @@ import dev.blocks.android.project.PhysicalBlock
 import dev.blocks.android.project.ParkingHistoryPage
 import dev.blocks.android.project.ProjectCacheState
 import dev.blocks.android.project.ProjectLifecycle
+import dev.blocks.android.project.ProjectIdentityMapping
 import dev.blocks.android.project.ProjectMutation
 import dev.blocks.android.project.ProjectMutationStatus
 import dev.blocks.android.project.ProjectMutationType
@@ -71,6 +72,8 @@ import dev.blocks.android.tag.LocalBlockState
 import dev.blocks.android.tag.LocalTagResolution
 import dev.blocks.android.tag.NdefLocatorCodec
 import dev.blocks.android.tag.NfcClearResult
+import dev.blocks.android.tag.NfcIoCancellation
+import dev.blocks.android.tag.NfcPresentationCorrelation
 import dev.blocks.android.tag.NfcProgrammingResult
 import dev.blocks.android.tag.NfcTagHandle
 import dev.blocks.android.tag.NfcTagPlatform
@@ -388,8 +391,35 @@ class MainActivityPresentationTest {
     }
 
     @Test
+    fun cancelAfterCaptureDuringQueuedPreMutationIoPreventsPhysicalWrite() {
+        nfc.programEntered = CountDownLatch(1)
+        nfc.allowProgram = CountDownLatch(1)
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { it.button("Active project").performClick() }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS).performClick()
+                activity.selectDialogItem("Set Tag")
+            }
+            waitUntil { nfc.readerActive }
+            nfc.tap()
+            assertTrue(nfc.programEntered!!.await(2, TimeUnit.SECONDS))
+
+            scenario.onActivity { it.dialogButton("Cancel").performClick() }
+            waitUntil { !nfc.readerActive }
+
+            assertEquals(1, nfc.programInvocations)
+            assertEquals(0, nfc.programCalls)
+            assertTrue(workspace.cache.localBlocks.isEmpty())
+            assertTrue(workspace.cache.localBlockOperations.isEmpty())
+        }
+    }
+
+    @Test
     fun formatableTagKeepsReaderActiveUntilSecondPresentationReadBack() {
-        nfc.result = NfcProgrammingResult.AwaitingReadBack
+        nfc.result = NfcProgrammingResult.AwaitingReadBack(TAG_A_CORRELATION)
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             scenario.onActivity { it.button("Active project").performClick() }
@@ -406,6 +436,11 @@ class MainActivityPresentationTest {
             assertEquals(1, nfc.programCalls)
 
             nfc.result = NfcProgrammingResult.Verified()
+            nfc.tap(TAG_B_CORRELATION)
+            Thread.sleep(100)
+            assertEquals(0, nfc.verifyWriteCalls)
+            assertTrue(nfc.readerActive)
+
             nfc.tap()
             waitFor(scenario) { it.dialogTexts().any { text -> text.contains("written and verified") } }
             assertEquals(1, nfc.programCalls)
@@ -452,12 +487,151 @@ class MainActivityPresentationTest {
 
             scenario.moveToState(Lifecycle.State.CREATED)
             assertFalse(nfc.readerActive)
-            nfc.allowProgram!!.countDown()
-            waitUntil { nfc.programCalls == 1 }
+            waitUntil { nfc.programInvocations == 1 }
             Thread.sleep(100)
 
+            assertEquals(0, nfc.programCalls)
             assertEquals(LocalBlockState.ACTIVE, workspace.cache.localBlocks.single().state)
             assertTrue(workspace.cache.localBlockOperations.isEmpty())
+        }
+    }
+
+    @Test
+    fun logicalProjectRemapKeepsAttemptValidAndRetiresLegacyOnlyInCapturedTenant() {
+        val legacyToken = OpaqueTagToken.fromBytes(ByteArray(32) { (it + 41).toByte() })
+        workspace.cache = workspace.cache.copy(
+            localBlocks = listOf(
+                LocalBlockRecord(
+                    clientBlockId = "remap-legacy-block",
+                    token = legacyToken,
+                    label = "Legacy",
+                    state = LocalBlockState.ACTIVE,
+                    intendedProjectId = PROJECT_ID,
+                    boundProjectId = PROJECT_ID,
+                    createdAt = NOW,
+                    verifiedAt = NOW,
+                    activationMedium = TagActivationMedium.NFC,
+                ),
+            ),
+        )
+        nfc.result = NfcProgrammingResult.Verified(TagLocator.create(legacyToken))
+        nfc.programEntered = CountDownLatch(1)
+        nfc.allowProgram = CountDownLatch(1)
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { it.button("Active project").performClick() }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS).performClick()
+                activity.selectDialogItem("Set Tag")
+            }
+            waitUntil { nfc.readerActive }
+            nfc.tap()
+            assertTrue(nfc.programEntered!!.await(2, TimeUnit.SECONDS))
+
+            workspace.remapCurrentProject(CANONICAL_PROJECT_ID)
+            presentationController.synchronize()
+            nfc.allowProgram!!.countDown()
+
+            waitFor(scenario) { it.dialogTexts().any { text -> text.contains("written and verified") } }
+            assertEquals(CANONICAL_PROJECT_ID, presentationController.state.projectPage?.project?.id)
+            assertEquals(LocalBlockState.UNBOUND, workspace.cacheFor(TENANT_ID).localBlocks.single().state)
+            assertEquals(
+                CANONICAL_PROJECT_ID,
+                workspace.cacheFor(TENANT_ID).projectLinks.single().projectId,
+            )
+        }
+    }
+
+    @Test
+    fun tenantChangeBeforeMutationCancelsAttemptAndCannotRetireLegacyInReplacementRealm() {
+        val legacyToken = OpaqueTagToken.fromBytes(ByteArray(32) { (it + 51).toByte() })
+        workspace.cache = workspace.cache.copy(
+            localBlocks = listOf(
+                LocalBlockRecord(
+                    clientBlockId = "scope-change-legacy-block",
+                    token = legacyToken,
+                    label = "Legacy",
+                    state = LocalBlockState.ACTIVE,
+                    intendedProjectId = PROJECT_ID,
+                    boundProjectId = PROJECT_ID,
+                    createdAt = NOW,
+                    verifiedAt = NOW,
+                    activationMedium = TagActivationMedium.NFC,
+                ),
+            ),
+        )
+        nfc.result = NfcProgrammingResult.Verified(TagLocator.create(legacyToken))
+        nfc.programEntered = CountDownLatch(1)
+        nfc.allowProgram = CountDownLatch(1)
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { it.button("Active project").performClick() }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS).performClick()
+                activity.selectDialogItem("Set Tag")
+            }
+            waitUntil { nfc.readerActive }
+            nfc.tap()
+            assertTrue(nfc.programEntered!!.await(2, TimeUnit.SECONDS))
+
+            presentationController.activateAuthenticated(Session(OTHER_TENANT_ID, "other", ACCOUNT_B))
+            nfc.allowProgram!!.countDown()
+            waitUntil { !nfc.readerActive }
+
+            assertEquals(0, nfc.programCalls)
+            assertEquals(LocalBlockState.ACTIVE, workspace.cacheFor(TENANT_ID).localBlocks.single().state)
+            assertTrue(workspace.cacheFor(TENANT_ID).localBlockOperations.isEmpty())
+            assertTrue(workspace.cacheFor(OTHER_TENANT_ID).localBlockOperations.isEmpty())
+        }
+    }
+
+    @Test
+    fun projectChangeBeforeMutationCancelsAttemptAndCannotRetireLegacy() {
+        val legacyToken = OpaqueTagToken.fromBytes(ByteArray(32) { (it + 61).toByte() })
+        workspace.cache = workspace.cache.copy(
+            localBlocks = listOf(
+                LocalBlockRecord(
+                    clientBlockId = "project-change-legacy-block",
+                    token = legacyToken,
+                    label = "Legacy",
+                    state = LocalBlockState.ACTIVE,
+                    intendedProjectId = PROJECT_ID,
+                    boundProjectId = PROJECT_ID,
+                    createdAt = NOW,
+                    verifiedAt = NOW,
+                    activationMedium = TagActivationMedium.NFC,
+                ),
+            ),
+        )
+        workspace.addProject(OTHER_PROJECT_ID, OTHER_PROJECT_KEY, "Other project")
+        nfc.result = NfcProgrammingResult.Verified(TagLocator.create(legacyToken))
+        nfc.programEntered = CountDownLatch(1)
+        nfc.allowProgram = CountDownLatch(1)
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { it.button("Active project").performClick() }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS).performClick()
+                activity.selectDialogItem("Set Tag")
+            }
+            waitUntil { nfc.readerActive }
+            nfc.tap()
+            assertTrue(nfc.programEntered!!.await(2, TimeUnit.SECONDS))
+
+            presentationController.openProject(OTHER_PROJECT_ID)
+            nfc.allowProgram!!.countDown()
+            waitUntil { !nfc.readerActive }
+
+            assertEquals(0, nfc.programCalls)
+            assertEquals(LocalBlockState.ACTIVE, workspace.cache.localBlocks.single().state)
+            assertTrue(workspace.cache.localBlockOperations.isEmpty())
+            assertEquals(OTHER_PROJECT_ID, presentationController.state.projectPage?.project?.id)
         }
     }
 
@@ -1512,6 +1686,7 @@ class MainActivityPresentationTest {
         @Volatile
         var clearResult: NfcClearResult = NfcClearResult.Verified()
         var programCalls = 0
+        var programInvocations = 0
         var verifyWriteCalls = 0
         var clearCalls = 0
         var readerWasActiveDuringProgram = false
@@ -1532,36 +1707,60 @@ class MainActivityPresentationTest {
         override fun programAndVerify(
             handle: NfcTagHandle,
             address: BlocksNavigationAddress,
+            cancellation: NfcIoCancellation,
         ): NfcProgrammingResult {
-            programCalls += 1
+            programInvocations += 1
             readerWasActiveDuringProgram = readerActive
-            programmedAddresses += address
             programEntered?.countDown()
-            allowProgram?.let { check(it.await(2, TimeUnit.SECONDS)) { "Timed out waiting to finish NFC I/O" } }
+            allowProgram?.let { release ->
+                if (!cancellation.registerConnection(release::countDown)) {
+                    return NfcProgrammingResult.Cancelled
+                }
+                check(release.await(2, TimeUnit.SECONDS)) { "Timed out waiting to finish NFC I/O" }
+                cancellation.clearConnection()
+            }
+            if (!cancellation.beginMutation()) return NfcProgrammingResult.Cancelled
+            programCalls += 1
+            programmedAddresses += address
             return result
         }
 
         override fun verifyWritten(
             handle: NfcTagHandle,
             address: BlocksNavigationAddress,
+            expectedCorrelation: NfcPresentationCorrelation,
+            cancellation: NfcIoCancellation,
         ): NfcProgrammingResult {
+            if (handle.presentationCorrelation != expectedCorrelation) {
+                return NfcProgrammingResult.AwaitingReadBack(expectedCorrelation)
+            }
             verifyWriteCalls += 1
             return result
         }
 
-        override fun clearAndVerify(handle: NfcTagHandle): NfcClearResult {
+        override fun clearAndVerify(
+            handle: NfcTagHandle,
+            cancellation: NfcIoCancellation,
+        ): NfcClearResult {
+            if (!cancellation.beginMutation()) return NfcClearResult.Cancelled
             clearCalls += 1
             return clearResult
         }
 
-        override fun verifyCleared(handle: NfcTagHandle): NfcClearResult = clearResult
+        override fun verifyCleared(
+            handle: NfcTagHandle,
+            expectedCorrelation: NfcPresentationCorrelation,
+            cancellation: NfcIoCancellation,
+        ): NfcClearResult = clearResult
 
-        fun tap() {
+        fun tap(correlation: NfcPresentationCorrelation = TAG_A_CORRELATION) {
             val current = checkNotNull(callback)
-            current(FakeNfcTagHandle)
+            current(FakeNfcTagHandle(correlation))
         }
 
-        private data object FakeNfcTagHandle : NfcTagHandle
+        private data class FakeNfcTagHandle(
+            override val presentationCorrelation: NfcPresentationCorrelation,
+        ) : NfcTagHandle
     }
 
     private class FakeIdentity : IdentityProvider {
@@ -1648,6 +1847,62 @@ class MainActivityPresentationTest {
         val mutations = mutableListOf<String>()
         val preparedTagTokens = mutableListOf<OpaqueTagToken>()
 
+        @Synchronized
+        fun cacheFor(tenantId: String): ProjectCacheState = caches[tenantId] ?: emptyCache()
+
+        @Synchronized
+        fun remapCurrentProject(serverId: String) {
+            val existing = cache.pages.single()
+            val provisionalId = existing.project.id
+            val remappedProject = existing.project.copy(id = serverId)
+            cache = cache.copy(
+                activeProjects = cache.activeProjects.map {
+                    if (it.id == provisionalId) it.copy(id = serverId) else it
+                },
+                archivedProjects = cache.archivedProjects.map {
+                    if (it.id == provisionalId) it.copy(id = serverId) else it
+                },
+                pages = cache.pages.map { page ->
+                    if (page.project.id == provisionalId) {
+                        page.copy(
+                            project = remappedProject,
+                            notes = page.notes.copy(projectId = serverId),
+                            newestParking = page.newestParking?.copy(projectId = serverId),
+                        )
+                    } else {
+                        page
+                    }
+                },
+                parkingRecords = cache.parkingRecords.map {
+                    if (it.projectId == provisionalId) it.copy(projectId = serverId) else it
+                },
+                projectIdMappings = cache.projectIdMappings + ProjectIdentityMapping(provisionalId, serverId),
+                projectLinks = cache.projectLinks.map {
+                    if (it.projectId == provisionalId) it.copy(projectId = serverId) else it
+                },
+                localBlocks = cache.localBlocks.map { block ->
+                    block.copy(
+                        intendedProjectId = if (block.intendedProjectId == provisionalId) serverId else block.intendedProjectId,
+                        boundProjectId = if (block.boundProjectId == provisionalId) serverId else block.boundProjectId,
+                    )
+                },
+            )
+        }
+
+        @Synchronized
+        fun addProject(projectId: String, key: ProjectKey, name: String) {
+            val summary = project().copy(id = projectId, name = name)
+            cache = cache.copy(
+                activeProjects = cache.activeProjects + summary,
+                pages = cache.pages + ProjectPage(
+                    summary,
+                    ProjectNotes(projectId, "", 1, NOW),
+                    null,
+                ),
+                projectLinks = cache.projectLinks + ProjectLinkIdentity(projectId, key),
+            )
+        }
+
         override fun activate(session: Session) {
             activeTenantId = session.tenantId
             activatedTenants += session.tenantId
@@ -1670,7 +1925,7 @@ class MainActivityPresentationTest {
         override fun archivedProjects(session: Session) = cache.archivedProjects
         override fun projectPage(session: Session, projectId: String): ProjectPage {
             pageCalls += 1
-            return cache.pages.single()
+            return cache.pages.single { it.project.id == projectId }
         }
         override fun parkingHistory(
             session: Session,
@@ -2157,8 +2412,13 @@ class MainActivityPresentationTest {
         private const val TENANT_ID = "00000000-0000-0000-0000-000000000011"
         private const val OTHER_TENANT_ID = "00000000-0000-0000-0000-000000000099"
         private const val PROJECT_ID = "00000000-0000-0000-0000-000000000012"
+        private const val CANONICAL_PROJECT_ID = "00000000-0000-0000-0000-000000000014"
+        private const val OTHER_PROJECT_ID = "00000000-0000-0000-0000-000000000015"
+        private val OTHER_PROJECT_KEY = ProjectKey.parse("00000000-0000-0000-0000-000000000016")!!
         private val PROJECT_KEY = ProjectKey.parse("00000000-0000-0000-0000-000000000013")!!
         private val PROJECT_LINK = ProjectLink.create(PROJECT_KEY)
+        private val TAG_A_CORRELATION = NfcPresentationCorrelation.create(byteArrayOf(1))!!
+        private val TAG_B_CORRELATION = NfcPresentationCorrelation.create(byteArrayOf(2))!!
         private const val NOW = "2026-09-07T10:00:00Z"
         private val ACCOUNT_A = AccountIdentity("https://accounts.google.com", "account-a")
         private val ACCOUNT_B = AccountIdentity("https://accounts.google.com", "account-b")
