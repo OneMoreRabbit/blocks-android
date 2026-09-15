@@ -52,9 +52,9 @@ import java.math.BigInteger
 import java.time.Instant
 
 /**
- * Encrypted local-first workspace. UI-facing calls commit a complete local projection,
- * its draft identity, and the durable command before returning. Only [backgroundSync] performs
- * transport, so every ordinary action remains available with an empty cache and no API.
+ * Tenant-local workspace. UI-facing calls atomically commit only the affected normalized rows
+ * and durable command before returning. Only [backgroundSync] performs transport, so every
+ * ordinary action remains available with an empty cache and no API.
  */
 class ProjectSyncRepository(
     private val service: ProjectService,
@@ -67,12 +67,15 @@ class ProjectSyncRepository(
 ) : ProjectWorkspace {
     @Volatile
     private var activeTenantId: String? = null
+    @Volatile
+    private var activeStateCache: TenantSyncState? = null
     private val backgroundLock = Any()
     private val backgroundSaveContext = ThreadLocal<BackgroundSaveContext?>()
 
     @Synchronized
     override fun activate(session: Session) {
         activeTenantId = session.tenantId
+        activeStateCache = syncStore.loadSyncState(session.tenantId)
         migrateProjectDrafts(session)
         val state = activeState(session)
         val withProjectLinks = state.withProjectLinks()
@@ -85,7 +88,10 @@ class ProjectSyncRepository(
 
     @Synchronized
     override fun deactivate(session: Session) {
-        if (activeTenantId == session.tenantId) activeTenantId = null
+        if (activeTenantId == session.tenantId) {
+            activeTenantId = null
+            activeStateCache = null
+        }
     }
 
     @Synchronized
@@ -1020,7 +1026,10 @@ class ProjectSyncRepository(
 
     @Synchronized
     override fun clearLocalState(session: Session) {
-        if (activeTenantId == session.tenantId) activeTenantId = null
+        if (activeTenantId == session.tenantId) {
+            activeTenantId = null
+            activeStateCache = null
+        }
         purge(session.tenantId)
     }
 
@@ -1074,8 +1083,9 @@ class ProjectSyncRepository(
         val projected = projection(state)
         val updated = projected.copy(
             projectCache = projected.projectCache.copy(commands = projected.projectCache.commands + command),
-        )
-        save(session, updated)
+        ).withProjectLinks()
+        syncStore.saveProjectMutation(session.tenantId, state, updated, command.type)
+        activeStateCache = updated
         return updated.toResult()
     }
 
@@ -1818,7 +1828,7 @@ class ProjectSyncRepository(
 
     private fun activeState(session: Session): TenantSyncState {
         checkActive(session)
-        return syncStore.loadSyncState(session.tenantId).also { state ->
+        return (activeStateCache ?: syncStore.loadSyncState(session.tenantId).also { activeStateCache = it }).also { state ->
             require(state.projectCache.projectCovers.all { it.tenantId == session.tenantId }) {
                 "Encrypted cover metadata crosses a tenant boundary"
             }
@@ -1829,14 +1839,17 @@ class ProjectSyncRepository(
         val stateWithLinks = state.withProjectLinks()
         val context = backgroundSaveContext.get()
         if (context == null) {
-            syncStore.saveSyncState(session.tenantId, stateWithLinks)
+            val previous = activeState(session)
+            syncStore.saveSyncState(session.tenantId, previous, stateWithLinks)
+            activeStateCache = stateWithLinks
             return stateWithLinks
         }
         return synchronized(this) {
             checkActive(session)
-            val current = syncStore.loadSyncState(session.tenantId)
+            val current = activeState(session)
             val merged = mergeConcurrentLocalChanges(context.baseline, stateWithLinks, current).withProjectLinks()
-            syncStore.saveSyncState(session.tenantId, merged)
+            syncStore.saveSyncState(session.tenantId, current, merged)
+            activeStateCache = merged
             context.baseline = merged
             merged
         }

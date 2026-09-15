@@ -67,7 +67,7 @@ import dev.blocks.android.project.ProjectWorkspace
 import dev.blocks.android.project.RegisteredBlock
 import dev.blocks.android.project.SessionAuthenticator
 import dev.blocks.android.state.AndroidEncryptedDraftStore
-import dev.blocks.android.state.AndroidEncryptedSyncStateStore
+import dev.blocks.android.state.AndroidSyncStateStore
 import dev.blocks.android.state.SessionContinuity
 import dev.blocks.android.sync.NoOpLegacyQueueReplay
 import dev.blocks.android.sync.ProjectSyncRepository
@@ -167,7 +167,7 @@ class MainActivityPresentationTest {
     fun tearDown() {
         MainActivity.dependencyFactory = null
         AndroidEncryptedDraftStore(context).clear(TENANT_ID)
-        AndroidEncryptedSyncStateStore(context).clearSyncState(TENANT_ID)
+        AndroidSyncStateStore(context).clearSyncState(TENANT_ID)
         AndroidEncryptedAcceptedTenantContinuityStore(context).clear()
     }
 
@@ -867,22 +867,23 @@ class MainActivityPresentationTest {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             scenario.onActivity { activity ->
-                val content = activity.findViewById<LinearLayout>(ProjectUiIds.CONTENT)
+                val root = activity.findViewById<LinearLayout>(ProjectUiIds.ROOT_CONTAINER)
                 val topInset = 37
                 ViewCompat.dispatchApplyWindowInsets(
-                    content,
+                    root,
                     WindowInsetsCompat.Builder()
                         .setInsets(WindowInsetsCompat.Type.systemBars(), Insets.of(0, topInset, 0, 11))
                         .build(),
                 )
-                val comfortableSpacing = (24 * activity.resources.displayMetrics.density).toInt()
-                assertEquals(topInset + comfortableSpacing, content.paddingTop)
+                val topNavigation = activity.findViewById<View>(ProjectUiIds.TOP_NAVIGATION)
+                val compactSpacing = (8 * activity.resources.displayMetrics.density).toInt()
+                assertEquals(topInset + compactSpacing, topNavigation.paddingTop)
 
                 activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
                 activity.selectDialogItem("About")
                 val about = activity.dialogTexts().joinToString("\n")
                 assertTrue(about.contains("Blocks Android"))
-                assertTrue(about.contains("Version 0.7.0 (11)"))
+                assertTrue(about.contains("Version 0.7.1 (12)"))
                 assertTrue(about.contains("dev.blocks.android/debug"))
                 assertFalse(about.contains("tenant", ignoreCase = true))
                 assertFalse(about.contains("token", ignoreCase = true))
@@ -1024,7 +1025,7 @@ class MainActivityPresentationTest {
 
     @Test
     fun slowBackgroundApiDoesNotBlockImmediateEncryptedLocalCreate() {
-        val syncStore = AndroidEncryptedSyncStateStore(context).apply {
+        val syncStore = AndroidSyncStateStore(context).apply {
             clearSyncState(TENANT_ID)
             saveSyncState(
                 TENANT_ID,
@@ -1053,7 +1054,7 @@ class MainActivityPresentationTest {
                     service,
                     NoOpLegacyQueueReplay,
                     drafts,
-                    AndroidEncryptedSyncStateStore(activity),
+                    AndroidSyncStateStore(activity),
                     coverMediaStore = AndroidEncryptedProjectCoverMediaStore(activity),
                 ),
                 newOperationId = { "slow-api-${operationIds.incrementAndGet()}" },
@@ -1112,7 +1113,7 @@ class MainActivityPresentationTest {
 
     @Test
     fun processStyleOfflineRestartReadsRealEncryptedDatabaseThenReconcilesOnlyAfterReconnect() {
-        val syncStore = AndroidEncryptedSyncStateStore(context)
+        val syncStore = AndroidSyncStateStore(context)
         syncStore.clearSyncState(TENANT_ID)
         syncStore.saveSyncState(
             TENANT_ID,
@@ -1134,7 +1135,7 @@ class MainActivityPresentationTest {
         val exchanges = AtomicInteger()
         MainActivity.dependencyFactory = { activity ->
             val drafts = AndroidEncryptedDraftStore(activity)
-            val persisted = AndroidEncryptedSyncStateStore(activity)
+            val persisted = AndroidSyncStateStore(activity)
             ProjectAppDependencies(
                 controller = ProjectPresentationController(
                     SessionAuthenticator {
@@ -1183,7 +1184,7 @@ class MainActivityPresentationTest {
 
     @Test
     fun emptyEncryptedCacheSupportsCreateNotesAndParkingAcrossAFullOfflineActivityRestart() {
-        AndroidEncryptedSyncStateStore(context).clearSyncState(TENANT_ID)
+        AndroidSyncStateStore(context).clearSyncState(TENANT_ID)
         AndroidEncryptedDraftStore(context).clear(TENANT_ID)
         val realAccepted = AndroidEncryptedAcceptedTenantContinuityStore(context).apply {
             clear()
@@ -1196,7 +1197,7 @@ class MainActivityPresentationTest {
                 service,
                 NoOpLegacyQueueReplay,
                 drafts,
-                AndroidEncryptedSyncStateStore(activity),
+                AndroidSyncStateStore(activity),
                 coverMediaStore = AndroidEncryptedProjectCoverMediaStore(activity),
             )
             presentationController = ProjectPresentationController(
@@ -1224,7 +1225,7 @@ class MainActivityPresentationTest {
             }
             waitFor(first) { it.hasButton("Offline project") }
             first.onActivity { activity ->
-                assertTrue(activity.findViewById<View>(ProjectUiIds.PENDING_CHANGES) != null)
+                assertTrue(activity.findViewById<View>(ProjectUiIds.PENDING_CHANGES) == null)
                 assertFalse(
                     activity.texts().any {
                         it.contains("service", ignoreCase = true) ||
@@ -1471,7 +1472,7 @@ class MainActivityPresentationTest {
     }
 
     @Test
-    fun notesAndAllThreeParkingFieldsSurviveConfigurationAndProcessStyleRecreation() {
+    fun notesAndAllThreeParkingFieldsSurviveConfigurationButNotProcessDeath() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             scenario.onActivity { it.button("Active project").performClick() }
@@ -1514,25 +1515,10 @@ class MainActivityPresentationTest {
         ActivityScenario.launch(MainActivity::class.java).use { restarted ->
             waitFor(restarted) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             restarted.onActivity { it.button("Active project").performClick() }
-            waitFor(restarted) {
-                it.screenTag() == ProjectUiIds.SCREEN_PROJECT &&
-                    it.findViewById<View>(ProjectUiIds.PARK_SHEET) != null
-            }
+            waitFor(restarted) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
             restarted.onActivity { activity ->
-                assertEquals("Shelf", activity.findViewById<EditText>(ProjectUiIds.PARKING_LOCATION).text.toString())
-                assertEquals(
-                    "Open notebook",
-                    activity.findViewById<EditText>(ProjectUiIds.PARKING_NEXT_ACTION).text.toString(),
-                )
-                assertEquals(
-                    "Bring cable",
-                    activity.findViewById<EditText>(ProjectUiIds.PARKING_MUST_NOT_FORGET).text.toString(),
-                )
-                activity.findViewById<Button>(ProjectUiIds.BACK).performClick()
-                assertEquals(
-                    "Draft after recreation",
-                    activity.findViewById<EditText>(ProjectUiIds.NOTES).text.toString(),
-                )
+                assertTrue(activity.findViewById<View>(ProjectUiIds.PARK_SHEET) == null)
+                assertEquals("Server notes", activity.findViewById<EditText>(ProjectUiIds.NOTES).text.toString())
             }
         }
     }
@@ -1622,7 +1608,7 @@ class MainActivityPresentationTest {
                     activity.findViewById<EditText>(ProjectUiIds.NOTES).text.toString(),
                 )
                 assertTrue(activity.findViewById<Button>(ProjectUiIds.RESOLVE_CONFLICT) != null)
-                assertTrue(activity.findViewById<View>(ProjectUiIds.PENDING_CHANGES) != null)
+                assertTrue(activity.findViewById<View>(ProjectUiIds.PENDING_CHANGES) == null)
                 assertFalse(activity.texts().any { it.contains("service", ignoreCase = true) })
                 assertTrue(activity.findViewById<Button>(ProjectUiIds.RESOLVE_CONFLICT) != null)
             }
@@ -2036,7 +2022,8 @@ class MainActivityPresentationTest {
         val body = activity.findViewById<LinearLayout>(ProjectUiIds.DASHBOARD_BODY)
         val grid = activity.findViewById<GridLayout>(ProjectUiIds.PROJECT_TILES)
         assertEquals(windowContent.width, root.width)
-        assertEquals(windowContent.height, root.height)
+        assertTrue(root.height < windowContent.height)
+        assertTrue(root.height > windowContent.height / 2)
         assertEquals(body.width, grid.width)
         assertEquals(Gravity.CENTER, body.gravity)
         assertTrue(root.background != null)

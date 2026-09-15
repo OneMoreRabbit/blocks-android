@@ -140,8 +140,8 @@ android {
         applicationId = "dev.blocks.android"
         minSdk = 26
         targetSdk = 37
-        versionCode = 11
-        versionName = "0.7.0"
+        versionCode = 12
+        versionName = "0.7.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "BLOCKS_API_BASE_URL", "\"https://api.blocks.onemorerabbit.co.uk\"")

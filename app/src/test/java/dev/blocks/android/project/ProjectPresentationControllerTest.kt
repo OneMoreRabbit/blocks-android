@@ -77,7 +77,7 @@ class ProjectPresentationControllerTest {
     }
 
     @Test
-    fun allEditableFieldsSurviveValidationAndControllerRecreation() {
+    fun invalidFormsRemainVisibleButUnsubmittedKeystrokesAreNotPersisted() {
         val drafts = MemoryDrafts()
         val workspace = FakeWorkspace()
         val first = controller(workspace, drafts)
@@ -85,6 +85,7 @@ class ProjectPresentationControllerTest {
         first.updateProjectName("  ")
         first.createProject("  ")
         assertEquals(ProjectFormField.PROJECT_NAME, first.state.invalidField)
+        assertEquals("  ", first.state.drafts.projectName)
 
         first.openProject(PROJECT_ID)
         first.updateRename("Renamed locally")
@@ -92,15 +93,17 @@ class ProjectPresentationControllerTest {
         first.showParkingForm()
         first.updateParking(ParkingDraft("Shelf", "Open notebook", "Bring cable"))
 
+        assertEquals("Renamed locally", first.state.drafts.projectRenames[PROJECT_ID])
+        assertEquals("Notes edited locally", first.state.drafts.projectNotes[PROJECT_ID])
+        assertEquals("Shelf", first.state.drafts.projectParking[PROJECT_ID]?.location)
+        assertEquals(0, drafts.saveCount)
+
         val recreated = controller(workspace, drafts)
         recreated.login("identity-token")
         recreated.openProject(PROJECT_ID)
 
-        assertEquals("  ", recreated.state.drafts.projectName)
-        assertEquals("Renamed locally", recreated.state.drafts.projectRenames[PROJECT_ID])
-        assertEquals("Notes edited locally", recreated.state.drafts.projectNotes[PROJECT_ID])
-        assertEquals("Shelf", recreated.state.drafts.projectParking[PROJECT_ID]?.location)
-        assertTrue(recreated.state.showParkingForm)
+        assertEquals(FormDrafts(), recreated.state.drafts)
+        assertFalse(recreated.state.showParkingForm)
     }
 
     @Test
@@ -152,7 +155,7 @@ class ProjectPresentationControllerTest {
 
         assertTrue(controller.state.reconciliationRequired)
         assertTrue(controller.state.pendingChanges)
-        assertTrue(controller.state.drafts.projectNotes.isEmpty())
+        assertEquals("Keep my edit", controller.state.drafts.projectNotes[PROJECT_ID])
         assertEquals("Keep my edit", controller.state.conflict?.localNotes)
         assertEquals(null, controller.state.status)
     }
@@ -241,7 +244,7 @@ class ProjectPresentationControllerTest {
     }
 
     @Test
-    fun dashboardViewArchiveModeAndParkDraftSurviveControllerRecreation() {
+    fun dashboardPreferencesPersistButUnsubmittedParkTextDoesNot() {
         val drafts = MemoryDrafts()
         val workspace = FakeWorkspace().apply {
             cache = cache.copy(
@@ -265,8 +268,8 @@ class ProjectPresentationControllerTest {
         assertEquals(DashboardView.LIST, restored.state.dashboardView)
         assertTrue(restored.state.archiveMode)
         restored.openProject(PROJECT_ID)
-        assertTrue(restored.state.showParkingForm)
-        assertEquals("Shelf", restored.state.drafts.projectParking[PROJECT_ID]?.location)
+        assertFalse(restored.state.showParkingForm)
+        assertNull(restored.state.drafts.projectParking[PROJECT_ID])
     }
 
     @Test
@@ -314,8 +317,10 @@ class ProjectPresentationControllerTest {
 
     private class MemoryDrafts : DraftStore {
         private val values = mutableMapOf<String, FormDrafts>()
+        var saveCount = 0
         override fun load(tenantId: String) = values[tenantId] ?: FormDrafts()
         override fun save(tenantId: String, drafts: FormDrafts) {
+            saveCount += 1
             values[tenantId] = drafts
         }
         override fun clear(tenantId: String) {

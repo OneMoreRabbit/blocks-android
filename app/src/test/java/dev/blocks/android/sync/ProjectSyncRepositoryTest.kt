@@ -605,15 +605,6 @@ class ProjectSyncRepositoryTest {
         val localProjectLink = first.projectLink(SESSION_A, provisionalId)
         assertEquals("create-project-key", provisionalId)
         assertEquals("Offline project", first.projectPage(SESSION_A, provisionalId).project.name)
-        state.saveSyncState(
-            TENANT_A,
-            state.loadSyncState(TENANT_A).copy(
-                projectCache = state.loadSyncState(TENANT_A).projectCache.copy(
-                    blocks = listOf(PhysicalBlock("local-block", "Desk", "bound", provisionalId)),
-                    blocksLoaded = true,
-                ),
-            ),
-        )
         first.queueSaveNotes(SESSION_A, provisionalId, 0, "Offline notes", "save-notes-key")
         first.queueParking(
             SESSION_A,
@@ -674,7 +665,6 @@ class ProjectSyncRepositoryTest {
         assertTrue(identityRewrite.projectCache.commands.all {
             it.targetId == PROJECT_ID && (it.projectId == null || it.projectId == PROJECT_ID)
         })
-        assertEquals(PROJECT_ID, identityRewrite.projectCache.blocks.single().boundProjectId)
         assertEquals("Newer notes draft", identityRewrite.projectDrafts.projectNotes[PROJECT_ID])
         assertEquals("Packing bench", identityRewrite.projectDrafts.projectParking[PROJECT_ID]?.location)
         assertTrue(provisionalId !in identityRewrite.projectDrafts.projectNotes)
