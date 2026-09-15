@@ -62,6 +62,22 @@ data class ProjectPage(
     val newestParking: ProjectParking?,
 )
 
+/**
+ * App-owned, metadata-free display derivatives for one local-only project cover.
+ * Encoded bytes live inside the encrypted tenant database and never enter the wire contract.
+ */
+data class ProjectCover(
+    val projectId: String,
+    val displayJpegBase64: String,
+    val thumbnailJpegBase64: String,
+    val displayWidth: Int,
+    val displayHeight: Int,
+    val thumbnailWidth: Int,
+    val thumbnailHeight: Int,
+    val contentDigest: String,
+    val importedAt: String,
+)
+
 data class ParkingHistoryPage(
     val records: List<ProjectParking>,
     val hasMore: Boolean,
@@ -108,7 +124,7 @@ enum class ProjectMutationStatus { PENDING, REQUIRES_RECONCILIATION }
 enum class DashboardView { LIST, TILES }
 
 data class ProjectUiPreferences(
-    val dashboardView: DashboardView = DashboardView.LIST,
+    val dashboardView: DashboardView = DashboardView.TILES,
     val archiveMode: Boolean = false,
 )
 
@@ -154,6 +170,7 @@ data class ProjectCacheState(
     val localBlocks: List<LocalBlockRecord> = emptyList(),
     val localBlockOperations: List<LocalBlockOperation> = emptyList(),
     val projectLinks: List<ProjectLinkIdentity> = emptyList(),
+    val projectCovers: List<ProjectCover> = emptyList(),
     val commands: List<ProjectMutation> = emptyList(),
     val retiredOperationIds: List<String> = emptyList(),
     val provisionalProjectIds: List<String> = emptyList(),
@@ -249,6 +266,12 @@ interface ProjectWorkspace {
         offset: Int,
         limit: Int,
     ): ParkingHistoryPage
+    fun projectCover(session: Session, projectId: String): ProjectCover? =
+        snapshot(session).cache.projectCovers.firstOrNull { it.projectId == projectId }
+    fun saveProjectCover(session: Session, cover: ProjectCover): BackgroundSyncResult =
+        throw UnsupportedOperationException("Project covers are unavailable")
+    fun removeProjectCover(session: Session, projectId: String): BackgroundSyncResult =
+        throw UnsupportedOperationException("Project covers are unavailable")
     fun localBlocks(session: Session): List<LocalBlockRecord> = snapshot(session).cache.localBlocks
     fun projectLink(session: Session, projectId: String): ProjectLink =
         throw UnsupportedOperationException("Project links are unavailable")

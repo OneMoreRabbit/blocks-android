@@ -1,19 +1,28 @@
 package dev.blocks.android
 
 import android.app.AlertDialog
+import android.content.ActivityNotFoundException
+import android.content.res.ColorStateList
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.Uri
 import android.os.Bundle
 import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
+import android.util.LruCache
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.GridLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -21,6 +30,9 @@ import android.widget.ScrollView
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -35,11 +47,16 @@ import dev.blocks.android.auth.AcceptedTenantContinuityStore
 import dev.blocks.android.auth.AndroidEncryptedAcceptedTenantContinuityStore
 import dev.blocks.android.auth.GoogleIdentityClient
 import dev.blocks.android.auth.IdentityProvider
+import dev.blocks.android.cover.AndroidProjectCoverImporter
+import dev.blocks.android.cover.CoverCaptureFiles
+import dev.blocks.android.cover.PendingCameraCover
+import dev.blocks.android.cover.ProjectCoverImporter
 import dev.blocks.android.mvp.ParkingDraft
 import dev.blocks.android.mvp.Session
 import dev.blocks.android.project.ProjectFormField
 import dev.blocks.android.project.DashboardView
 import dev.blocks.android.project.DirectTagAttemptScope
+import dev.blocks.android.project.ProjectCover
 import dev.blocks.android.project.ProjectMutationType
 import dev.blocks.android.project.ProjectPresentationController
 import dev.blocks.android.project.ProjectScreen
@@ -66,6 +83,7 @@ import dev.blocks.android.tag.TagShareIntent
 import com.google.zxing.BarcodeFormat
 import com.journeyapps.barcodescanner.BarcodeEncoder
 import java.net.URI
+import java.util.Base64
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -86,6 +104,7 @@ internal data class ProjectAppDependencies(
     val acceptedTenantStore: AcceptedTenantContinuityStore,
     val observeConnectivity: Boolean = true,
     val nfcTagPlatform: NfcTagPlatform? = null,
+    val coverImporter: ProjectCoverImporter? = null,
 )
 
 private sealed interface ActiveTagAction {
@@ -143,6 +162,13 @@ internal object ProjectUiIds {
     const val SCAN_QR = 1052
     const val TAG_QR = 1053
     const val PARKING_HISTORY_DIVIDER = 1054
+    const val SEARCH = 1060
+    const val VIEW_TILES = 1061
+    const val VIEW_LIST = 1062
+    const val SEARCH_EMPTY = 1063
+    const val DASHBOARD_WATERMARK = 1064
+    const val PROJECT_COVER = 1070
+    const val EDIT_COVER = 1071
 }
 
 class MainActivity : ComponentActivity() {
@@ -152,6 +178,8 @@ class MainActivity : ComponentActivity() {
     private val continuity get() = dependencies.continuity
     private val acceptedTenantStore get() = dependencies.acceptedTenantStore
     private val nfcTagPlatform by lazy { dependencies.nfcTagPlatform ?: AndroidNfcTagPlatform(this) }
+    private val coverImporter by lazy { dependencies.coverImporter ?: AndroidProjectCoverImporter(this) }
+    private val coverCaptureFiles by lazy { CoverCaptureFiles(this) }
     private val uiScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val localStateDispatcher = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "blocks-local-state")
@@ -161,6 +189,14 @@ class MainActivity : ComponentActivity() {
     private var syncJob: Job? = null
     private var credentialJob: Job? = null
     private var restoreProjectId: String? = null
+    private var dashboardSearchQuery: String = ""
+    private var pendingCameraCover: PendingCameraCover? = null
+    private var pendingCoverProjectId: String? = null
+    private var renderGeneration = 0L
+    private val coverJobs = mutableListOf<Job>()
+    private val coverBitmaps = object : LruCache<String, Bitmap>(8 * 1024 * 1024) {
+        override fun sizeOf(key: String, value: Bitmap): Int = value.allocationByteCount
+    }
     private var pendingNavigationAddress: BlocksNavigationAddress? = null
     private var pendingInvalidTagIntent = false
     private val tagAttemptLock = Any()
@@ -169,17 +205,27 @@ class MainActivity : ComponentActivity() {
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     internal var activeDialog: AlertDialog? = null
         private set
+    private val coverPickerLauncher = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        handleCoverPickerResult(uri)
+    }
+    private val coverCameraLauncher = registerForActivityResult(ActivityResultContracts.TakePicture()) { saved ->
+        handleCoverCameraResult(saved)
+    }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         consumeTagIntent(intent, clearActivityIntent = true)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         restoreProjectId = savedInstanceState?.getString(STATE_PROJECT_ID)
+        dashboardSearchQuery = savedInstanceState?.getString(STATE_DASHBOARD_SEARCH).orEmpty()
+        pendingCoverProjectId = savedInstanceState?.getString(STATE_COVER_PROJECT_ID)
+        pendingCameraCover = coverCaptureFiles.restore(savedInstanceState?.getString(STATE_CAMERA_COVER_PATH))
+        uiScope.launch(Dispatchers.IO) { coverCaptureFiles.cleanupOrphans(pendingCameraCover?.path) }
         content = LinearLayout(this).apply {
             id = ProjectUiIds.CONTENT
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.TOP
             setPadding(dp(24), dp(24), dp(24), dp(24))
-            setBackgroundColor(Color.rgb(246, 243, 234))
+            setBackgroundColor(brandColor(R.color.blocks_paper))
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -193,7 +239,7 @@ class MainActivity : ComponentActivity() {
         rootScroll = ScrollView(this).apply {
             id = ProjectUiIds.ROOT_SCROLL
             isFillViewport = true
-            setBackgroundColor(Color.rgb(246, 243, 234))
+            setBackgroundColor(brandColor(R.color.blocks_paper))
             addView(content)
         }
         setContentView(rootScroll)
@@ -253,6 +299,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onSaveInstanceState(outState: Bundle) {
         controller.state.projectPage?.project?.id?.let { outState.putString(STATE_PROJECT_ID, it) }
+        outState.putString(STATE_DASHBOARD_SEARCH, dashboardSearchQuery)
+        pendingCoverProjectId?.let { outState.putString(STATE_COVER_PROJECT_ID, it) }
+        pendingCameraCover?.path?.let { outState.putString(STATE_CAMERA_COVER_PATH, it) }
         super.onSaveInstanceState(outState)
     }
 
@@ -279,6 +328,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun render() {
+        renderGeneration += 1
+        coverJobs.forEach { it.cancel() }
+        coverJobs.clear()
         content.removeAllViews()
         if (controller.state.screen == ProjectScreen.PROJECT && controller.state.showParkingForm) {
             renderParkingSheet()
@@ -299,32 +351,39 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun renderTopBar() {
+        if (controller.state.screen == ProjectScreen.DASHBOARD) return
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        bar.addView(
-            label("Blocks", 28f, Color.rgb(32, 48, 42)),
-            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
-        )
+        if (controller.state.screen == ProjectScreen.LOGIN) {
+            bar.addView(ImageView(this).apply {
+                setImageResource(R.drawable.blocks_foreground)
+                contentDescription = null
+            }, LinearLayout.LayoutParams(dp(40), dp(40)))
+            bar.addView(
+                heading("Blocks", 28f),
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    marginStart = dp(8)
+                },
+            )
+        } else {
+            bar.addView(
+                iconTextButton("Projects", R.drawable.ic_back) {
+                    controller.backToDashboard()
+                    render()
+                }.apply { id = ProjectUiIds.MAIN },
+                LinearLayout.LayoutParams(0, dp(48), 1f),
+            )
+        }
         if (controller.state.pendingChanges) {
             bar.addView(label("●", 16f, Color.rgb(96, 104, 100)).apply {
                 id = ProjectUiIds.PENDING_CHANGES
                 contentDescription = "Changes pending"
             })
         }
-        if (controller.state.screen == ProjectScreen.DASHBOARD) {
-            bar.addView(button("Settings") { showSettings() }.apply { id = ProjectUiIds.SETTINGS })
-        } else if (controller.state.screen == ProjectScreen.PROJECT) {
-            bar.addView(button("Main") {
-                controller.backToDashboard()
-                render()
-            }.apply { id = ProjectUiIds.MAIN })
-            bar.addView(button("Park") {
-                controller.showParkingForm()
-                render()
-            }.apply { id = ProjectUiIds.PARK })
-            bar.addView(button("Settings") { showProjectSettings() }.apply {
+        if (controller.state.screen == ProjectScreen.PROJECT) {
+            bar.addView(iconOnlyButton(R.drawable.ic_more, "Project settings") { showProjectSettings() }.apply {
                 id = ProjectUiIds.PROJECT_SETTINGS
             })
         }
@@ -347,66 +406,54 @@ class MainActivity : ComponentActivity() {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
         }
-        body.addView(label(if (archiveMode) "Archive" else "Projects", 22f))
-        if (projects.isEmpty()) {
-            body.addView(label(if (archiveMode) "No archived projects." else "No active projects yet.", 15f))
+        body.addView(dashboardControls())
+        if (archiveMode) body.addView(heading("Archive", 24f).apply { setPadding(0, dp(16), 0, dp(8)) })
+
+        val collection = FrameLayout(this).apply {
+            setBackgroundColor(Color.TRANSPARENT)
+            minimumHeight = dp(360)
         }
-        val projectContainer: ViewGroup = if (controller.state.dashboardView == DashboardView.TILES) {
-            GridLayout(this).apply {
-                id = ProjectUiIds.PROJECT_TILES
-                columnCount = dashboardColumnCount()
-                alignmentMode = GridLayout.ALIGN_BOUNDS
-                useDefaultMargins = true
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                )
-            }
-        } else {
-            LinearLayout(this).apply {
-                id = ProjectUiIds.PROJECT_LIST
-                orientation = LinearLayout.VERTICAL
-                gravity = Gravity.CENTER_HORIZONTAL
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                )
-            }
-        }
-        projects.forEach { project ->
-            val projectButton = button(project.name) { source ->
-                if (archiveMode) confirmReopen(project) else runRepositoryAction(source = source) {
-                    controller.openProject(project.id)
-                }
-            }
-            if (projectContainer is GridLayout) {
-                projectContainer.addView(
-                    projectButton,
-                    GridLayout.LayoutParams().apply {
-                        width = 0
-                        columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1, 1f)
-                    },
-                )
-            } else {
-                projectContainer.addView(
-                    projectButton,
-                    LinearLayout.LayoutParams(
-                        LinearLayout.LayoutParams.MATCH_PARENT,
-                        LinearLayout.LayoutParams.WRAP_CONTENT,
-                    ),
-                )
-            }
-        }
-        body.addView(projectContainer)
+        collection.addView(
+            ImageView(this).apply {
+                id = ProjectUiIds.DASHBOARD_WATERMARK
+                setImageResource(R.drawable.blocks_monochrome)
+                imageTintList = ColorStateList.valueOf(brandColor(R.color.blocks_teal))
+                alpha = 0.055f
+                scaleType = ImageView.ScaleType.CENTER_INSIDE
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            },
+            FrameLayout.LayoutParams(dp(360), dp(360), Gravity.CENTER),
+        )
+        body.addView(
+            collection,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ),
+        )
+        populateDashboardCollection(collection, projects, archiveMode)
 
         if (archiveMode) {
-            body.addView(button("Main") { source ->
+            body.addView(secondaryButton("Projects", R.drawable.ic_back) { source ->
                 runRepositoryAction(source = source) { controller.showMainDashboard() }
             }.apply { id = ProjectUiIds.ARCHIVE_MAIN })
         } else {
-            body.addView(button("Create project") { showCreateProject() }.apply {
-                id = ProjectUiIds.CREATE_PROJECT
-            })
+            val actions = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER
+                setPadding(0, dp(16), 0, 0)
+            }
+            actions.addView(
+                primaryButton("Create project", R.drawable.ic_plus) { showCreateProject() }.apply {
+                    id = ProjectUiIds.CREATE_PROJECT
+                },
+                LinearLayout.LayoutParams(0, dp(52), 1.6f).apply { marginEnd = dp(8) },
+            )
+            actions.addView(
+                secondaryButton("Archive", R.drawable.ic_archive) { openArchiveMode() },
+                LinearLayout.LayoutParams(0, dp(52), 1f).apply { marginStart = dp(8) },
+            )
+            body.addView(actions)
         }
         content.addView(
             body,
@@ -423,11 +470,231 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun dashboardControls(): View {
+        val controls = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, dp(12))
+        }
+        val search = EditText(this).apply {
+            id = ProjectUiIds.SEARCH
+            hint = "Search projects"
+            contentDescription = "Search projects"
+            setText(dashboardSearchQuery)
+            setSelection(text.length)
+            isSingleLine = true
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+            setTextColor(brandColor(R.color.blocks_ink))
+            setHintTextColor(brandColor(R.color.blocks_muted))
+            textSize = 16f
+            typeface = interTypeface
+            setPadding(dp(14), 0, dp(10), 0)
+            setCompoundDrawablesRelativeWithIntrinsicBounds(R.drawable.ic_search, 0, 0, 0)
+            compoundDrawablePadding = dp(8)
+            background = roundedBackground(brandColor(R.color.blocks_white), brandColor(R.color.blocks_input), 10f)
+            minimumHeight = dp(48)
+            addTextChangedListener(watcher { value ->
+                dashboardSearchQuery = value
+                val projects = if (controller.state.archiveMode) {
+                    controller.state.archivedProjects
+                } else {
+                    controller.state.activeProjects
+                }
+                val collection = content.findViewById<View>(ProjectUiIds.DASHBOARD_WATERMARK)?.parent as? FrameLayout
+                collection?.let { populateDashboardCollection(it, projects, controller.state.archiveMode) }
+            })
+        }
+        controls.addView(search, LinearLayout.LayoutParams(0, dp(52), 1f).apply { marginEnd = dp(8) })
+
+        val toggle = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        val tilesSelected = controller.state.dashboardView == DashboardView.TILES
+        toggle.addView(
+            viewToggleButton(R.drawable.ic_grid, "Tile view", tilesSelected) {
+                if (!tilesSelected) runRepositoryAction { controller.toggleDashboardView() }
+            }.apply { id = ProjectUiIds.VIEW_TILES },
+            LinearLayout.LayoutParams(dp(48), dp(48)),
+        )
+        toggle.addView(
+            viewToggleButton(R.drawable.ic_list, "List view", !tilesSelected) {
+                if (tilesSelected) runRepositoryAction { controller.toggleDashboardView() }
+            }.apply { id = ProjectUiIds.VIEW_LIST },
+            LinearLayout.LayoutParams(dp(48), dp(48)),
+        )
+        controls.addView(toggle, LinearLayout.LayoutParams(dp(96), dp(48)).apply {
+            marginStart = dp(4)
+            marginEnd = dp(8)
+        })
+
+        if (controller.state.pendingChanges) {
+            controls.addView(label("●", 14f, brandColor(R.color.blocks_muted)).apply {
+                id = ProjectUiIds.PENDING_CHANGES
+                contentDescription = "Changes pending"
+                setPadding(0, 0, dp(4), 0)
+            })
+        }
+        controls.addView(iconOnlyButton(R.drawable.ic_settings, "Settings") { showSettings() }.apply {
+            id = ProjectUiIds.SETTINGS
+        }, LinearLayout.LayoutParams(dp(48), dp(48)))
+        return controls
+    }
+
+    private fun populateDashboardCollection(
+        frame: FrameLayout,
+        sourceProjects: List<ProjectSummary>,
+        archiveMode: Boolean,
+    ) {
+        frame.findViewWithTag<View>(DASHBOARD_COLLECTION_TAG)?.let(frame::removeView)
+        val query = dashboardSearchQuery.trim()
+        val projects = if (query.isEmpty()) sourceProjects else sourceProjects.filter {
+            it.name.contains(query, ignoreCase = true)
+        }
+        val view = when {
+            projects.isEmpty() && query.isNotEmpty() -> searchEmptyState()
+            projects.isEmpty() -> emptyDashboardState(archiveMode)
+            controller.state.dashboardView == DashboardView.TILES -> tileCollection(projects, archiveMode)
+            else -> listCollection(projects, archiveMode)
+        }
+        view.tag = DASHBOARD_COLLECTION_TAG
+        frame.addView(
+            view,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+            ),
+        )
+    }
+
+    private fun tileCollection(projects: List<ProjectSummary>, archiveMode: Boolean) = GridLayout(this).apply {
+        id = ProjectUiIds.PROJECT_TILES
+        columnCount = dashboardColumnCount()
+        alignmentMode = GridLayout.ALIGN_BOUNDS
+        useDefaultMargins = false
+        setPadding(0, dp(4), 0, dp(4))
+        projects.forEach { project ->
+            addView(
+                projectTile(project, archiveMode),
+                GridLayout.LayoutParams().apply {
+                    width = 0
+                    columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1, 1f)
+                    setMargins(dp(6), dp(6), dp(6), dp(6))
+                },
+            )
+        }
+    }
+
+    private fun listCollection(projects: List<ProjectSummary>, archiveMode: Boolean) = LinearLayout(this).apply {
+        id = ProjectUiIds.PROJECT_LIST
+        orientation = LinearLayout.VERTICAL
+        projects.forEachIndexed { index, project ->
+            addView(projectRow(project, archiveMode))
+            if (index < projects.lastIndex) addView(divider())
+        }
+    }
+
+    private fun projectTile(project: ProjectSummary, archiveMode: Boolean) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        background = roundedBackground(brandColor(R.color.blocks_white), Color.TRANSPARENT, 12f)
+        clipToOutline = true
+        val image = projectImage(project, thumbnail = true)
+        addView(image, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(116)))
+        addView(
+            projectButton(project, archiveMode).apply {
+                gravity = Gravity.START or Gravity.CENTER_VERTICAL
+                setPadding(dp(14), 0, dp(10), 0)
+                background = null
+            },
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(58)),
+        )
+    }
+
+    private fun projectRow(project: ProjectSummary, archiveMode: Boolean) = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        minimumHeight = dp(88)
+        setPadding(0, dp(8), 0, dp(8))
+        addView(projectImage(project, thumbnail = true), LinearLayout.LayoutParams(dp(112), dp(72)).apply {
+            marginEnd = dp(14)
+        })
+        addView(projectButton(project, archiveMode).apply {
+            gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            background = null
+            setPadding(0, 0, dp(8), 0)
+        }, LinearLayout.LayoutParams(0, dp(64), 1f))
+        addView(ImageView(this@MainActivity).apply {
+            setImageResource(R.drawable.ic_arrow)
+            contentDescription = null
+        }, LinearLayout.LayoutParams(dp(32), dp(48)))
+    }
+
+    private fun projectButton(project: ProjectSummary, archiveMode: Boolean) = Button(this).apply {
+        text = project.name
+        isAllCaps = false
+        textSize = 17f
+        typeface = manropeTypeface
+        setTextColor(brandColor(R.color.blocks_ink))
+        contentDescription = if (archiveMode) "Reopen ${project.name}" else "Open ${project.name}"
+        setOnClickListener { source ->
+            if (archiveMode) confirmReopen(project) else runRepositoryAction(source = source) {
+                controller.openProject(project.id)
+            }
+        }
+    }
+
+    private fun projectImage(project: ProjectSummary, thumbnail: Boolean) = ImageView(this).apply {
+        scaleType = ImageView.ScaleType.CENTER_INSIDE
+        setPadding(dp(18), dp(12), dp(18), dp(12))
+        background = roundedBackground(brandColor(R.color.blocks_soft), Color.TRANSPARENT, 10f)
+        setImageResource(R.drawable.blocks_foreground)
+        contentDescription = "No cover for ${project.name}"
+        controller.state.projectCovers.firstOrNull { it.projectId == project.id }?.let { cover ->
+            contentDescription = "Cover for ${project.name}"
+            loadCover(this, project, cover, thumbnail)
+        }
+    }
+
+    private fun searchEmptyState() = LinearLayout(this).apply {
+        id = ProjectUiIds.SEARCH_EMPTY
+        orientation = LinearLayout.VERTICAL
+        gravity = Gravity.CENTER
+        setPadding(dp(24), dp(72), dp(24), dp(72))
+        addView(ImageView(this@MainActivity).apply {
+            setImageResource(R.drawable.ic_search)
+            imageTintList = ColorStateList.valueOf(brandColor(R.color.blocks_teal))
+            contentDescription = null
+        }, LinearLayout.LayoutParams(dp(72), dp(72)))
+        addView(heading("No projects found", 22f).apply { gravity = Gravity.CENTER })
+        addView(label("Try another search or clear the filter.", 15f, brandColor(R.color.blocks_muted)).apply {
+            gravity = Gravity.CENTER
+        })
+        addView(secondaryButton("Clear search", R.drawable.ic_search) {
+            dashboardSearchQuery = ""
+            render()
+        }, LinearLayout.LayoutParams(dp(190), dp(52)))
+        addView(label("Search works on this device.", 13f, brandColor(R.color.blocks_muted)).apply {
+            gravity = Gravity.CENTER
+            setPadding(0, dp(12), 0, 0)
+        })
+    }
+
+    private fun emptyDashboardState(archiveMode: Boolean) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        gravity = Gravity.CENTER
+        setPadding(dp(24), dp(72), dp(24), dp(72))
+        addView(ImageView(this@MainActivity).apply {
+            setImageResource(R.drawable.blocks_foreground)
+            contentDescription = null
+            alpha = 0.85f
+        }, LinearLayout.LayoutParams(dp(88), dp(88)))
+        addView(heading(if (archiveMode) "No archived projects" else "Your first project starts here.", 20f).apply {
+            gravity = Gravity.CENTER
+        })
+    }
+
     private fun showSettings() {
-        val viewChoice = if (controller.state.dashboardView == DashboardView.LIST) "Tile view" else "List view"
         val items = buildList {
-            add("Archive")
-            add(viewChoice)
             add("About")
             if (controller.state.authenticationRequired || controller.state.sessionConfirmationRequired) {
                 add("Reconnect Google account")
@@ -439,8 +706,6 @@ class MainActivity : ComponentActivity() {
         val dialog = AlertDialog.Builder(this).setTitle("Settings")
             .setItems(items.toTypedArray()) { _, which ->
                 when (items[which]) {
-                    "Archive" -> openArchiveMode()
-                    viewChoice -> runRepositoryAction { controller.toggleDashboardView() }
                     "About" -> showAbout()
                     "Reconnect Google account" -> reauthenticate()
                     "Switch account" -> switchAccount()
@@ -470,7 +735,7 @@ class MainActivity : ComponentActivity() {
             .setTitle("Remove local data?")
             .setMessage(
                 "This permanently removes this account's projects, notes, park messages, " +
-                    "drafts, and pending changes from this device.",
+                    "covers, drafts, and pending changes from this device.",
             )
             .setPositiveButton("Remove local data") { _, _ -> removeActiveLocalData() }
             .setNegativeButton("Cancel", null)
@@ -481,22 +746,64 @@ class MainActivity : ComponentActivity() {
     private fun renderProject() {
         content.tag = ProjectUiIds.SCREEN_PROJECT
         val page = requireNotNull(controller.state.projectPage)
-        content.addView(label(page.project.name, 22f))
+        content.addView(heading(page.project.name, 30f).apply {
+            setPadding(0, dp(18), 0, dp(14))
+        })
+
+        val coverFrame = FrameLayout(this).apply {
+            id = ProjectUiIds.PROJECT_COVER
+            background = roundedBackground(brandColor(R.color.blocks_soft), Color.TRANSPARENT, 14f)
+            clipToOutline = true
+        }
+        coverFrame.addView(
+            projectImage(page.project, thumbnail = false),
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            ),
+        )
+        coverFrame.addView(
+            secondaryButton("Edit cover", R.drawable.ic_edit) { showCoverActions() }.apply {
+                id = ProjectUiIds.EDIT_COVER
+                backgroundTintList = ColorStateList.valueOf(Color.argb(218, 255, 255, 255))
+            },
+            FrameLayout.LayoutParams(dp(150), dp(50), Gravity.BOTTOM or Gravity.END).apply {
+                setMargins(0, 0, dp(12), dp(12))
+            },
+        )
+        content.addView(
+            coverFrame,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(210)).apply {
+                bottomMargin = dp(18)
+            },
+        )
 
         val newestParking = page.newestParking
-        if (newestParking == null) {
-            content.addView(label("No park message yet.", 16f, Color.rgb(53, 104, 89)))
-        } else {
-            content.addView(label("Latest park message", 17f, Color.rgb(53, 104, 89)))
-            content.addView(label("Where I am", 12f, Color.GRAY))
-            content.addView(label(newestParking.location, 16f))
-            content.addView(label("Next physical action", 12f, Color.GRAY))
-            content.addView(label(newestParking.nextAction, 16f))
-            content.addView(label("Must not forget", 12f, Color.GRAY))
-            content.addView(label(newestParking.mustNotForget, 16f))
+        val parkingCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = roundedBackground(brandColor(R.color.blocks_white), brandColor(R.color.blocks_line), 12f)
+            setPadding(dp(18), dp(16), dp(18), dp(10))
         }
+        parkingCard.addView(heading("Where you left off", 20f))
+        if (newestParking == null) {
+            parkingCard.addView(label("No park message yet.", 16f, brandColor(R.color.blocks_muted)))
+        } else {
+            parkingCard.addView(fieldValue("Where I am", newestParking.location))
+            parkingCard.addView(divider())
+            parkingCard.addView(fieldValue("Next physical action", newestParking.nextAction))
+            parkingCard.addView(divider())
+            parkingCard.addView(fieldValue("Must not forget", newestParking.mustNotForget))
+        }
+        content.addView(parkingCard)
+        content.addView(primaryButton("Park", R.drawable.ic_park) {
+            controller.showParkingForm()
+            render()
+        }.apply { id = ProjectUiIds.PARK }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            dp(52),
+        ).apply { topMargin = dp(12); bottomMargin = dp(22) })
 
-        content.addView(label("Notes", 17f))
+        content.addView(heading("Notes", 22f))
         val notesValue = controller.state.drafts.projectNotes[page.project.id] ?: page.notes.body
         val notes = input("Project notes", notesValue) { value ->
             queueDraftUpdate { controller.updateNotes(value) }
@@ -506,16 +813,20 @@ class MainActivity : ComponentActivity() {
             gravity = Gravity.TOP
         }
         notes.markInvalid(ProjectFormField.NOTES)
-        content.addView(notes)
-        content.addView(button("Save notes") { source ->
+        notes.background = roundedBackground(brandColor(R.color.blocks_white), brandColor(R.color.blocks_input), 10f)
+        content.addView(notes, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(132)))
+        content.addView(primaryButton("Save notes", R.drawable.ic_edit) { source ->
             runRepositoryAction(source = source, syncAfter = true) {
                 controller.saveNotes(notes.text.toString())
             }
-        }.apply { id = ProjectUiIds.SAVE_NOTES })
+        }.apply { id = ProjectUiIds.SAVE_NOTES }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            dp(52),
+        ).apply { topMargin = dp(10); bottomMargin = dp(20) })
 
         val olderParking = controller.state.parkingHistory.filterNot { it.id == newestParking?.id }
         if (olderParking.isNotEmpty() || controller.state.parkingHistoryHasMore) {
-            content.addView(label("Parking history", 17f, Color.rgb(53, 104, 89)))
+            content.addView(heading("Parking history", 20f))
             val history = LinearLayout(this).apply {
                 id = ProjectUiIds.PARKING_HISTORY
                 orientation = LinearLayout.VERTICAL
@@ -654,10 +965,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun showProjectSettings() {
-        val items = arrayOf("Set Tag", "View QR", "Clear Tags", "Rename", "Archive")
+        val items = arrayOf("Project cover", "Set Tag", "View QR", "Clear Tags", "Rename", "Archive")
         val dialog = AlertDialog.Builder(this).setTitle("Project settings")
             .setItems(items) { _, which ->
                 when (items[which]) {
+                    "Project cover" -> showCoverActions()
                     "Set Tag" -> showSetTag()
                     "View QR" -> showLatestQr()
                     "Clear Tags" -> showClearTags()
@@ -666,6 +978,124 @@ class MainActivity : ComponentActivity() {
                 }
             }.setNegativeButton("Cancel", null).create()
         showManagedDialog(dialog)
+    }
+
+    private fun showCoverActions() {
+        val page = controller.state.projectPage ?: return
+        val hasCover = controller.state.projectCovers.any { it.projectId == page.project.id }
+        val items = buildList {
+            add("Take photo")
+            add("Choose image")
+            if (hasCover) add("Replace cover")
+            if (hasCover) add("Remove cover")
+        }
+        showManagedDialog(
+            AlertDialog.Builder(this)
+                .setTitle("Project cover")
+                .setMessage("Choose how this project appears on your dashboard.")
+                .setItems(items.toTypedArray()) { _, which ->
+                    when (items[which]) {
+                        "Take photo" -> launchCoverCamera(page.project.id)
+                        "Choose image", "Replace cover" -> launchCoverPicker(page.project.id)
+                        "Remove cover" -> confirmRemoveCover()
+                    }
+                }
+                .setNegativeButton("Cancel", null)
+                .create(),
+        )
+    }
+
+    private fun launchCoverPicker(projectId: String) {
+        stagePendingCover(projectId)
+        runCatching {
+            coverPickerLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+        }.onFailure {
+            pendingCoverProjectId = null
+            showMessage("Image unavailable", "Blocks could not open the system photo picker. Your current cover is unchanged.")
+        }
+    }
+
+    private fun launchCoverCamera(projectId: String) {
+        val capture = runCatching { coverCaptureFiles.create() }.getOrElse {
+            showMessage("Camera unavailable", "Blocks could not create a private temporary photo. Your current cover is unchanged.")
+            return
+        }
+        stagePendingCover(projectId, capture)
+        try {
+            coverCameraLauncher.launch(capture.uri)
+        } catch (_: ActivityNotFoundException) {
+            discardPendingCameraCover()
+            showMessage("Camera unavailable", "No camera app is available. Your current cover is unchanged.")
+        } catch (_: SecurityException) {
+            discardPendingCameraCover()
+            showMessage("Camera unavailable", "The camera did not accept the private photo destination. Your current cover is unchanged.")
+        }
+    }
+
+    internal fun handleCoverPickerResult(uri: Uri?) {
+        val projectId = pendingCoverProjectId
+        pendingCoverProjectId = null
+        if (uri != null && projectId != null) importCover(projectId, uri)
+    }
+
+    internal fun stagePendingCover(projectId: String, capture: PendingCameraCover? = null) {
+        pendingCoverProjectId = projectId
+        pendingCameraCover = capture
+    }
+
+    internal fun handleCoverCameraResult(saved: Boolean) {
+        val projectId = pendingCoverProjectId
+        val capture = pendingCameraCover
+        pendingCoverProjectId = null
+        pendingCameraCover = null
+        if (!saved || projectId == null || capture == null) {
+            uiScope.launch(Dispatchers.IO) { runCatching { coverCaptureFiles.delete(capture) } }
+            return
+        }
+        importCover(projectId, capture.uri, capture)
+    }
+
+    internal fun importCover(projectId: String, uri: Uri, capture: PendingCameraCover? = null) {
+        val tenantId = controller.activeTenantId ?: return
+        uiScope.launch {
+            try {
+                val cover = withContext(Dispatchers.IO) {
+                    val processed = coverImporter.importCover(projectId, uri)
+                    if (capture != null) coverCaptureFiles.delete(capture)
+                    processed
+                }
+                withContext(NonCancellable + localStateDispatcher) {
+                    check(controller.activeTenantId == tenantId) { "The active account changed during cover import" }
+                    check(controller.state.projectPage?.project?.id == projectId) {
+                        "The selected project changed during cover import"
+                    }
+                    controller.saveProjectCover(cover)
+                }
+            } catch (_: Exception) {
+                if (capture != null) withContext(Dispatchers.IO) { runCatching { coverCaptureFiles.delete(capture) } }
+                controller.reportError("Blocks could not save that cover on this device. Your current cover is unchanged.")
+            }
+            render()
+        }
+    }
+
+    private fun confirmRemoveCover() {
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Remove project cover?")
+            .setMessage("The encrypted local cover and its thumbnail will be removed from this device.")
+            .setPositiveButton("Remove") { _, _ ->
+                runRepositoryAction { controller.removeProjectCover() }
+            }
+            .setNegativeButton("Cancel", null)
+            .create()
+        showManagedDialog(dialog)
+    }
+
+    private fun discardPendingCameraCover() {
+        val capture = pendingCameraCover
+        pendingCameraCover = null
+        pendingCoverProjectId = null
+        uiScope.launch(Dispatchers.IO) { runCatching { coverCaptureFiles.delete(capture) } }
     }
 
     private fun showSetTag() {
@@ -1132,9 +1562,179 @@ class MainActivity : ComponentActivity() {
         showManagedDialog(dialog)
     }
 
+    private val interTypeface: Typeface
+        get() = resources.getFont(R.font.inter_variable)
+
+    private val manropeTypeface: Typeface
+        get() = resources.getFont(R.font.manrope_variable)
+
+    private fun brandColor(resource: Int): Int = ContextCompat.getColor(this, resource)
+
+    private fun roundedBackground(fill: Int, stroke: Int, radiusDp: Float) = GradientDrawable().apply {
+        shape = GradientDrawable.RECTANGLE
+        cornerRadius = dp(radiusDp.toInt()).toFloat()
+        setColor(fill)
+        if (stroke != Color.TRANSPARENT) setStroke(dp(1), stroke)
+    }
+
+    private fun heading(text: String, size: Float) = TextView(this).apply {
+        this.text = text
+        textSize = size
+        typeface = manropeTypeface
+        setTextColor(brandColor(R.color.blocks_ink))
+        setPadding(0, 0, 0, dp(10))
+    }
+
+    private fun fieldValue(title: String, value: String) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        addView(label(title, 13f, brandColor(R.color.blocks_teal)).apply {
+            typeface = manropeTypeface
+            setPadding(0, 0, 0, dp(3))
+        })
+        addView(label(value, 17f, brandColor(R.color.blocks_ink)).apply {
+            setPadding(0, 0, 0, dp(8))
+        })
+    }
+
+    private fun divider() = View(this).apply {
+        setBackgroundColor(brandColor(R.color.blocks_line))
+        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1)).apply {
+            topMargin = dp(4)
+            bottomMargin = dp(10)
+        }
+        importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+    }
+
+    private fun primaryButton(text: String, icon: Int, action: (View) -> Unit) = styledButton(
+        text,
+        icon,
+        brandColor(R.color.blocks_teal),
+        brandColor(R.color.blocks_white),
+        Color.TRANSPARENT,
+        action,
+    )
+
+    private fun secondaryButton(text: String, icon: Int, action: (View) -> Unit) = styledButton(
+        text,
+        icon,
+        brandColor(R.color.blocks_white),
+        brandColor(R.color.blocks_ink),
+        brandColor(R.color.blocks_input),
+        action,
+    )
+
+    private fun iconTextButton(text: String, icon: Int, action: (View) -> Unit) = styledButton(
+        text,
+        icon,
+        Color.TRANSPARENT,
+        brandColor(R.color.blocks_ink),
+        Color.TRANSPARENT,
+        action,
+    )
+
+    private fun styledButton(
+        text: String,
+        icon: Int,
+        fill: Int,
+        foreground: Int,
+        stroke: Int,
+        action: (View) -> Unit,
+    ) = Button(this).apply {
+        this.text = text
+        isAllCaps = false
+        textSize = 16f
+        typeface = manropeTypeface
+        setTextColor(foreground)
+        background = roundedBackground(fill, stroke, 10f)
+        setCompoundDrawablesRelativeWithIntrinsicBounds(icon, 0, 0, 0)
+        compoundDrawablePadding = dp(8)
+        compoundDrawableTintList = ColorStateList.valueOf(foreground)
+        minimumHeight = dp(48)
+        setPadding(dp(14), 0, dp(14), 0)
+        setOnClickListener(action)
+    }
+
+    private fun iconOnlyButton(icon: Int, description: String, action: (View) -> Unit) = Button(this).apply {
+        text = ""
+        contentDescription = description
+        setCompoundDrawablesRelativeWithIntrinsicBounds(icon, 0, 0, 0)
+        compoundDrawableTintList = ColorStateList.valueOf(brandColor(R.color.blocks_ink))
+        background = roundedBackground(Color.TRANSPARENT, Color.TRANSPARENT, 10f)
+        minimumWidth = dp(48)
+        minimumHeight = dp(48)
+        setPadding(dp(12), dp(12), dp(12), dp(12))
+        setOnClickListener(action)
+    }
+
+    private fun viewToggleButton(icon: Int, description: String, selected: Boolean, action: (View) -> Unit) =
+        Button(this).apply {
+            text = ""
+            contentDescription = description
+            isSelected = selected
+            ViewCompat.setStateDescription(this, if (selected) "Selected" else "Not selected")
+            setCompoundDrawablesRelativeWithIntrinsicBounds(icon, 0, 0, 0)
+            compoundDrawableTintList = ColorStateList.valueOf(
+                if (selected) brandColor(R.color.blocks_white) else brandColor(R.color.blocks_ink),
+            )
+            background = roundedBackground(
+                if (selected) brandColor(R.color.blocks_teal) else brandColor(R.color.blocks_white),
+                brandColor(R.color.blocks_input),
+                9f,
+            )
+            minimumWidth = dp(48)
+            minimumHeight = dp(48)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            setOnClickListener(action)
+        }
+
+    private fun loadCover(image: ImageView, project: ProjectSummary, cover: ProjectCover, thumbnail: Boolean) {
+        val cacheKey = "${cover.contentDigest}:${if (thumbnail) "thumb" else "display"}"
+        coverBitmaps.get(cacheKey)?.let {
+            image.scaleType = ImageView.ScaleType.CENTER_CROP
+            image.setPadding(0, 0, 0, 0)
+            image.setImageBitmap(it)
+            image.contentDescription = "Cover for ${project.name}"
+            return
+        }
+        val generation = renderGeneration
+        val tenantId = controller.activeTenantId
+        val encoded = if (thumbnail) cover.thumbnailJpegBase64 else cover.displayJpegBase64
+        val job = uiScope.launch {
+            val bitmap = withContext(Dispatchers.Default) {
+                val bytes = Base64.getDecoder().decode(encoded)
+                try {
+                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                } finally {
+                    bytes.fill(0)
+                }
+            } ?: return@launch
+            if (generation != renderGeneration || tenantId != controller.activeTenantId) {
+                bitmap.recycle()
+                return@launch
+            }
+            coverBitmaps.put(cacheKey, bitmap)
+            image.scaleType = ImageView.ScaleType.CENTER_CROP
+            image.setPadding(0, 0, 0, 0)
+            image.setImageBitmap(bitmap)
+            image.contentDescription = "Cover for ${project.name}"
+        }
+        coverJobs += job
+    }
+
+    private fun clearCoverMemory() {
+        coverJobs.forEach { it.cancel() }
+        coverJobs.clear()
+        coverBitmaps.evictAll()
+        val capture = pendingCameraCover
+        pendingCameraCover = null
+        pendingCoverProjectId = null
+        uiScope.launch(Dispatchers.IO) { runCatching { coverCaptureFiles.delete(capture) } }
+    }
+
     private fun label(text: String, size: Float, color: Int = Color.DKGRAY) = TextView(this).apply {
         this.text = text
         textSize = size
+        typeface = interTypeface
         setTextColor(color)
         setPadding(0, 0, 0, dp(12))
     }
@@ -1167,6 +1767,7 @@ class MainActivity : ComponentActivity() {
     private fun button(text: String, action: (View) -> Unit) = Button(this).apply {
         this.text = text
         isAllCaps = false
+        minimumHeight = dp(48)
         setOnClickListener(action)
     }
 
@@ -1271,6 +1872,7 @@ class MainActivity : ComponentActivity() {
         syncJob?.cancel()
         syncJob = null
         restoreProjectId = null
+        clearCoverMemory()
         val locked = runCatching {
             withContext(localStateDispatcher) {
                 controller.lock()
@@ -1297,6 +1899,7 @@ class MainActivity : ComponentActivity() {
             syncJob = null
             continuity.shouldRestore = false
             restoreProjectId = null
+            clearCoverMemory()
             val locked = runCatching {
                 withContext(localStateDispatcher) {
                     controller.lock()
@@ -1330,6 +1933,7 @@ class MainActivity : ComponentActivity() {
             syncJob = null
             continuity.shouldRestore = false
             restoreProjectId = null
+            clearCoverMemory()
             val removed = runCatching {
                 withContext(localStateDispatcher) {
                     controller.eraseAcceptedTenantCache(tenantId)
@@ -1430,6 +2034,7 @@ class MainActivity : ComponentActivity() {
             syncJob = null
             continuity.shouldRestore = false
             restoreProjectId = null
+            clearCoverMemory()
             withContext(NonCancellable) {
                 runCatching {
                     withContext(localStateDispatcher) { acceptedTenantStore.remove(revokedTenantId) }
@@ -1456,6 +2061,10 @@ class MainActivity : ComponentActivity() {
 
     internal companion object {
         private const val STATE_PROJECT_ID = "project_id"
+        private const val STATE_DASHBOARD_SEARCH = "dashboard_search"
+        private const val STATE_COVER_PROJECT_ID = "cover_project_id"
+        private const val STATE_CAMERA_COVER_PATH = "camera_cover_path"
+        private const val DASHBOARD_COLLECTION_TAG = "dashboard_collection"
 
         @Volatile
         var dependencyFactory: ((MainActivity) -> ProjectAppDependencies)? = null

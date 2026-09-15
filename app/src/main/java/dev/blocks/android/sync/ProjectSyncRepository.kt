@@ -16,6 +16,7 @@ import dev.blocks.android.project.BlockBinding
 import dev.blocks.android.project.PhysicalBlock
 import dev.blocks.android.project.ProjectCacheState
 import dev.blocks.android.project.ProjectConflict
+import dev.blocks.android.project.ProjectCover
 import dev.blocks.android.project.ProjectIdentityMapping
 import dev.blocks.android.project.ProjectLifecycle
 import dev.blocks.android.project.ProjectMutation
@@ -125,6 +126,49 @@ class ProjectSyncRepository(
             .firstOrNull { it.provisionalId == projectId }?.serverId ?: projectId
         return state.projectCache.pages.firstOrNull { it.project.id == resolvedId }
             ?: throw IllegalStateException("This project is not available in saved local data.")
+    }
+
+    @Synchronized
+    override fun projectCover(session: Session, projectId: String): ProjectCover? {
+        val state = activeState(session)
+        val resolvedId = state.projectCache.resolveProjectId(projectId)
+        return state.projectCache.projectCovers.firstOrNull { it.projectId == resolvedId }
+    }
+
+    @Synchronized
+    override fun saveProjectCover(session: Session, cover: ProjectCover): BackgroundSyncResult {
+        val state = activeState(session)
+        val resolvedId = state.projectCache.resolveProjectId(cover.projectId)
+        require(state.projectCache.pages.any { it.project.id == resolvedId }) {
+            "The selected project is not available in saved local data"
+        }
+        require(cover.displayWidth > 0 && cover.displayHeight > 0) { "The display cover is invalid" }
+        require(cover.thumbnailWidth > 0 && cover.thumbnailHeight > 0) { "The cover thumbnail is invalid" }
+        require(cover.displayJpegBase64.isNotBlank() && cover.thumbnailJpegBase64.isNotBlank()) {
+            "The project cover has no display content"
+        }
+        val committed = cover.copy(projectId = resolvedId)
+        val updated = state.copy(
+            projectCache = state.projectCache.copy(
+                projectCovers = state.projectCache.projectCovers
+                    .filterNot { it.projectId == resolvedId } + committed,
+            ),
+        )
+        save(session, updated)
+        return updated.toResult()
+    }
+
+    @Synchronized
+    override fun removeProjectCover(session: Session, projectId: String): BackgroundSyncResult {
+        val state = activeState(session)
+        val resolvedId = state.projectCache.resolveProjectId(projectId)
+        val updated = state.copy(
+            projectCache = state.projectCache.copy(
+                projectCovers = state.projectCache.projectCovers.filterNot { it.projectId == resolvedId },
+            ),
+        )
+        save(session, updated)
+        return updated.toResult()
     }
 
     @Synchronized
@@ -1355,6 +1399,9 @@ class ProjectSyncRepository(
                 },
                 projectLinks = projectCache.projectLinks.map { identity ->
                     if (identity.projectId == provisionalId) identity.copy(projectId = serverId) else identity
+                }.distinctBy { it.projectId },
+                projectCovers = projectCache.projectCovers.map { cover ->
+                    if (cover.projectId == provisionalId) cover.copy(projectId = serverId) else cover
                 }.distinctBy { it.projectId },
             ),
             projectDrafts = mappedDrafts,

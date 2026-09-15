@@ -1,10 +1,12 @@
 <resources>
     <style name="Theme.Blocks" parent="android:style/Theme.Material.Light.NoActionBar">
-        <item name="android:fontFamily">sans</item>
-        <item name="android:colorAccent">#356859</item>
-        <item name="android:navigationBarColor">#F6F3EA</item>
-        <item name="android:statusBarColor">#F6F3EA</item>
+        <item name="android:fontFamily">@font/inter_variable</item>
+        <item name="android:colorAccent">@color/blocks_teal</item>
+        <item name="android:windowBackground">@color/blocks_paper</item>
+        <item name="android:navigationBarColor">@color/blocks_paper</item>
+        <item name="android:statusBarColor">@color/blocks_paper</item>
         <item name="android:windowLightStatusBar">true</item>
         <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:windowNoTitle">true</item>
     </style>
 </resources>

@@ -28,6 +28,7 @@ import dev.blocks.android.project.BlockBinding
 import dev.blocks.android.project.BlockLookup
 import dev.blocks.android.project.PhysicalBlock
 import dev.blocks.android.project.ProjectCacheState
+import dev.blocks.android.project.ProjectCover
 import dev.blocks.android.project.ProjectIdentityMapping
 import dev.blocks.android.project.ProjectLifecycle
 import dev.blocks.android.project.ProjectMutationType
@@ -352,6 +353,7 @@ class ProjectSyncRepositoryTest {
         val token = OpaqueTagToken.fromBytes(ByteArray(32) { (it + 5).toByte() })
         repository.activate(SESSION_A)
         repository.queueCreateProject(SESSION_A, "Local project", "create-project", "local-project")
+        repository.saveProjectCover(SESSION_A, cover("local-project"))
         repository.beginTagProgramming(
             SESSION_A,
             "local-project",
@@ -370,7 +372,26 @@ class ProjectSyncRepositoryTest {
         assertEquals(PROJECT_ID, synced.cache.localBlockOperations.single {
             it.type == LocalBlockOperationType.BIND_BLOCK
         }.projectId)
+        assertEquals(PROJECT_ID, synced.cache.projectCovers.single().projectId)
         assertEquals(listOf("list-active", "create", "changes", "list-archived", "blocks"), service.calls)
+    }
+
+    @Test
+    fun projectCoverCommitsAtomicallyAndSurvivesRestartUntilExplicitRemoval() {
+        val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
+        val first = repository(FakeProjectService(), MemoryDrafts(), state)
+        first.activate(SESSION_A)
+
+        val committed = first.saveProjectCover(SESSION_A, cover(PROJECT_ID))
+
+        assertEquals(cover(PROJECT_ID), committed.cache.projectCovers.single())
+        val restarted = repository(FakeProjectService(), MemoryDrafts(), state)
+        restarted.activate(SESSION_A)
+        assertEquals(cover(PROJECT_ID), restarted.projectCover(SESSION_A, PROJECT_ID))
+
+        restarted.removeProjectCover(SESSION_A, PROJECT_ID)
+        assertEquals(null, restarted.projectCover(SESSION_A, PROJECT_ID))
+        assertTrue(state.loadSyncState(TENANT_A).projectCache.projectCovers.isEmpty())
     }
 
     @Test
@@ -1567,6 +1588,18 @@ class ProjectSyncRepositoryTest {
             project = project(tenantId = tenantId),
             notes = ProjectNotes(PROJECT_ID, "Server notes", 4, NOW),
             newestParking = null,
+        )
+
+        private fun cover(projectId: String) = ProjectCover(
+            projectId = projectId,
+            displayJpegBase64 = "display",
+            thumbnailJpegBase64 = "thumbnail",
+            displayWidth = 1200,
+            displayHeight = 675,
+            thumbnailWidth = 480,
+            thumbnailHeight = 270,
+            contentDigest = "b".repeat(64),
+            importedAt = NOW,
         )
 
         private fun projectParking(

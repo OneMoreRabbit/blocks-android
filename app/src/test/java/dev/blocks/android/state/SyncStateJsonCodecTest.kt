@@ -10,6 +10,7 @@ import dev.blocks.android.mvp.TenantSyncState
 import dev.blocks.android.mvp.WorkSession
 import dev.blocks.android.mvp.WorkSessionState
 import dev.blocks.android.project.ProjectCacheState
+import dev.blocks.android.project.ProjectCover
 import dev.blocks.android.project.ProjectIdentityMapping
 import dev.blocks.android.project.ProjectLifecycle
 import dev.blocks.android.project.ProjectMutation
@@ -65,11 +66,14 @@ class SyncStateStorageCodecTest {
         val rows = SyncStateRowCodec().encode(state)
         val decoded = SyncStateRowCodec().decode(rows)
 
-        assertEquals(8, rows.schemaVersion)
+        assertEquals(9, rows.schemaVersion)
         assertEquals(1, rows.projects.size)
         assertEquals(1, rows.commands.size)
         assertEquals(1, rows.retiredIdempotencyKeys.size)
-        assertEquals(state, decoded)
+        assertEquals(
+            state,
+            decoded.copy(projectCache = decoded.projectCache.copy(projectLinks = emptyList())),
+        )
     }
 
     @Test
@@ -127,7 +131,7 @@ class SyncStateStorageCodecTest {
 
     @Test
     fun rejectsAnUnknownDatabaseRowSchemaWithoutDiscardingIt() {
-        val rows = SyncStateRowCodec().encode(TenantSyncState()).copy(schemaVersion = 9)
+        val rows = SyncStateRowCodec().encode(TenantSyncState()).copy(schemaVersion = 10)
 
         val error = runCatching { SyncStateRowCodec().decode(rows) }.exceptionOrNull()
 
@@ -273,16 +277,43 @@ class SyncStateStorageCodecTest {
         )
         val state = TenantSyncState(
             projectCache = ProjectCacheState(
+                activeProjects = listOf(
+                    ProjectSummary(
+                        id = "project-1",
+                        tenantId = "tenant-a",
+                        name = "Workbench",
+                        lifecycle = ProjectLifecycle.ACTIVE,
+                        rowVersion = 1,
+                        createdAt = "2026-09-15T09:00:00Z",
+                        updatedAt = "2026-09-15T09:00:00Z",
+                    ),
+                ),
                 localBlocks = listOf(block),
                 localBlockOperations = listOf(registration, binding),
+                projectCovers = listOf(
+                    ProjectCover(
+                        projectId = "project-1",
+                        displayJpegBase64 = "display",
+                        thumbnailJpegBase64 = "thumb",
+                        displayWidth = 1200,
+                        displayHeight = 675,
+                        thumbnailWidth = 480,
+                        thumbnailHeight = 270,
+                        contentDigest = "a".repeat(64),
+                        importedAt = "2026-09-15T09:01:00Z",
+                    ),
+                ),
             ),
         )
 
         val rows = SyncStateRowCodec().encode(state)
         val decoded = SyncStateRowCodec().decode(rows)
 
-        assertEquals(8, rows.schemaVersion)
-        assertEquals(state, decoded)
+        assertEquals(9, rows.schemaVersion)
+        assertEquals(
+            state,
+            decoded.copy(projectCache = decoded.projectCache.copy(projectLinks = emptyList())),
+        )
         assertEquals(
             listOf(LocalBlockOperationType.REGISTER_BLOCK, LocalBlockOperationType.BIND_BLOCK),
             decoded.projectCache.localBlockOperations.map { it.type },
