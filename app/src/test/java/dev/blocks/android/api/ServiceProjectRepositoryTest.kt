@@ -3,6 +3,9 @@ package dev.blocks.android.api
 import dev.blocks.android.mvp.ParkingDraft
 import dev.blocks.android.mvp.Session
 import dev.blocks.android.project.ProjectLifecycle
+import dev.blocks.android.project.ProjectItemMutation
+import dev.blocks.android.project.ProjectItemMutationType
+import dev.blocks.android.tag.ProjectKey
 import dev.blocks.android.sync.ProjectSyncRepository
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -126,6 +129,36 @@ class ServiceProjectRepositoryTest {
         repository.projectPage(SESSION, PROJECT_ID)
     }
 
+    @Test
+    fun mapsApi06ReceiptProvenanceAndNavigationAliasAsDistinctIdentities() {
+        val transport = FakeProjectTransport()
+        val repository = ServiceProjectRepository(transport)
+        val operation = ProjectItemMutation(
+            operationId = OPERATION_A,
+            type = ProjectItemMutationType.CREATE_NOTE,
+            targetId = ITEM_ID,
+            projectId = PROJECT_ID,
+            clientResourceId = ITEM_ID,
+            noteBody = "Offline note",
+            createdAt = NOW,
+        )
+        val key = requireNotNull(ProjectKey.parse(NAVIGATION_KEY))
+
+        val acknowledgement = repository.createNote(SESSION, operation)
+        val attached = repository.attachNavigationKey(SESSION, PROJECT_ID, key)
+        val resolved = repository.resolveNavigationKey(SESSION, key)
+
+        assertEquals(OPERATION_A, acknowledgement.operationId)
+        assertEquals(OPERATION_B, acknowledgement.item.lastOperationId)
+        assertEquals(2, acknowledgement.item.rowVersion)
+        assertEquals(NAVIGATION_KEY, attached.encoded)
+        assertEquals(PROJECT_ID, resolved)
+        assertEquals(OPERATION_A, JSONObject(transport.createNoteBody).getString("operation_id"))
+        assertEquals(ITEM_ID, JSONObject(transport.createNoteBody).getString("id"))
+        assertEquals(NAVIGATION_KEY, JSONObject(transport.aliasBody).getString("project_key"))
+        assertEquals(NAVIGATION_KEY, JSONObject(transport.resolveBody).getString("project_key"))
+    }
+
     private class FakeProjectTransport(
         private val pageTenant: String = TENANT_ID,
         private val oldCreateResponse: Boolean = false,
@@ -144,6 +177,9 @@ class ServiceProjectRepositoryTest {
         var registrationBody: String = ""
         var registrationCalls = 0
         var unbound = false
+        var createNoteBody = ""
+        var aliasBody = ""
+        var resolveBody = ""
 
         override fun listProjects(identityToken: String, tenantId: String, status: String): ApiResponse {
             requestedStatus = status
@@ -263,6 +299,28 @@ class ServiceProjectRepositoryTest {
             """{"events":[{"eventId":"41","eventType":"project.notes_saved","eventVersion":"0.1","occurredAt":"$NOW","payload":{"projectId":"$PROJECT_ID","rowVersion":4},"tenantId":"$TENANT_ID"}],"next_since":"41","has_more":false}""",
         )
 
+        override fun createNote(identityToken: String, tenantId: String, projectId: String, body: String): ApiResponse {
+            createNoteBody = body
+            return success(noteAckJson())
+        }
+
+        override fun attachNavigationAlias(
+            identityToken: String,
+            tenantId: String,
+            projectId: String,
+            body: String,
+        ): ApiResponse {
+            aliasBody = body
+            return success(
+                """{"tenant_id":"$TENANT_ID","project_id":"$PROJECT_ID","project_key":"$NAVIGATION_KEY","created_at":"$NOW"}""",
+            )
+        }
+
+        override fun resolveNavigationAlias(identityToken: String, tenantId: String, body: String): ApiResponse {
+            resolveBody = body
+            return success("""{"project_id":"$PROJECT_ID"}""")
+        }
+
         private fun success(body: String) = ApiResponse.Success(200, body)
     }
 
@@ -304,6 +362,13 @@ class ServiceProjectRepositoryTest {
         private fun parkingJson() =
             """{"id":"$PARKING_ID","project_id":"$PROJECT_ID","where_i_am":"Here","next_physical_action":"Next","must_not_forget":"Remember","authored_by_user_id":"$USER_ID","device_id":null,"supersedes_id":null,"created_at":"$NOW","occurred_at":"$NOW","client_id":"$CLIENT_ID"}"""
 
+        private fun noteAckJson() =
+            """{"authored_by_user_id":"$USER_ID","body":"Later state","created_at":"$NOW","deleted_at":null,"id":"$ITEM_ID","last_operation_id":"$OPERATION_B","operation_id":"$OPERATION_A","pinned":true,"project_id":"$PROJECT_ID","row_version":2,"tenant_id":"$TENANT_ID","updated_at":"$NOW"}"""
+
         private const val CLIENT_ID = "00000000-0000-0000-0000-000000000098"
+        private const val ITEM_ID = "00000000-0000-4000-8000-000000000009"
+        private const val OPERATION_A = "00000000-0000-4000-8000-00000000000a"
+        private const val OPERATION_B = "00000000-0000-4000-8000-00000000000b"
+        private const val NAVIGATION_KEY = "00000000-0000-4000-8000-00000000000c"
     }
 }

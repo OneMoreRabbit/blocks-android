@@ -32,4 +32,28 @@ class ProjectResourceUriTest {
             "https://example.com/line\nbreak",
         ).forEach { value -> assertFalse("Unexpectedly accepted $value", ProjectResourceUri.canLaunch(value)) }
     }
+
+    @Test
+    fun matchesTheApi06PrintableAsciiAndAuthorityBoundary() {
+        listOf(
+            "HTTPS://Example.COM/path",
+            "https://example.com/caf%C3%A9",
+            "https://127.0.0.1:65535/path",
+            "https://[2001:db8::1]/path",
+            "obsidian://new?vault=Blocks&name=Note%20one",
+        ).forEach { value -> assertTrue("Unexpectedly rejected $value", ProjectResourceUri.canLaunch(value)) }
+
+        listOf(
+            "https://example.com/café",
+            "https://example.com/space here",
+            "https://user@example.com/path",
+            "https://127.00.0.1/path",
+            "https://example.com:0/path",
+            "https://example.com:65536/path",
+            "https://bad_host.example/path",
+            "https://[fe80::1%25eth0]/path",
+            "obsidian://",
+            "obsidian://open\t?vault=Blocks",
+        ).forEach { value -> assertFalse("Unexpectedly accepted $value", ProjectResourceUri.canLaunch(value)) }
+    }
 }

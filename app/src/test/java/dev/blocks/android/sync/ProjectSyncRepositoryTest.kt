@@ -43,6 +43,7 @@ import dev.blocks.android.project.ProjectNotes
 import dev.blocks.android.project.ProjectNoteItem
 import dev.blocks.android.project.ProjectPage
 import dev.blocks.android.project.ProjectParking
+import dev.blocks.android.project.ProjectResourceLink
 import dev.blocks.android.project.ProjectService
 import dev.blocks.android.project.ProjectSummary
 import dev.blocks.android.project.RegisteredBlock
@@ -50,6 +51,7 @@ import dev.blocks.android.tag.LocalBlockOperationType
 import dev.blocks.android.tag.LocalBlockState
 import dev.blocks.android.tag.LocalTagResolution
 import dev.blocks.android.tag.OpaqueTagToken
+import dev.blocks.android.tag.ProjectKey
 import dev.blocks.android.tag.TagActivationMedium
 import dev.blocks.android.tag.TagProgrammingFailure
 import java.io.IOException
@@ -65,6 +67,165 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ProjectSyncRepositoryTest {
+    @Test
+    fun api06QueueReplaysAfterRestartInDependencyOrderAndAttachesTheDistinctNavigationAlias() {
+        val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
+        val service = FakeProjectService()
+        var repository = repository(service, MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+        val noteId = "10000000-0000-4000-8000-000000000041"
+        val linkId = "20000000-0000-4000-8000-000000000042"
+        repository.addNoteItem(SESSION_A, PROJECT_ID, "First", "note-create-41", noteId)
+        repository.editNoteItem(SESSION_A, noteId, "Second", "note-edit-41")
+        repository.setNoteItemPinned(SESSION_A, noteId, true, "note-pin-41")
+        repository.addResourceLink(
+            SESSION_A,
+            PROJECT_ID,
+            "Reference",
+            "https://example.com/reference",
+            "link-create-41",
+            linkId,
+        )
+        repository.editResourceLink(
+            SESSION_A,
+            linkId,
+            "Updated",
+            "https://example.com/updated",
+            "link-edit-41",
+        )
+        val navigationKey = repository.projectLink(SESSION_A, PROJECT_ID).key
+
+        repository = repository(service, MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+        val synced = repository.backgroundSync(SESSION_A)
+
+        assertEquals(
+            listOf("note-create-41", "note-edit-41", "note-pin-41", "link-create-41", "link-edit-41"),
+            service.itemOperationIds,
+        )
+        assertTrue(synced.cache.itemOperations.isEmpty())
+        assertEquals("Second", synced.cache.noteItems.single { it.id == noteId }.body)
+        assertTrue(synced.cache.noteItems.single { it.id == noteId }.pinned)
+        assertEquals("https://example.com/updated", synced.cache.resourceLinks.single { it.id == linkId }.uri)
+        assertEquals(navigationKey, service.navigationAliases[PROJECT_ID])
+        assertFalse(navigationKey.encoded == synced.cache.activeProjects.single { it.id == PROJECT_ID }.clientId)
+        assertEquals(0, synced.pendingNavigationAliases)
+    }
+
+    @Test
+    fun ambiguousItemResponseReplaysTheExactEnvelopeAndConflictReadRetainsLocalIntent() {
+        val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
+        val service = FakeProjectService().apply { loseItemResponseFor = "ambiguous-create" }
+        var repository = repository(service, MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+        val noteId = "30000000-0000-4000-8000-000000000043"
+        repository.addNoteItem(SESSION_A, PROJECT_ID, "Created offline", "ambiguous-create", noteId)
+
+        val uncertain = repository.backgroundSync(SESSION_A)
+        assertTrue(uncertain.cache.itemOperations.single().deliveryUncertain)
+        assertEquals(1, service.acceptedItemOperations.count { it == "ambiguous-create" })
+
+        repository = repository(service, MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+        val replayed = repository.backgroundSync(SESSION_A)
+        assertTrue(replayed.cache.itemOperations.isEmpty())
+        assertEquals(listOf("ambiguous-create", "ambiguous-create"), service.itemOperationIds.take(2))
+        assertEquals(1, service.acceptedItemOperations.count { it == "ambiguous-create" })
+
+        repository.editNoteItem(SESSION_A, noteId, "Keep my local edit", "conflicting-edit")
+        service.conflictItemOperation = "conflicting-edit"
+        val conflict = repository.backgroundSync(SESSION_A)
+
+        assertEquals(ProjectMutationStatus.REQUIRES_RECONCILIATION, conflict.cache.itemOperations.single().status)
+        assertEquals("Keep my local edit", conflict.cache.noteItems.single { it.id == noteId }.body)
+        assertFalse(conflict.cache.itemOperations.single().deliveryUncertain)
+    }
+
+    @Test
+    fun itemEventFetchAndCursorCommitStayTogetherWhileUnknownEventsAdvance() {
+        val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
+        val service = FakeProjectService()
+        val noteId = "40000000-0000-4000-8000-000000000044"
+        service.remoteNotes[noteId] = ProjectNoteItem(
+            noteId,
+            PROJECT_ID,
+            "Remote tombstone",
+            false,
+            "00000000-0000-4000-8000-000000000111",
+            NOW,
+            NOW,
+            3,
+            deletedAt = NOW,
+            lastOperationId = "remote-delete",
+        )
+        val itemEvent = event(
+            "41",
+            "project.note_deleted",
+            mapOf("projectId" to PROJECT_ID, "itemId" to noteId, "operationId" to "remote-delete"),
+        )
+        val unknownEvent = event("42", "project.future_event", mapOf("futureId" to "opaque"))
+        service.changePages += ChangePage(listOf(itemEvent, unknownEvent), "42", false)
+        service.failItemRead = true
+        val repository = repository(service, MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+
+        val deferred = repository.backgroundSync(SESSION_A)
+        assertEquals(null, deferred.cursor)
+        assertTrue(deferred.cache.noteItems.none { it.id == noteId })
+
+        service.failItemRead = false
+        service.changePages += ChangePage(listOf(itemEvent, unknownEvent), "42", false)
+        val synchronized = repository.backgroundSync(SESSION_A)
+        assertEquals("42", synchronized.cursor)
+        assertEquals(NOW, synchronized.cache.noteItems.single { it.id == noteId }.deletedAt)
+    }
+
+    @Test
+    fun retryingEarlierReceiptDoesNotRewriteAFrozenLaterEnvelopeFromCurrentStateProvenance() {
+        val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
+        val repository = repository(FakeProjectService(), MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+        val noteId = "50000000-0000-4000-8000-000000000045"
+        repository.addNoteItem(SESSION_A, PROJECT_ID, "A", "operation-a", noteId)
+        repository.editNoteItem(SESSION_A, noteId, "B", "operation-b")
+        val before = state.loadSyncState(TENANT_A)
+        state.saveSyncState(
+            TENANT_A,
+            before.copy(
+                projectCache = before.projectCache.copy(
+                    itemOperations = before.projectCache.itemOperations.map {
+                        if (it.operationId == "operation-b") it.copy(ifMatch = 2) else it
+                    },
+                ),
+            ),
+        )
+        val restarted = repository(FakeProjectService(), MemoryDrafts(), state)
+        restarted.activate(SESSION_A)
+
+        restarted.acknowledgeProjectItem(
+            SESSION_A,
+            ProjectItemAcknowledgement.Note(
+                "operation-a",
+                ProjectNoteItem(
+                    noteId,
+                    PROJECT_ID,
+                    "B is already authoritative",
+                    false,
+                    "00000000-0000-4000-8000-000000000111",
+                    NOW,
+                    NOW,
+                    2,
+                    lastOperationId = "operation-b",
+                ),
+            ),
+        )
+
+        val remaining = state.loadSyncState(TENANT_A).projectCache.itemOperations.single()
+        assertEquals("operation-b", remaining.operationId)
+        assertEquals(2, remaining.ifMatch)
+        assertEquals(null, remaining.dependsOnOperationId)
+    }
+
     @Test
     fun exactItemAcknowledgementsHandOffVersionsAcrossRestartWhileAmbiguityAndConflictStayClosed() {
         val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
@@ -877,8 +1038,9 @@ class ProjectSyncRepositoryTest {
         assertEquals(listOf("Saved while create waits"), service.savedNotesBodies)
         assertEquals(setOf(PROJECT_ID), durable.noteItems.map { it.projectId }.toSet())
         assertEquals(setOf(PROJECT_ID), durable.resourceLinks.map { it.projectId }.toSet())
-        assertEquals(2, durable.itemOperations.size)
-        assertTrue(durable.itemOperations.all { it.projectId == PROJECT_ID && it.dependsOnOperationId == null })
+        assertTrue(durable.itemOperations.isEmpty())
+        assertTrue(durable.retiredItemOperationIds.containsAll(listOf("item-concurrent", "link-concurrent")))
+        assertTrue(service.itemOperationIds.containsAll(listOf("item-concurrent", "link-concurrent")))
     }
 
     @Test
@@ -1714,6 +1876,16 @@ class ProjectSyncRepositoryTest {
         private val parkingByClientId = mutableMapOf<String, ProjectParking>()
         private val lostCreateResponses = mutableSetOf<String>()
         val changePages = ArrayDeque<ChangePage>()
+        val remoteNotes = mutableMapOf<String, ProjectNoteItem>()
+        val remoteLinks = mutableMapOf<String, ProjectResourceLink>()
+        val itemOperationIds = mutableListOf<String>()
+        val acceptedItemOperations = mutableListOf<String>()
+        val navigationAliases = mutableMapOf<String, ProjectKey>()
+        var loseItemResponseFor: String? = null
+        var conflictItemOperation: String? = null
+        var failItemRead = false
+        private val itemReceipts = mutableSetOf<String>()
+        private val lostItemResponses = mutableSetOf<String>()
         lateinit var changesEntered: CountDownLatch
         lateinit var allowChanges: CountDownLatch
         lateinit var createEntered: CountDownLatch
@@ -1884,6 +2056,168 @@ class ProjectSyncRepositoryTest {
                 check(allowChanges.await(2, TimeUnit.SECONDS)) { "Timed out waiting to release changes" }
             }
             return if (changePages.isEmpty()) ChangePage(emptyList(), cursor, false) else changePages.removeFirst()
+        }
+
+        override fun createNote(
+            session: Session,
+            operation: ProjectItemMutation,
+        ): ProjectItemAcknowledgement.Note = noteMutation(operation) { current ->
+            current ?: ProjectNoteItem(
+                operation.targetId,
+                operation.projectId,
+                requireNotNull(operation.noteBody),
+                false,
+                "00000000-0000-4000-8000-000000000111",
+                NOW,
+                NOW,
+                1,
+                lastOperationId = operation.operationId,
+            )
+        }
+
+        override fun editNote(
+            session: Session,
+            operation: ProjectItemMutation,
+        ): ProjectItemAcknowledgement.Note = noteMutation(operation) { current ->
+            requireNotNull(current).copy(
+                body = requireNotNull(operation.noteBody),
+                updatedAt = NOW,
+                rowVersion = current.rowVersion + 1,
+                lastOperationId = operation.operationId,
+            )
+        }
+
+        override fun pinNote(
+            session: Session,
+            operation: ProjectItemMutation,
+        ): ProjectItemAcknowledgement.Note = noteMutation(operation) { current ->
+            requireNotNull(current).copy(
+                pinned = requireNotNull(operation.pinned),
+                updatedAt = NOW,
+                rowVersion = current.rowVersion + 1,
+                lastOperationId = operation.operationId,
+            )
+        }
+
+        override fun deleteNote(
+            session: Session,
+            operation: ProjectItemMutation,
+        ): ProjectItemAcknowledgement.Note = noteMutation(operation) { current ->
+            requireNotNull(current).copy(
+                updatedAt = NOW,
+                rowVersion = current.rowVersion + 1,
+                deletedAt = NOW,
+                lastOperationId = operation.operationId,
+            )
+        }
+
+        override fun readNote(session: Session, projectId: String, noteId: String): ProjectNoteItem {
+            if (failItemRead) throw IOException("item read unavailable")
+            return requireNotNull(remoteNotes[noteId]).also { require(it.projectId == projectId) }
+        }
+
+        override fun createLink(
+            session: Session,
+            operation: ProjectItemMutation,
+        ): ProjectItemAcknowledgement.Link = linkMutation(operation) { current ->
+            current ?: ProjectResourceLink(
+                operation.targetId,
+                operation.projectId,
+                requireNotNull(operation.linkTitle),
+                requireNotNull(operation.linkUri),
+                NOW,
+                NOW,
+                1,
+                lastOperationId = operation.operationId,
+            )
+        }
+
+        override fun editLink(
+            session: Session,
+            operation: ProjectItemMutation,
+        ): ProjectItemAcknowledgement.Link = linkMutation(operation) { current ->
+            requireNotNull(current).copy(
+                title = requireNotNull(operation.linkTitle),
+                uri = requireNotNull(operation.linkUri),
+                updatedAt = NOW,
+                rowVersion = current.rowVersion + 1,
+                lastOperationId = operation.operationId,
+            )
+        }
+
+        override fun deleteLink(
+            session: Session,
+            operation: ProjectItemMutation,
+        ): ProjectItemAcknowledgement.Link = linkMutation(operation) { current ->
+            requireNotNull(current).copy(
+                updatedAt = NOW,
+                rowVersion = current.rowVersion + 1,
+                deletedAt = NOW,
+                lastOperationId = operation.operationId,
+            )
+        }
+
+        override fun readLink(session: Session, projectId: String, linkId: String): ProjectResourceLink {
+            if (failItemRead) throw IOException("item read unavailable")
+            return requireNotNull(remoteLinks[linkId]).also { require(it.projectId == projectId) }
+        }
+
+        override fun attachNavigationKey(session: Session, projectId: String, key: ProjectKey): ProjectKey {
+            failIfNeeded()
+            val current = navigationAliases.putIfAbsent(projectId, key)
+            if (current != null && current != key) throw ServiceException(409, ApiError(ApiErrorCode.CONFLICT, "Alias exists"))
+            return current ?: key
+        }
+
+        override fun resolveNavigationKey(session: Session, key: ProjectKey): String? {
+            failIfNeeded()
+            return navigationAliases.entries.firstOrNull { it.value == key }?.key
+        }
+
+        private fun noteMutation(
+            operation: ProjectItemMutation,
+            apply: (ProjectNoteItem?) -> ProjectNoteItem,
+        ): ProjectItemAcknowledgement.Note {
+            itemOperationIds += operation.operationId
+            failIfNeeded()
+            if (conflictItemOperation == operation.operationId) {
+                throw ServiceException(409, ApiError(ApiErrorCode.CONFLICT, "Item changed"))
+            }
+            if (itemReceipts.add(operation.operationId)) {
+                remoteNotes[operation.targetId] = apply(remoteNotes[operation.targetId])
+                acceptedItemOperations += operation.operationId
+            }
+            val acknowledgement = ProjectItemAcknowledgement.Note(
+                operation.operationId,
+                requireNotNull(remoteNotes[operation.targetId]),
+            )
+            if (loseItemResponseFor == operation.operationId && lostItemResponses.add(operation.operationId)) {
+                throw IOException("response lost after item acceptance")
+            }
+            return acknowledgement
+        }
+
+        private fun linkMutation(
+            operation: ProjectItemMutation,
+            apply: (ProjectResourceLink?) -> ProjectResourceLink,
+        ): ProjectItemAcknowledgement.Link {
+            itemOperationIds += operation.operationId
+            failIfNeeded()
+            if (conflictItemOperation == operation.operationId) {
+                throw ServiceException(409, ApiError(ApiErrorCode.CONFLICT, "Item changed"))
+            }
+            if (itemReceipts.add(operation.operationId)) {
+                remoteLinks[operation.targetId] = apply(remoteLinks[operation.targetId])
+                acceptedItemOperations += operation.operationId
+            }
+            val acknowledgement = ProjectItemAcknowledgement.Link(
+                operation.operationId,
+                requireNotNull(remoteLinks[operation.targetId]),
+            )
+            if (loseItemResponseFor == operation.operationId && lostItemResponses.add(operation.operationId)) {
+                throw IOException("response lost after item acceptance")
+            }
+            return acknowledgement
         }
 
         fun expireIdempotencyResults() {

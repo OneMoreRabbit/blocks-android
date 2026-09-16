@@ -320,6 +320,33 @@ class AndroidNormalizedSyncStateStoreTest {
     }
 
     @Test
+    fun realDatabaseRetainsApi06ProvenanceAndNonconformingLegacyLinkForReconciliation() {
+        val initial = state(TENANT).withoutCommands().withExistingItems()
+        val retained = initial.copy(
+            projectCache = initial.projectCache.copy(
+                noteItems = initial.projectCache.noteItems.map {
+                    it.copy(lastOperationId = "00000000-0000-4000-8000-0000000000a1")
+                },
+                resourceLinks = initial.projectCache.resourceLinks.map {
+                    it.copy(
+                        uri = "https://example.com/café",
+                        lastOperationId = "00000000-0000-4000-8000-0000000000b1",
+                        requiresReconciliation = true,
+                    )
+                },
+            ),
+        )
+
+        store.saveSyncState(TENANT, retained)
+        val restored = AndroidSyncStateStore(context).loadSyncState(TENANT).projectCache
+
+        assertEquals("00000000-0000-4000-8000-0000000000a1", restored.noteItems.single().lastOperationId)
+        assertEquals("00000000-0000-4000-8000-0000000000b1", restored.resourceLinks.single().lastOperationId)
+        assertEquals("https://example.com/café", restored.resourceLinks.single().uri)
+        assertTrue(restored.resourceLinks.single().requiresReconciliation)
+    }
+
+    @Test
     fun notesSubmitTouchesOnlyNotesAndQueueRowsInOneTransaction() {
         val initial = state(TENANT).copy(projectCache = state(TENANT).projectCache.copy(commands = emptyList()))
         store.saveSyncState(TENANT, initial)

@@ -33,6 +33,8 @@ data class ProjectSummary(
     val updatedAt: String,
     val archivedAt: String? = null,
     val clientId: String? = null,
+    /** API 0.6 navigation alias. Distinct from [clientId]. */
+    val navigationKey: String? = null,
 )
 
 data class ProjectNotes(
@@ -67,6 +69,8 @@ data class ProjectNoteItem(
     val updatedAt: String,
     val rowVersion: Int = 0,
     val deletedAt: String? = null,
+    /** State provenance only; acknowledgement is always the response/event operation id. */
+    val lastOperationId: String? = null,
 )
 
 data class ProjectResourceLink(
@@ -78,6 +82,10 @@ data class ProjectResourceLink(
     val updatedAt: String,
     val rowVersion: Int = 0,
     val deletedAt: String? = null,
+    /** State provenance only; acknowledgement is always the response/event operation id. */
+    val lastOperationId: String? = null,
+    /** Retained local value that cannot cross the accepted API 0.6 URI boundary unchanged. */
+    val requiresReconciliation: Boolean = false,
 )
 
 data class ProjectPage(
@@ -181,7 +189,7 @@ enum class ProjectItemMutationType {
     DELETE_LINK,
 }
 
-/** Durable API-0.6-shaped intent. It remains local until reviewed API 0.6 artifacts exist. */
+/** Durable API 0.6 intent; the complete envelope is immutable across retry and restart. */
 data class ProjectItemMutation(
     val operationId: String,
     val type: ProjectItemMutationType,
@@ -200,7 +208,7 @@ data class ProjectItemMutation(
     val contractVersion: String = "0.6",
 )
 
-/** Exact API-0.6-shaped acknowledgement applied by the future transport adapter. */
+/** Exact API 0.6 acknowledgement. [operationId], never item provenance, retires the queue entry. */
 sealed interface ProjectItemAcknowledgement {
     val operationId: String
     val projectId: String
@@ -293,6 +301,7 @@ data class BackgroundSyncResult(
     val conflict: ProjectConflict? = null,
     val pendingBlockOperations: Int = 0,
     val pendingItemOperations: Int = 0,
+    val pendingNavigationAliases: Int = 0,
 )
 
 data class ProjectConflict(
@@ -347,6 +356,28 @@ interface ProjectService {
     fun unbindBlock(session: Session, blockId: String)
     fun lookupBlock(session: Session, tagToken: String): BlockLookup
     fun changes(session: Session, cursor: String?, limit: Int = 100): ChangePage
+    fun createNote(session: Session, operation: ProjectItemMutation): ProjectItemAcknowledgement.Note =
+        throw UnsupportedOperationException("Service API 0.6 note items are unavailable")
+    fun editNote(session: Session, operation: ProjectItemMutation): ProjectItemAcknowledgement.Note =
+        throw UnsupportedOperationException("Service API 0.6 note items are unavailable")
+    fun pinNote(session: Session, operation: ProjectItemMutation): ProjectItemAcknowledgement.Note =
+        throw UnsupportedOperationException("Service API 0.6 note items are unavailable")
+    fun deleteNote(session: Session, operation: ProjectItemMutation): ProjectItemAcknowledgement.Note =
+        throw UnsupportedOperationException("Service API 0.6 note items are unavailable")
+    fun readNote(session: Session, projectId: String, noteId: String): ProjectNoteItem =
+        throw UnsupportedOperationException("Service API 0.6 note items are unavailable")
+    fun createLink(session: Session, operation: ProjectItemMutation): ProjectItemAcknowledgement.Link =
+        throw UnsupportedOperationException("Service API 0.6 resource links are unavailable")
+    fun editLink(session: Session, operation: ProjectItemMutation): ProjectItemAcknowledgement.Link =
+        throw UnsupportedOperationException("Service API 0.6 resource links are unavailable")
+    fun deleteLink(session: Session, operation: ProjectItemMutation): ProjectItemAcknowledgement.Link =
+        throw UnsupportedOperationException("Service API 0.6 resource links are unavailable")
+    fun readLink(session: Session, projectId: String, linkId: String): ProjectResourceLink =
+        throw UnsupportedOperationException("Service API 0.6 resource links are unavailable")
+    fun attachNavigationKey(session: Session, projectId: String, key: ProjectKey): ProjectKey =
+        throw UnsupportedOperationException("Service API 0.6 navigation aliases are unavailable")
+    fun resolveNavigationKey(session: Session, key: ProjectKey): String? =
+        throw UnsupportedOperationException("Service API 0.6 navigation aliases are unavailable")
 }
 
 fun interface SessionAuthenticator {
@@ -385,6 +416,7 @@ interface ProjectWorkspace {
     fun projectLink(session: Session, projectId: String): ProjectLink =
         throw UnsupportedOperationException("Project links are unavailable")
     fun resolveProjectLinkLocally(session: Session, key: ProjectKey): String? = null
+    fun resolveProjectLinkThroughService(session: Session, key: ProjectKey): String? = null
     fun prepareDirectTagWrite(
         session: Session,
         projectId: String,
@@ -573,7 +605,8 @@ internal fun ProjectCacheState.ensureProjectLinks(
     val usedKeys = links.map { it.key }.toMutableSet()
     knownProjects.forEach { project ->
         if (links.any { it.projectId == project.id }) return@forEach
-        val preferred = project.clientId?.let(ProjectKey::parse)?.takeIf(usedKeys::add)
+        val preferred = project.navigationKey?.let(ProjectKey::parse)?.takeIf(usedKeys::add)
+            ?: project.clientId?.let(ProjectKey::parse)?.takeIf(usedKeys::add)
         val key = preferred ?: generateSequence(keyFactory::create).first(usedKeys::add)
         links += ProjectLinkIdentity(project.id, key)
     }

@@ -53,6 +53,7 @@ import dev.blocks.android.tag.OpaqueTagToken
 import dev.blocks.android.tag.ProjectKey
 import dev.blocks.android.tag.ProjectKeyFactory
 import dev.blocks.android.tag.ProjectLink
+import dev.blocks.android.tag.ProjectLinkIdentity
 import dev.blocks.android.tag.TagActivationMedium
 import dev.blocks.android.tag.TagProgrammingFailure
 import java.io.IOException
@@ -262,6 +263,33 @@ class ProjectSyncRepository(
         val state = activeState(session)
         val projectId = state.projectCache.projectLinks.firstOrNull { it.key == key }?.projectId ?: return null
         return projectId.takeIf { candidate -> state.projectCache.pages.any { it.project.id == candidate } }
+    }
+
+    @Synchronized
+    override fun resolveProjectLinkThroughService(session: Session, key: ProjectKey): String? {
+        resolveProjectLinkLocally(session, key)?.let { return it }
+        val projectId = service.resolveNavigationKey(session, key) ?: return null
+        var state = activeState(session)
+        if (state.projectCache.pages.none { it.project.id == projectId }) {
+            state = state.withPage(service.projectPage(session, projectId)).withProjectLinks()
+        }
+        val existingForProject = state.projectCache.projectLinks.firstOrNull { it.projectId == projectId }
+        val existingForKey = state.projectCache.projectLinks.firstOrNull { it.key == key }
+        require(existingForKey == null || existingForKey.projectId == projectId) {
+            "A navigation key cannot resolve to two local projects"
+        }
+        require(existingForProject == null || existingForProject.key == key) {
+            "Service navigation identity conflicts with the retained local project key"
+        }
+        if (existingForProject == null) {
+            state = state.copy(
+                projectCache = state.projectCache.copy(
+                    projectLinks = state.projectCache.projectLinks + ProjectLinkIdentity(projectId, key),
+                ),
+            )
+        }
+        save(session, state)
+        return projectId
     }
 
     @Synchronized
@@ -1116,7 +1144,13 @@ class ProjectSyncRepository(
         session: Session,
         acknowledgement: ProjectItemAcknowledgement,
     ): BackgroundSyncResult {
-        val state = activeState(session)
+        return save(session, applyProjectItemAcknowledgement(activeState(session), acknowledgement)).toResult()
+    }
+
+    private fun applyProjectItemAcknowledgement(
+        state: TenantSyncState,
+        acknowledgement: ProjectItemAcknowledgement,
+    ): TenantSyncState {
         val operationIndex = state.projectCache.itemOperations.indexOfFirst {
             it.operationId == acknowledgement.operationId
         }
@@ -1156,12 +1190,12 @@ class ProjectSyncRepository(
             it.operationId == operation.operationId
         }.map { pending ->
             if (pending.dependsOnOperationId == operation.operationId) {
-                pending.copy(ifMatch = authoritativeVersion, dependsOnOperationId = null)
+                pending.copy(ifMatch = pending.ifMatch ?: authoritativeVersion, dependsOnOperationId = null)
             } else {
                 pending
             }
         }
-        val acknowledged = when (acknowledgement) {
+        return when (acknowledgement) {
             is ProjectItemAcknowledgement.Note -> state.copy(
                 projectCache = state.projectCache.copy(
                     noteItems = state.projectCache.noteItems.filterNot { it.id == acknowledgement.item.id } +
@@ -1183,7 +1217,6 @@ class ProjectSyncRepository(
                 ),
             )
         }.reapplyPendingItemProjection(operation.targetId)
-        return save(session, acknowledged).toResult()
     }
 
     @Synchronized
@@ -1315,9 +1348,11 @@ class ProjectSyncRepository(
                 state = verifyApi04BeforeMutation(session, state) ?: return state.toResult()
             }
             state = drainProjectQueue(session, state)
+            state = drainProjectItemQueue(session, state)
             state = synchronizeChangesBestEffort(session, state)
             state = legacyReplayer.replay(session, state)
             state = refreshInvalidatedBestEffort(session, state)
+            state = synchronizeNavigationAliasesBestEffort(session, state)
             state = save(session, state)
             return state.toResult()
         } catch (error: Exception) {
@@ -1495,6 +1530,99 @@ class ProjectSyncRepository(
         }
     }
 
+    private fun drainProjectItemQueue(session: Session, initial: TenantSyncState): TenantSyncState {
+        var state = initial
+        while (true) {
+            val operation = state.projectCache.itemOperations.firstOrNull() ?: return state
+            val dependency = operation.dependsOnOperationId
+            if (dependency != null && (
+                    state.projectCache.itemOperations.any { it.operationId == dependency } ||
+                        state.projectCache.commands.any { it.operationId == dependency }
+                    )
+            ) return state
+            if (operation.status == ProjectMutationStatus.REQUIRES_RECONCILIATION) return state
+            if (
+                operation.type in setOf(ProjectItemMutationType.CREATE_LINK, ProjectItemMutationType.EDIT_LINK) &&
+                operation.linkUri?.let(ProjectResourceUri::canLaunch) == false
+            ) {
+                state = state.updateProjectItemOperation(operation.operationId) {
+                    it.copy(status = ProjectMutationStatus.REQUIRES_RECONCILIATION, deliveryUncertain = false)
+                }
+                return save(session, state)
+            }
+            try {
+                val acknowledgement = sendProjectItemOperation(session, operation)
+                state = applyProjectItemAcknowledgement(state, acknowledgement)
+                state = save(session, state)
+            } catch (error: Exception) {
+                error.handleMembershipRevocation(session)
+                if (error is ServiceException && error.status == 401) throw error
+                if (error.isDeferredItemSync()) {
+                    state = state.updateProjectItemOperation(operation.operationId) {
+                        it.copy(deliveryUncertain = true)
+                    }
+                    return save(session, state)
+                }
+                state = reconcileProjectItemConflict(session, state, operation)
+                return save(session, state)
+            }
+        }
+    }
+
+    private fun sendProjectItemOperation(
+        session: Session,
+        operation: ProjectItemMutation,
+    ): ProjectItemAcknowledgement = when (operation.type) {
+        ProjectItemMutationType.CREATE_NOTE -> service.createNote(session, operation)
+        ProjectItemMutationType.EDIT_NOTE -> service.editNote(session, operation)
+        ProjectItemMutationType.PIN_NOTE -> service.pinNote(session, operation)
+        ProjectItemMutationType.DELETE_NOTE -> service.deleteNote(session, operation)
+        ProjectItemMutationType.CREATE_LINK -> service.createLink(session, operation)
+        ProjectItemMutationType.EDIT_LINK -> service.editLink(session, operation)
+        ProjectItemMutationType.DELETE_LINK -> service.deleteLink(session, operation)
+    }
+
+    private fun reconcileProjectItemConflict(
+        session: Session,
+        initial: TenantSyncState,
+        operation: ProjectItemMutation,
+    ): TenantSyncState {
+        val authoritative = try {
+            when (operation.type) {
+                in NOTE_ITEM_TYPES -> ItemAuthoritativeState.Note(
+                    service.readNote(session, operation.projectId, operation.targetId),
+                )
+                in LINK_ITEM_TYPES -> ItemAuthoritativeState.Link(
+                    service.readLink(session, operation.projectId, operation.targetId),
+                )
+                else -> error("Unknown project item operation ${operation.type}")
+            }
+        } catch (error: Exception) {
+            error.handleMembershipRevocation(session)
+            if (error is ServiceException && error.status == 401) throw error
+            null
+        }
+        var state = when (authoritative) {
+            is ItemAuthoritativeState.Note -> initial.copy(
+                projectCache = initial.projectCache.copy(
+                    noteItems = initial.projectCache.noteItems.filterNot { it.id == authoritative.value.id } +
+                        authoritative.value,
+                ),
+            )
+            is ItemAuthoritativeState.Link -> initial.copy(
+                projectCache = initial.projectCache.copy(
+                    resourceLinks = initial.projectCache.resourceLinks.filterNot { it.id == authoritative.value.id } +
+                        authoritative.value,
+                ),
+            )
+            null -> initial
+        }
+        state = state.updateProjectItemOperation(operation.operationId) {
+            it.copy(status = ProjectMutationStatus.REQUIRES_RECONCILIATION, deliveryUncertain = false)
+        }
+        return state.reapplyPendingItemProjection(operation.targetId)
+    }
+
     private fun prepareCommand(
         session: Session,
         initial: TenantSyncState,
@@ -1621,7 +1749,7 @@ class ProjectSyncRepository(
                 val page = service.changes(session, requestedCursor, CHANGE_PAGE_SIZE)
                 page.validateOrderAfter(requestedCursor)
                 var updated = state
-                page.events.forEach { event -> updated = observeEvent(updated, event) }
+                page.events.forEach { event -> updated = observeEvent(session, updated, event) }
                 val nextCursor = page.nextCursor ?: requestedCursor
                 if (page.hasMore || page.events.isNotEmpty()) {
                     require(nextCursor != null && nextCursor != requestedCursor) {
@@ -1639,9 +1767,51 @@ class ProjectSyncRepository(
         }
     }
 
-    private fun observeEvent(state: TenantSyncState, event: ChangeEvent): TenantSyncState {
+    private fun observeEvent(session: Session, state: TenantSyncState, event: ChangeEvent): TenantSyncState {
         var updated = legacyReplayer.observe(state, event)
         val projectId = event.payload["projectId"]?.toString()
+        if (event.eventType in NOTE_ITEM_EVENTS) {
+            val resolvedProjectId = requireNotNull(projectId) { "A note event has no project identity" }
+            val itemId = requireNotNull(event.payload["itemId"]?.toString()) { "A note event has no item identity" }
+            val operationId = requireNotNull(event.payload["operationId"]?.toString()) {
+                "A note event has no operation identity"
+            }
+            val item = service.readNote(session, resolvedProjectId, itemId)
+            val pending = updated.projectCache.itemOperations.any {
+                it.operationId == operationId && it.projectId == resolvedProjectId && it.targetId == itemId
+            }
+            updated = if (pending) {
+                applyProjectItemAcknowledgement(updated, ProjectItemAcknowledgement.Note(operationId, item))
+            } else {
+                updated.copy(
+                    projectCache = updated.projectCache.copy(
+                        noteItems = updated.projectCache.noteItems.filterNot { it.id == itemId } + item,
+                    ),
+                ).reapplyPendingItemProjection(itemId)
+            }
+            return updated
+        }
+        if (event.eventType in LINK_ITEM_EVENTS) {
+            val resolvedProjectId = requireNotNull(projectId) { "A link event has no project identity" }
+            val itemId = requireNotNull(event.payload["itemId"]?.toString()) { "A link event has no item identity" }
+            val operationId = requireNotNull(event.payload["operationId"]?.toString()) {
+                "A link event has no operation identity"
+            }
+            val item = service.readLink(session, resolvedProjectId, itemId)
+            val pending = updated.projectCache.itemOperations.any {
+                it.operationId == operationId && it.projectId == resolvedProjectId && it.targetId == itemId
+            }
+            updated = if (pending) {
+                applyProjectItemAcknowledgement(updated, ProjectItemAcknowledgement.Link(operationId, item))
+            } else {
+                updated.copy(
+                    projectCache = updated.projectCache.copy(
+                        resourceLinks = updated.projectCache.resourceLinks.filterNot { it.id == itemId } + item,
+                    ),
+                ).reapplyPendingItemProjection(itemId)
+            }
+            return updated
+        }
         val cache = updated.projectCache
         val changed = when {
             event.eventType.startsWith("session.") -> cache
@@ -1706,6 +1876,30 @@ class ProjectSyncRepository(
             }
         }
         state = save(session, state)
+        return state
+    }
+
+    private fun synchronizeNavigationAliasesBestEffort(
+        session: Session,
+        initial: TenantSyncState,
+    ): TenantSyncState {
+        var state = initial
+        state.projectCache.projectLinks.toList().forEach { identity ->
+            if (identity.projectId in state.projectCache.provisionalProjectIds) return@forEach
+            val project = state.projectCache.projectSummary(identity.projectId) ?: return@forEach
+            if (project.navigationKey == identity.key.encoded) return@forEach
+            if (project.navigationKey != null) return@forEach
+            try {
+                val attached = service.attachNavigationKey(session, project.id, identity.key)
+                check(attached == identity.key) { "Service acknowledged a different navigation key" }
+                state = state.updateProject(project.id) { it.copy(navigationKey = identity.key.encoded) }
+                state = save(session, state)
+            } catch (error: Exception) {
+                error.handleMembershipRevocation(session)
+                if (error is ServiceException && error.status == 409) return@forEach
+                if (!error.isDeferredItemSync()) throw error
+            }
+        }
         return state
     }
 
@@ -2043,15 +2237,20 @@ class ProjectSyncRepository(
         require(state.projectCache.itemOperations.any { it.operationId == operationId }) {
             "The project item operation is not pending"
         }
-        val updated = state.copy(
-            projectCache = state.projectCache.copy(
-                itemOperations = state.projectCache.itemOperations.map {
-                    if (it.operationId == operationId) update(it) else it
-                },
-            ),
-        )
+        val updated = state.updateProjectItemOperation(operationId, update)
         return save(session, updated).toResult()
     }
+
+    private fun TenantSyncState.updateProjectItemOperation(
+        operationId: String,
+        update: (ProjectItemMutation) -> ProjectItemMutation,
+    ): TenantSyncState = copy(
+        projectCache = projectCache.copy(
+            itemOperations = projectCache.itemOperations.map {
+                if (it.operationId == operationId) update(it) else it
+            },
+        ),
+    )
 
     private fun TenantSyncState.reapplyPendingItemProjection(itemId: String): TenantSyncState {
         var projected = this
@@ -2256,11 +2455,20 @@ class ProjectSyncRepository(
     }
 
     private fun TenantSyncState.toResult(): BackgroundSyncResult {
+        val pendingAliases = projectCache.projectLinks.count { identity ->
+            identity.projectId !in projectCache.provisionalProjectIds &&
+                projectCache.projectSummary(identity.projectId)?.navigationKey != identity.key.encoded
+        }
         val reconciliation = projectCache.commands.any {
             it.status == ProjectMutationStatus.REQUIRES_RECONCILIATION
         } || projectCache.itemOperations.any {
             it.status == ProjectMutationStatus.REQUIRES_RECONCILIATION
-        } || commands.any { it.status.name == ProjectMutationStatus.REQUIRES_RECONCILIATION.name }
+        } || commands.any {
+            it.status.name == ProjectMutationStatus.REQUIRES_RECONCILIATION.name
+        } || projectCache.projectLinks.any { identity ->
+            val remoteKey = projectCache.projectSummary(identity.projectId)?.navigationKey
+            remoteKey != null && remoteKey != identity.key.encoded
+        }
         val conflicting = projectCache.commands.firstOrNull {
             it.status == ProjectMutationStatus.REQUIRES_RECONCILIATION
         }
@@ -2285,6 +2493,7 @@ class ProjectSyncRepository(
             },
             pendingBlockOperations = projectCache.localBlockOperations.size,
             pendingItemOperations = projectCache.itemOperations.size,
+            pendingNavigationAliases = pendingAliases,
         )
     }
 
@@ -2549,6 +2758,11 @@ class ProjectSyncRepository(
         this is IncompatibleServiceApiException ||
         this is ServiceException && (status >= 500 || status in setOf(404, 405, 426))
 
+    private fun Exception.isDeferredItemSync() = this is IOException ||
+        this is IncompatibleServiceApiException ||
+        this is UnsupportedOperationException ||
+        this is ServiceException && (status >= 500 || status in setOf(405, 426))
+
     private fun Exception.isRecognizedOlderApi(command: ProjectMutation) =
         this is ServiceException && status == 422 && command.contractVersion == "0.4" &&
             command.type in setOf(ProjectMutationType.CREATE_PROJECT, ProjectMutationType.ADD_PARKING)
@@ -2560,6 +2774,11 @@ class ProjectSyncRepository(
 
     private fun ProjectCacheState.resolveProjectId(projectId: String): String =
         projectIdMappings.firstOrNull { it.provisionalId == projectId }?.serverId ?: projectId
+
+    private fun ProjectCacheState.projectSummary(projectId: String): ProjectSummary? =
+        pages.firstOrNull { it.project.id == projectId }?.project
+            ?: activeProjects.firstOrNull { it.id == projectId }
+            ?: archivedProjects.firstOrNull { it.id == projectId }
 
     private fun LocalBlockRecord.toResolution(): LocalTagResolution = when {
         state in PENDING_TAG_STATES -> LocalTagResolution.PendingProgramming(this)
@@ -2594,6 +2813,11 @@ class ProjectSyncRepository(
         data class Parking(val value: ProjectParking) : ProjectOutcome
         data class Binding(val value: BlockBinding) : ProjectOutcome
         data class Unbound(val blockId: String) : ProjectOutcome
+    }
+
+    private sealed interface ItemAuthoritativeState {
+        data class Note(val value: ProjectNoteItem) : ItemAuthoritativeState
+        data class Link(val value: ProjectResourceLink) : ItemAuthoritativeState
     }
 
     private companion object {
@@ -2631,6 +2855,17 @@ class ProjectSyncRepository(
             "project.reopened",
         )
         val PROJECT_PAGE_EVENTS = setOf("project.notes_saved", "project.parked")
+        val NOTE_ITEM_EVENTS = setOf(
+            "project.note_created",
+            "project.note_edited",
+            "project.note_pinned",
+            "project.note_deleted",
+        )
+        val LINK_ITEM_EVENTS = setOf(
+            "project.link_created",
+            "project.link_edited",
+            "project.link_deleted",
+        )
         val BLOCK_EVENTS = setOf("block.bound", "block.unbound")
     }
 }

@@ -7,6 +7,7 @@ import dev.blocks.android.api.generated.v02.model.ReentryOut
 import dev.blocks.android.api.generated.v04.model.ProjectIn
 import dev.blocks.android.api.generated.v04.model.ProjectPageOut
 import dev.blocks.android.api.generated.v04.model.ProjectParkIn
+import dev.blocks.android.api.generated.v06.model.NoteAck
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -137,5 +138,32 @@ class GeneratedContractModelsTest {
             setOf("where_i_am", "next_physical_action", "must_not_forget", "client_id", "occurred_at"),
             JSONObject(json.toJson(request)).keys().asSequence().toSet(),
         )
+    }
+
+    @Test
+    fun generatedApi06AcknowledgementKeepsReceiptDistinctFromCurrentStateProvenance() {
+        val receipt = json.fromJson(
+            """
+            {
+              "authored_by_user_id":"00000000-0000-4000-8000-000000000006",
+              "body":"Later state",
+              "created_at":"2026-09-16T10:00:00Z",
+              "deleted_at":null,
+              "id":"00000000-0000-4000-8000-000000000009",
+              "last_operation_id":"00000000-0000-4000-8000-00000000000b",
+              "operation_id":"00000000-0000-4000-8000-00000000000a",
+              "pinned":true,
+              "project_id":"00000000-0000-4000-8000-000000000003",
+              "row_version":2,
+              "tenant_id":"00000000-0000-4000-8000-000000000002",
+              "updated_at":"2026-09-16T10:01:00Z"
+            }
+            """.trimIndent(),
+            NoteAck::class.java,
+        )
+
+        assertEquals("00000000-0000-4000-8000-00000000000a", receipt.operationId.toString())
+        assertEquals("00000000-0000-4000-8000-00000000000b", receipt.lastOperationId.toString())
+        assertEquals(2, receipt.rowVersion)
     }
 }

@@ -248,6 +248,21 @@ internal class SyncStateRowCodec(
                 projectsAwaitingNotesBaseline = emptyList(),
             )
         }
+        projectCache = projectCache.copy(
+            resourceLinks = projectCache.resourceLinks.map { link ->
+                link.copy(requiresReconciliation = !ProjectResourceUri.canLaunch(link.uri))
+            },
+            itemOperations = projectCache.itemOperations.map { operation ->
+                if (
+                    operation.type in setOf(ProjectItemMutationType.CREATE_LINK, ProjectItemMutationType.EDIT_LINK) &&
+                    operation.linkUri?.let(ProjectResourceUri::canLaunch) == false
+                ) {
+                    operation.copy(status = dev.blocks.android.project.ProjectMutationStatus.REQUIRES_RECONCILIATION)
+                } else {
+                    operation
+                }
+            },
+        )
         validateProjectCache(projectCache)
         val decodedDrafts = if (rows.schemaVersion >= LOCAL_FIRST_SCHEMA_VERSION) {
             rows.projectDrafts?.let { gson.fromJson(it, FormDrafts::class.java) } ?: FormDrafts()
@@ -510,8 +525,9 @@ private fun validateProjectCache(cache: ProjectCacheState) {
         require(link.projectId in knownProjectIds) { "A project resource link references an unknown project" }
         require(link.title.isNotBlank()) { "A project resource link title is missing" }
         require(link.title.length <= 200) { "A project resource link title exceeds the local limit" }
-        require(runCatching { ProjectResourceUri.validate(link.uri) }.getOrNull() == link.uri) {
-            "A project resource link URI is unsafe or non-canonical"
+        val acceptedUri = runCatching { ProjectResourceUri.validate(link.uri) }.getOrNull() == link.uri
+        require(link.requiresReconciliation == !acceptedUri) {
+            "A project resource link URI validation state is inconsistent"
         }
         require(link.rowVersion >= 0) { "A project resource link row version is invalid" }
     }
