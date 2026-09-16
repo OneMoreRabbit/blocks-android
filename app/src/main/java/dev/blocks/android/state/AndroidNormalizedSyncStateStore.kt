@@ -438,6 +438,7 @@ class AndroidSyncStateStore internal constructor(
         require(state.projectCache.projectCovers.all { it.tenantId == tenantId }) {
             "Project cover state crosses a tenant boundary"
         }
+        validateProjectItemOperations(state.projectCache)
     }
 
     private fun readRows(database: SQLiteDatabase, tenantId: String): EncodedSyncRows {

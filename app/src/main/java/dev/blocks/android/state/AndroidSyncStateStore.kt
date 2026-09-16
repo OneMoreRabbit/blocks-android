@@ -524,30 +524,7 @@ private fun validateProjectCache(cache: ProjectCacheState) {
         }
         require(link.rowVersion >= 0) { "A project resource link row version is invalid" }
     }
-    require(cache.itemOperations.map { it.operationId }.distinct().size == cache.itemOperations.size) {
-        "Project item operation identifiers are not unique"
-    }
-    require(cache.itemOperations.none { it.operationId in cache.retiredItemOperationIds }) {
-        "A pending project item operation is already retired"
-    }
-    val itemOperationPositions = cache.itemOperations.mapIndexed { index, operation ->
-        operation.operationId to index
-    }.toMap()
-    cache.itemOperations.forEachIndexed { index, operation ->
-        require(operation.operationId.isNotBlank()) { "A project item operation identity is missing" }
-        require(operation.projectId in knownProjectIds) { "A project item operation references an unknown project" }
-        require(operation.contractVersion == "0.6") { "A project item operation has the wrong contract boundary" }
-        operation.dependsOnOperationId?.let { dependency ->
-            val pendingPosition = itemOperationPositions[dependency]
-            val validPending = pendingPosition != null && pendingPosition < index
-            val validLegacyProjectCreate = cache.commands.any {
-                it.operationId == dependency && it.type == dev.blocks.android.project.ProjectMutationType.CREATE_PROJECT
-            }
-            require(validPending || validLegacyProjectCreate) {
-                "A project item operation dependency must precede the dependent operation"
-            }
-        }
-    }
+    validateProjectItemOperations(cache)
     require(cache.localBlockOperations.map { it.operationId }.distinct().size == cache.localBlockOperations.size) {
         "Local block operation identities are not unique"
     }
@@ -617,6 +594,75 @@ private fun validateProjectCache(cache: ProjectCacheState) {
         "Projects awaiting a notes baseline are not unique"
     }
 }
+
+internal fun validateProjectItemOperations(cache: ProjectCacheState) {
+    val knownProjectIds = (
+        cache.activeProjects.map { it.id } +
+            cache.archivedProjects.map { it.id } +
+            cache.pages.map { it.project.id }
+        ).toSet()
+    require(cache.itemOperations.map { it.operationId }.distinct().size == cache.itemOperations.size) {
+        "Project item operation identifiers are not unique"
+    }
+    require(cache.itemOperations.none { it.operationId in cache.retiredItemOperationIds }) {
+        "A pending project item operation is already retired"
+    }
+    val itemOperationPositions = cache.itemOperations.mapIndexed { index, operation ->
+        operation.operationId to index
+    }.toMap()
+    cache.itemOperations.forEachIndexed { index, operation ->
+        require(operation.operationId.isNotBlank()) { "A project item operation identity is missing" }
+        require(operation.projectId in knownProjectIds) { "A project item operation references an unknown project" }
+        require(operation.contractVersion == "0.6") { "A project item operation has the wrong contract boundary" }
+        operation.dependsOnOperationId?.let { dependency ->
+            val pendingPosition = itemOperationPositions[dependency]
+            val validPending = pendingPosition != null && pendingPosition < index &&
+                cache.itemOperations[pendingPosition].targetId == operation.targetId
+            val validLegacyProjectCreate = cache.commands.any {
+                it.operationId == dependency &&
+                    it.type == ProjectMutationType.CREATE_PROJECT &&
+                    (it.targetId == operation.projectId || it.projectId == operation.projectId)
+            }
+            val validLegacyNotesSave = cache.commands.any {
+                it.operationId == dependency &&
+                    it.type == ProjectMutationType.SAVE_NOTES &&
+                    it.targetId == operation.projectId &&
+                    operation.targetId == legacyNoteItemIdentity(operation.projectId)
+            }
+            require(validPending || validLegacyProjectCreate || validLegacyNotesSave) {
+                "A project item operation dependency must precede the dependent operation"
+            }
+        }
+        if (operation.type in VERSIONED_PROJECT_ITEM_MUTATIONS) {
+            val dependency = operation.dependsOnOperationId
+            val pendingPosition = dependency?.let(itemOperationPositions::get)
+            val versionProducingItemDependency = pendingPosition != null &&
+                pendingPosition < index &&
+                cache.itemOperations[pendingPosition].targetId == operation.targetId
+            val versionProducingLegacyNotesDependency = cache.commands.any {
+                it.operationId == dependency &&
+                    it.type == ProjectMutationType.SAVE_NOTES &&
+                    it.targetId == operation.projectId &&
+                    operation.targetId == legacyNoteItemIdentity(operation.projectId)
+            }
+            require(
+                operation.ifMatch?.let { it > 0 } == true ||
+                    versionProducingItemDependency ||
+                    versionProducingLegacyNotesDependency,
+            ) {
+                "A versioned project item operation needs If-Match or an earlier version-producing prerequisite"
+            }
+        }
+    }
+}
+
+private val VERSIONED_PROJECT_ITEM_MUTATIONS = setOf(
+    ProjectItemMutationType.EDIT_NOTE,
+    ProjectItemMutationType.PIN_NOTE,
+    ProjectItemMutationType.DELETE_NOTE,
+    ProjectItemMutationType.EDIT_LINK,
+    ProjectItemMutationType.DELETE_LINK,
+)
 
 private fun String.isCanonicalUuid(): Boolean = runCatching {
     java.util.UUID.fromString(this).toString() == lowercase()

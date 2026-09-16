@@ -5,6 +5,7 @@ import android.database.sqlite.SQLiteDatabase
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.blocks.android.mvp.FormDrafts
+import dev.blocks.android.mvp.ChangePage
 import dev.blocks.android.mvp.NoteItemDraft
 import dev.blocks.android.mvp.NoOpDraftStore
 import dev.blocks.android.mvp.ParkingDraft
@@ -235,6 +236,168 @@ class AndroidNormalizedSyncStateStoreTest {
         assertEquals(7, persisted.itemOperations.single().ifMatch)
         assertEquals("Edited", persisted.noteItems.single { it.id == noteId }.body)
         assertEquals(7, persisted.noteItems.single { it.id == noteId }.rowVersion)
+    }
+
+    @Test
+    fun realDatabaseAtomicallyHandsLegacyNotesVersionToDependentItemAcrossRestart() {
+        val legacyId = legacyNoteItemIdentity(PROJECT)
+        val save = ProjectMutation(
+            operationId = "save-legacy",
+            type = ProjectMutationType.SAVE_NOTES,
+            targetId = PROJECT,
+            ifMatch = 2,
+            notesBody = "Legacy baseline",
+            localCreatedAt = NOW,
+        )
+        val edit = ProjectItemMutation(
+            operationId = "edit-legacy",
+            type = ProjectItemMutationType.EDIT_NOTE,
+            targetId = legacyId,
+            projectId = PROJECT,
+            noteBody = "Newer local edit",
+            dependsOnOperationId = save.operationId,
+            createdAt = NOW,
+        )
+        val pin = ProjectItemMutation(
+            operationId = "pin-legacy",
+            type = ProjectItemMutationType.PIN_NOTE,
+            targetId = legacyId,
+            projectId = PROJECT,
+            pinned = true,
+            dependsOnOperationId = edit.operationId,
+            createdAt = NOW,
+        )
+        val initial = state(TENANT).withoutCommands().copy(
+            projectCache = state(TENANT).withoutCommands().projectCache.copy(
+                commands = listOf(save),
+                noteItems = listOf(
+                    ProjectNoteItem(
+                        legacyId,
+                        PROJECT,
+                        "Newer local edit",
+                        true,
+                        null,
+                        NOW,
+                        NOW,
+                        rowVersion = 0,
+                        legacySingleton = true,
+                    ),
+                ),
+                itemOperations = listOf(edit, pin),
+            ),
+        )
+        store.saveSyncState(TENANT, initial)
+
+        val service = java.lang.reflect.Proxy.newProxyInstance(
+            ProjectService::class.java.classLoader,
+            arrayOf(ProjectService::class.java),
+        ) { _, method, args ->
+            when (method.name) {
+                "listProjects" -> if (args!![1] == ProjectLifecycle.ACTIVE) {
+                    initial.projectCache.activeProjects
+                } else {
+                    emptyList<ProjectSummary>()
+                }
+                "saveNotes" -> ProjectNotes(PROJECT, "Legacy baseline", 7, NOW)
+                "changes" -> ChangePage(emptyList(), null, false)
+                "blocks" -> emptyList<dev.blocks.android.project.PhysicalBlock>()
+                "parking" -> initial.projectCache.parkingRecords.filter { it.projectId == args!![1] }
+                "projectPage" -> initial.projectCache.pages.single { it.project.id == args!![1] }
+                else -> error("Unexpected Service call: ${method.name}")
+            }
+        } as ProjectService
+        val session = Session(TENANT, "test-token")
+        var repository = ProjectSyncRepository(
+            service,
+            NoOpLegacyQueueReplay,
+            NoOpDraftStore,
+            store,
+            coverMediaStore = InMemoryProjectCoverMediaStore(),
+        )
+        repository.activate(session)
+        repository.backgroundSync(session)
+
+        var persisted = store.loadSyncState(TENANT).projectCache
+        assertTrue(persisted.commands.isEmpty())
+        assertEquals("edit-legacy", persisted.itemOperations[0].operationId)
+        assertEquals(7, persisted.itemOperations[0].ifMatch)
+        assertEquals(null, persisted.itemOperations[0].dependsOnOperationId)
+        assertEquals("edit-legacy", persisted.itemOperations[1].dependsOnOperationId)
+        assertEquals("Newer local edit", persisted.noteItems.single().body)
+        assertTrue(persisted.noteItems.single().pinned)
+        assertEquals(7, persisted.noteItems.single().rowVersion)
+
+        repository = ProjectSyncRepository(
+            service,
+            NoOpLegacyQueueReplay,
+            NoOpDraftStore,
+            store,
+            coverMediaStore = InMemoryProjectCoverMediaStore(),
+        )
+        repository.activate(session)
+        repository.acknowledgeProjectItem(
+            session,
+            ProjectItemAcknowledgement.Note(
+                "edit-legacy",
+                persisted.noteItems.single().copy(rowVersion = 8, pinned = false),
+            ),
+        )
+        persisted = store.loadSyncState(TENANT).projectCache
+        assertEquals("pin-legacy", persisted.itemOperations.single().operationId)
+        assertEquals(8, persisted.itemOperations.single().ifMatch)
+        assertEquals(null, persisted.itemOperations.single().dependsOnOperationId)
+        assertEquals("Newer local edit", persisted.noteItems.single().body)
+        assertTrue(persisted.noteItems.single().pinned)
+    }
+
+    @Test
+    fun realDatabaseRejectsVersionedItemWithoutIfMatchOrVersionProducingPrerequisite() {
+        val base = state(TENANT).withoutCommands()
+        val legacyId = legacyNoteItemIdentity(PROJECT)
+        val note = ProjectNoteItem(
+            legacyId,
+            PROJECT,
+            "Local edit",
+            false,
+            null,
+            NOW,
+            NOW,
+            rowVersion = 0,
+            legacySingleton = true,
+        )
+        val invalidEdit = ProjectItemMutation(
+            operationId = "edit-without-version",
+            type = ProjectItemMutationType.EDIT_NOTE,
+            targetId = legacyId,
+            projectId = PROJECT,
+            noteBody = "Local edit",
+            createdAt = NOW,
+        )
+        val invalid = base.copy(
+            projectCache = base.projectCache.copy(
+                noteItems = listOf(note),
+                itemOperations = listOf(invalidEdit),
+            ),
+        )
+
+        assertTrue(runCatching { store.saveSyncState(TENANT, invalid) }.isFailure)
+
+        val save = ProjectMutation(
+            operationId = "save-prerequisite",
+            type = ProjectMutationType.SAVE_NOTES,
+            targetId = PROJECT,
+            ifMatch = 2,
+            notesBody = "Legacy baseline",
+            localCreatedAt = NOW,
+        )
+        val valid = invalid.copy(
+            projectCache = invalid.projectCache.copy(
+                commands = listOf(save),
+                itemOperations = listOf(invalidEdit.copy(dependsOnOperationId = save.operationId)),
+            ),
+        )
+        store.saveSyncState(TENANT, valid)
+        assertEquals(valid, store.loadSyncState(TENANT))
     }
 
     @Test
@@ -597,10 +760,18 @@ class AndroidNormalizedSyncStateStoreTest {
     private fun TenantSyncState.withExistingItems(): TenantSyncState = copy(
         projectCache = projectCache.copy(
             noteItems = listOf(
-                ProjectNoteItem(NOTE_ID, PROJECT, "Existing note", false, "local", NOW, NOW),
+                ProjectNoteItem(NOTE_ID, PROJECT, "Existing note", false, "local", NOW, NOW, rowVersion = 3),
             ),
             resourceLinks = listOf(
-                ProjectResourceLink(LINK_ID, PROJECT, "Existing link", "https://example.com", NOW, NOW),
+                ProjectResourceLink(
+                    LINK_ID,
+                    PROJECT,
+                    "Existing link",
+                    "https://example.com",
+                    NOW,
+                    NOW,
+                    rowVersion = 4,
+                ),
             ),
             itemOperations = emptyList(),
         ),
@@ -643,6 +814,16 @@ class AndroidNormalizedSyncStateStoreTest {
             targetId = target,
             projectId = PROJECT,
             clientResourceId = target.takeIf { type == ProjectItemMutationType.CREATE_NOTE || type == ProjectItemMutationType.CREATE_LINK },
+            ifMatch = when (type) {
+                ProjectItemMutationType.EDIT_NOTE,
+                ProjectItemMutationType.PIN_NOTE,
+                ProjectItemMutationType.DELETE_NOTE,
+                -> 3
+                ProjectItemMutationType.EDIT_LINK,
+                ProjectItemMutationType.DELETE_LINK,
+                -> 4
+                else -> null
+            },
             noteBody = "Updated note".takeIf { type == ProjectItemMutationType.CREATE_NOTE || type == ProjectItemMutationType.EDIT_NOTE },
             pinned = true.takeIf { type == ProjectItemMutationType.PIN_NOTE },
             linkTitle = "Updated link".takeIf { type == ProjectItemMutationType.CREATE_LINK || type == ProjectItemMutationType.EDIT_LINK },

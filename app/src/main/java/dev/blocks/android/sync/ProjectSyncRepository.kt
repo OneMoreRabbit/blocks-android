@@ -1458,7 +1458,10 @@ class ProjectSyncRepository(
                 }
                 state = save(session, state)
                 command = state.projectCache.commands.first { it.operationId == command.operationId }
-                if (command.isSatisfiedByAuthoritativeState()) {
+                if (
+                    command.isSatisfiedByAuthoritativeState() &&
+                    !state.projectCache.hasProjectItemDependent(command.operationId)
+                ) {
                     state = retireProjectCommand(state, command).reapplyPendingProjection()
                     state = save(session, state)
                     continue
@@ -1590,8 +1593,7 @@ class ProjectSyncRepository(
         } else {
             state.withProject(outcome.value)
         }
-        is ProjectOutcome.Notes -> state.updatePage(outcome.value.projectId) { it.copy(notes = outcome.value) }
-            .withLegacyNote(outcome.value)
+        is ProjectOutcome.Notes -> state.withLegacyNotesAcknowledgement(command, outcome.value)
         is ProjectOutcome.Parking -> {
             if (command.contractVersion == "0.4") {
                 check(outcome.value.clientId == command.clientResourceId) {
@@ -2023,6 +2025,80 @@ class ProjectSyncRepository(
         )
     }
 
+    private fun TenantSyncState.withLegacyNotesAcknowledgement(
+        command: ProjectMutation,
+        notes: ProjectNotes,
+    ): TenantSyncState {
+        require(command.type == ProjectMutationType.SAVE_NOTES) {
+            "Only a notes save can acknowledge the legacy singleton item"
+        }
+        require(notes.rowVersion > 0) { "A notes acknowledgement needs an authoritative version" }
+        val noteId = legacyNoteItemIdentity(notes.projectId)
+        val directDependents = projectCache.itemOperations.filter {
+            it.dependsOnOperationId == command.operationId
+        }
+        require(directDependents.size <= 1) { "A legacy notes acknowledgement chain must be linear" }
+        directDependents.singleOrNull()?.let { dependent ->
+            require(dependent.projectId == notes.projectId && dependent.targetId == noteId) {
+                "A notes save can only release its deterministic legacy item"
+            }
+        }
+        val existing = projectCache.noteItems.firstOrNull { it.id == noteId }
+        val authoritative = if (notes.body.isEmpty()) {
+            existing?.copy(
+                body = "",
+                updatedAt = notes.updatedAt,
+                rowVersion = notes.rowVersion,
+                deletedAt = notes.updatedAt,
+                legacySingleton = true,
+            ) ?: ProjectNoteItem(
+                id = noteId,
+                projectId = notes.projectId,
+                body = "",
+                pinned = false,
+                authoredByUserId = null,
+                createdAt = notes.updatedAt,
+                updatedAt = notes.updatedAt,
+                rowVersion = notes.rowVersion,
+                deletedAt = notes.updatedAt,
+                legacySingleton = true,
+            )
+        } else {
+            existing?.copy(
+                body = notes.body,
+                updatedAt = notes.updatedAt,
+                rowVersion = notes.rowVersion,
+                deletedAt = null,
+                legacySingleton = true,
+            ) ?: ProjectNoteItem(
+                id = noteId,
+                projectId = notes.projectId,
+                body = notes.body,
+                pinned = false,
+                authoredByUserId = null,
+                createdAt = notes.updatedAt,
+                updatedAt = notes.updatedAt,
+                rowVersion = notes.rowVersion,
+                legacySingleton = true,
+            )
+        }
+        return copy(
+            projectCache = projectCache.copy(
+                pages = projectCache.pages.map { page ->
+                    if (page.project.id == notes.projectId) page.copy(notes = notes) else page
+                },
+                noteItems = projectCache.noteItems.filterNot { it.id == noteId } + authoritative,
+                itemOperations = projectCache.itemOperations.map { pending ->
+                    if (pending.dependsOnOperationId == command.operationId) {
+                        pending.copy(ifMatch = notes.rowVersion, dependsOnOperationId = null)
+                    } else {
+                        pending
+                    }
+                },
+            ),
+        ).reapplyPendingItemProjection(noteId)
+    }
+
     private fun TenantSyncState.withParkingRecord(record: ProjectParking): TenantSyncState {
         val records = projectCache.parkingRecords.upsertParking(record)
         val newest = records.newestFirstFor(record.projectId).firstOrNull()
@@ -2192,9 +2268,17 @@ class ProjectSyncRepository(
     private fun ProjectCacheState.latestItemDependency(projectId: String, itemId: String): String? =
         itemOperations.lastOrNull { it.targetId == itemId }?.operationId
             ?: commands.lastOrNull {
+                itemId == legacyNoteItemIdentity(projectId) &&
+                    it.type == ProjectMutationType.SAVE_NOTES &&
+                    it.targetId == projectId
+            }?.operationId
+            ?: commands.lastOrNull {
                 it.type == ProjectMutationType.CREATE_PROJECT &&
                     (it.targetId == projectId || it.projectId == projectId)
             }?.operationId
+
+    private fun ProjectCacheState.hasProjectItemDependent(operationId: String): Boolean =
+        itemOperations.any { it.dependsOnOperationId == operationId }
 
     private fun FormDrafts.cleanAfter(command: ProjectMutation): FormDrafts {
         val contentCleaned = when (command.type) {
