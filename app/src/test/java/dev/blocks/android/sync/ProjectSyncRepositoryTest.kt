@@ -68,6 +68,194 @@ import org.junit.Test
 
 class ProjectSyncRepositoryTest {
     @Test
+    fun concurrentForegroundItemEditMergesOntoTheAcknowledgementWithoutResurrectingTheCreate() {
+        val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
+        val service = FakeProjectService().apply {
+            blockItemResponseFor = "blocked-create"
+            itemResponseEntered = CountDownLatch(1)
+            allowItemResponse = CountDownLatch(1)
+        }
+        var repository = repository(service, MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+        val noteId = "01000000-0000-4000-8000-000000000001"
+        repository.addNoteItem(SESSION_A, PROJECT_ID, "First", "blocked-create", noteId)
+
+        var backgroundFailure: Throwable? = null
+        val background = Thread {
+            runCatching { repository.backgroundSync(SESSION_A) }
+                .exceptionOrNull()
+                ?.let { backgroundFailure = it }
+        }
+        background.start()
+        assertTrue(service.itemResponseEntered.await(2, TimeUnit.SECONDS))
+
+        repository.editNoteItem(SESSION_A, noteId, "Saved while acknowledgement waits", "concurrent-edit")
+        val foreground = state.loadSyncState(TENANT_A).projectCache
+        assertEquals(listOf("blocked-create", "concurrent-edit"), foreground.itemOperations.map { it.operationId })
+        assertEquals("Saved while acknowledgement waits", foreground.noteItems.single().body)
+
+        service.allowItemResponse.countDown()
+        background.join(2_000)
+        assertFalse("Background item acknowledgement did not complete", background.isAlive)
+        assertEquals(null, backgroundFailure)
+        assertEquals(listOf("blocked-create", "concurrent-edit"), service.itemOperationIds)
+        val editEnvelope = service.sentItemOperations.single { it.operationId == "concurrent-edit" }
+        assertEquals(1, editEnvelope.ifMatch)
+        assertEquals(null, editEnvelope.dependsOnOperationId)
+
+        val durable = state.loadSyncState(TENANT_A).projectCache
+        assertTrue(durable.itemOperations.isEmpty())
+        assertEquals(listOf("blocked-create", "concurrent-edit"), durable.retiredItemOperationIds)
+        assertEquals("Saved while acknowledgement waits", durable.noteItems.single().body)
+        assertEquals(2, durable.noteItems.single().rowVersion)
+        assertEquals("concurrent-edit", durable.noteItems.single().lastOperationId)
+
+        repository = repository(service, MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+        repository.backgroundSync(SESSION_A)
+        assertEquals(1, service.itemOperationIds.count { it == "blocked-create" })
+        assertEquals(1, service.itemOperationIds.count { it == "concurrent-edit" })
+    }
+
+    @Test
+    fun invalidLinkIntentDoesNotBlockOtherChainsAndAValidEditReplacesItAcrossRestart() {
+        val invalidLinkId = "02000000-0000-4000-8000-000000000002"
+        val invalidOperation = ProjectItemMutation(
+            operationId = "invalid-link-create",
+            type = ProjectItemMutationType.CREATE_LINK,
+            targetId = invalidLinkId,
+            projectId = PROJECT_ID,
+            clientResourceId = invalidLinkId,
+            linkTitle = "Legacy reference",
+            linkUri = "https://example.com/café",
+            createdAt = NOW,
+            status = ProjectMutationStatus.REQUIRES_RECONCILIATION,
+        )
+        val initial = loadedState().copy(
+            projectCache = loadedState().projectCache.copy(
+                resourceLinks = listOf(
+                    ProjectResourceLink(
+                        invalidLinkId,
+                        PROJECT_ID,
+                        "Legacy reference",
+                        "https://example.com/café",
+                        NOW,
+                        NOW,
+                        requiresReconciliation = true,
+                    ),
+                ),
+                itemOperations = listOf(invalidOperation),
+            ),
+        )
+        val state = MemoryState().apply { saveSyncState(TENANT_A, initial) }
+        val service = FakeProjectService()
+        var repository = repository(service, MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+        val noteId = "03000000-0000-4000-8000-000000000003"
+        val otherLinkId = "04000000-0000-4000-8000-000000000004"
+        repository.addNoteItem(SESSION_A, PROJECT_ID, "Unrelated note", "other-note", noteId)
+        repository.addResourceLink(
+            SESSION_A,
+            PROJECT_ID,
+            "Other link",
+            "https://example.com/other",
+            "other-link",
+            otherLinkId,
+        )
+
+        repository.backgroundSync(SESSION_A)
+        assertEquals(listOf("other-note", "other-link"), service.itemOperationIds)
+        assertFalse("The invalid envelope crossed transport", service.itemOperationIds.contains("invalid-link-create"))
+        assertEquals(
+            listOf("invalid-link-create"),
+            state.loadSyncState(TENANT_A).projectCache.itemOperations.map { it.operationId },
+        )
+
+        repository = repository(service, MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+        repository.editResourceLink(
+            SESSION_A,
+            invalidLinkId,
+            "Corrected reference",
+            "https://example.com/cafe",
+            "corrected-link-create",
+        )
+        val corrected = state.loadSyncState(TENANT_A).projectCache
+        assertEquals(listOf("corrected-link-create"), corrected.itemOperations.map { it.operationId })
+        assertEquals(ProjectItemMutationType.CREATE_LINK, corrected.itemOperations.single().type)
+        assertTrue("invalid-link-create" in corrected.retiredItemOperationIds)
+        assertFalse(corrected.resourceLinks.single { it.id == invalidLinkId }.requiresReconciliation)
+        assertEquals("https://example.com/cafe", corrected.resourceLinks.single { it.id == invalidLinkId }.uri)
+
+        repository = repository(service, MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+        repository.backgroundSync(SESSION_A)
+        assertEquals(0, service.itemOperationIds.count { it == "invalid-link-create" })
+        assertEquals(1, service.itemOperationIds.count { it == "corrected-link-create" })
+        assertTrue(state.loadSyncState(TENANT_A).projectCache.itemOperations.isEmpty())
+    }
+
+    @Test
+    fun correctingAnInvalidEditKeepsTheServerIdentityAndAuthoritativeVersion() {
+        val linkId = "05000000-0000-4000-8000-000000000005"
+        val invalidEdit = ProjectItemMutation(
+            operationId = "invalid-link-edit",
+            type = ProjectItemMutationType.EDIT_LINK,
+            targetId = linkId,
+            projectId = PROJECT_ID,
+            ifMatch = 5,
+            linkTitle = "Invalid edit",
+            linkUri = "https://example.com/café",
+            createdAt = NOW,
+            status = ProjectMutationStatus.REQUIRES_RECONCILIATION,
+        )
+        val serverLink = ProjectResourceLink(
+            linkId,
+            PROJECT_ID,
+            "Server link",
+            "https://example.com/server",
+            NOW,
+            NOW,
+            rowVersion = 5,
+            lastOperationId = "server-link-operation",
+        )
+        val initial = loadedState().copy(
+            projectCache = loadedState().projectCache.copy(
+                resourceLinks = listOf(
+                    serverLink.copy(
+                        title = "Invalid edit",
+                        uri = "https://example.com/café",
+                        requiresReconciliation = true,
+                    ),
+                ),
+                itemOperations = listOf(invalidEdit),
+            ),
+        )
+        val state = MemoryState().apply { saveSyncState(TENANT_A, initial) }
+        val service = FakeProjectService().apply { remoteLinks[linkId] = serverLink }
+        val repository = repository(service, MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+
+        repository.editResourceLink(
+            SESSION_A,
+            linkId,
+            "Corrected edit",
+            "https://example.com/cafe",
+            "corrected-link-edit",
+        )
+        val pending = state.loadSyncState(TENANT_A).projectCache.itemOperations.single()
+        assertEquals(ProjectItemMutationType.EDIT_LINK, pending.type)
+        assertEquals(5, pending.ifMatch)
+        assertEquals(linkId, pending.targetId)
+        assertEquals(null, pending.clientResourceId)
+
+        repository.backgroundSync(SESSION_A)
+        assertEquals(0, service.itemOperationIds.count { it == "invalid-link-edit" })
+        assertEquals(1, service.itemOperationIds.count { it == "corrected-link-edit" })
+        assertEquals(6, state.loadSyncState(TENANT_A).projectCache.resourceLinks.single().rowVersion)
+    }
+
+    @Test
     fun api06QueueReplaysAfterRestartInDependencyOrderAndAttachesTheDistinctNavigationAlias() {
         val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
         val service = FakeProjectService()
@@ -1879,9 +2067,11 @@ class ProjectSyncRepositoryTest {
         val remoteNotes = mutableMapOf<String, ProjectNoteItem>()
         val remoteLinks = mutableMapOf<String, ProjectResourceLink>()
         val itemOperationIds = mutableListOf<String>()
+        val sentItemOperations = mutableListOf<ProjectItemMutation>()
         val acceptedItemOperations = mutableListOf<String>()
         val navigationAliases = mutableMapOf<String, ProjectKey>()
         var loseItemResponseFor: String? = null
+        var blockItemResponseFor: String? = null
         var conflictItemOperation: String? = null
         var failItemRead = false
         private val itemReceipts = mutableSetOf<String>()
@@ -1890,6 +2080,8 @@ class ProjectSyncRepositoryTest {
         lateinit var allowChanges: CountDownLatch
         lateinit var createEntered: CountDownLatch
         lateinit var allowCreate: CountDownLatch
+        lateinit var itemResponseEntered: CountDownLatch
+        lateinit var allowItemResponse: CountDownLatch
 
         override fun listProjects(session: Session, lifecycle: ProjectLifecycle): List<ProjectSummary> {
             calls += "list-${lifecycle.wireValue}"
@@ -2179,6 +2371,7 @@ class ProjectSyncRepositoryTest {
             apply: (ProjectNoteItem?) -> ProjectNoteItem,
         ): ProjectItemAcknowledgement.Note {
             itemOperationIds += operation.operationId
+            sentItemOperations += operation
             failIfNeeded()
             if (conflictItemOperation == operation.operationId) {
                 throw ServiceException(409, ApiError(ApiErrorCode.CONFLICT, "Item changed"))
@@ -2191,6 +2384,7 @@ class ProjectSyncRepositoryTest {
                 operation.operationId,
                 requireNotNull(remoteNotes[operation.targetId]),
             )
+            blockItemResponse(operation)
             if (loseItemResponseFor == operation.operationId && lostItemResponses.add(operation.operationId)) {
                 throw IOException("response lost after item acceptance")
             }
@@ -2202,6 +2396,7 @@ class ProjectSyncRepositoryTest {
             apply: (ProjectResourceLink?) -> ProjectResourceLink,
         ): ProjectItemAcknowledgement.Link {
             itemOperationIds += operation.operationId
+            sentItemOperations += operation
             failIfNeeded()
             if (conflictItemOperation == operation.operationId) {
                 throw ServiceException(409, ApiError(ApiErrorCode.CONFLICT, "Item changed"))
@@ -2214,10 +2409,17 @@ class ProjectSyncRepositoryTest {
                 operation.operationId,
                 requireNotNull(remoteLinks[operation.targetId]),
             )
+            blockItemResponse(operation)
             if (loseItemResponseFor == operation.operationId && lostItemResponses.add(operation.operationId)) {
                 throw IOException("response lost after item acceptance")
             }
             return acknowledgement
+        }
+
+        private fun blockItemResponse(operation: ProjectItemMutation) {
+            if (blockItemResponseFor != operation.operationId) return
+            itemResponseEntered.countDown()
+            check(allowItemResponse.await(2, TimeUnit.SECONDS)) { "Timed out waiting to release item response" }
         }
 
         fun expireIdempotencyResults() {

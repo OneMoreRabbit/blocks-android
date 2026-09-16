@@ -1092,6 +1092,24 @@ class ProjectSyncRepository(
         val existing = state.projectCache.resourceLinks.single { it.id == linkId && it.deletedAt == null }
         require(state.projectCache.pages.single { it.project.id == existing.projectId }.project.lifecycle == ProjectLifecycle.ACTIVE)
         val timestamp = now()
+        val invalidIntents = state.projectCache.itemOperations.filter { pending ->
+            pending.targetId == linkId &&
+                pending.status == ProjectMutationStatus.REQUIRES_RECONCILIATION &&
+                pending.type in setOf(ProjectItemMutationType.CREATE_LINK, ProjectItemMutationType.EDIT_LINK) &&
+                pending.linkUri?.let(ProjectResourceUri::canLaunch) == false
+        }
+        if (invalidIntents.isNotEmpty()) {
+            return replaceInvalidLinkIntent(
+                session = session,
+                state = state,
+                existing = existing,
+                invalidIntents = invalidIntents,
+                title = cleanTitle,
+                uri = cleanUri,
+                operationId = operationId,
+                timestamp = timestamp,
+            )
+        }
         val operation = ProjectItemMutation(
             operationId = operationId,
             type = ProjectItemMutationType.EDIT_LINK,
@@ -1105,7 +1123,12 @@ class ProjectSyncRepository(
         )
         return commitItemLocal(session, operation) { current ->
             current.updateResourceLink(linkId) {
-                it.copy(title = cleanTitle, uri = cleanUri, updatedAt = timestamp)
+                it.copy(
+                    title = cleanTitle,
+                    uri = cleanUri,
+                    updatedAt = timestamp,
+                    requiresReconciliation = false,
+                )
             }.copy(
                 projectDrafts = current.projectDrafts.copy(
                     projectResourceLinks = current.projectDrafts.projectResourceLinks -
@@ -1113,6 +1136,94 @@ class ProjectSyncRepository(
                 ),
             )
         }
+    }
+
+    private fun replaceInvalidLinkIntent(
+        session: Session,
+        state: TenantSyncState,
+        existing: ProjectResourceLink,
+        invalidIntents: List<ProjectItemMutation>,
+        title: String,
+        uri: String,
+        operationId: String,
+        timestamp: String,
+    ): BackgroundSyncResult {
+        val invalidIds = invalidIntents.map { it.operationId }.toSet()
+        require(operationId !in invalidIds && operationId !in state.projectCache.retiredItemOperationIds) {
+            "A corrected Link needs a fresh operation identity"
+        }
+        require(state.projectCache.itemOperations.none { it.operationId == operationId }) {
+            "A project item operation identity cannot describe two requests"
+        }
+        val firstInvalidIndex = state.projectCache.itemOperations.indexOfFirst {
+            it.operationId in invalidIds
+        }
+        val earlierSameItem = state.projectCache.itemOperations
+            .take(firstInvalidIndex)
+            .lastOrNull { it.targetId == existing.id && it.operationId !in invalidIds }
+        val originalDependency = invalidIntents.first().dependsOnOperationId?.takeUnless { it in invalidIds }
+        val dependency = earlierSameItem?.operationId ?: originalDependency
+        val replacementType = if (
+            existing.rowVersion == 0 &&
+            state.projectCache.itemOperations.none {
+                it.targetId == existing.id &&
+                    it.operationId !in invalidIds &&
+                    it.type == ProjectItemMutationType.CREATE_LINK
+            }
+        ) {
+            ProjectItemMutationType.CREATE_LINK
+        } else {
+            ProjectItemMutationType.EDIT_LINK
+        }
+        val replacement = ProjectItemMutation(
+            operationId = operationId,
+            type = replacementType,
+            targetId = existing.id,
+            projectId = existing.projectId,
+            clientResourceId = existing.id.takeIf { replacementType == ProjectItemMutationType.CREATE_LINK },
+            ifMatch = existing.rowVersion.takeIf {
+                replacementType == ProjectItemMutationType.EDIT_LINK && dependency == null && it > 0
+            },
+            linkTitle = title,
+            linkUri = uri,
+            dependsOnOperationId = dependency,
+            createdAt = timestamp,
+        )
+        val operations = buildList {
+            state.projectCache.itemOperations.forEachIndexed { index, pending ->
+                if (index == firstInvalidIndex) add(replacement)
+                if (pending.operationId !in invalidIds) {
+                    add(
+                        if (pending.dependsOnOperationId in invalidIds) {
+                            pending.copy(dependsOnOperationId = replacement.operationId)
+                        } else {
+                            pending
+                        },
+                    )
+                }
+            }
+        }
+        val updatedLinkState = state.updateResourceLink(existing.id) {
+            it.copy(
+                title = title,
+                uri = uri,
+                updatedAt = timestamp,
+                requiresReconciliation = false,
+            )
+        }
+        val updated = updatedLinkState.copy(
+            projectDrafts = state.projectDrafts.copy(
+                projectResourceLinks = state.projectDrafts.projectResourceLinks -
+                    resourceLinkDraftKey(existing.projectId, existing.id),
+            ),
+            projectCache = updatedLinkState.projectCache.copy(
+                itemOperations = operations,
+                retiredItemOperationIds = (
+                    state.projectCache.retiredItemOperationIds + invalidIds
+                    ).distinct(),
+            ),
+        )
+        return save(session, updated).toResult()
     }
 
     @Synchronized
@@ -1533,14 +1644,14 @@ class ProjectSyncRepository(
     private fun drainProjectItemQueue(session: Session, initial: TenantSyncState): TenantSyncState {
         var state = initial
         while (true) {
-            val operation = state.projectCache.itemOperations.firstOrNull() ?: return state
-            val dependency = operation.dependsOnOperationId
-            if (dependency != null && (
-                    state.projectCache.itemOperations.any { it.operationId == dependency } ||
-                        state.projectCache.commands.any { it.operationId == dependency }
-                    )
-            ) return state
-            if (operation.status == ProjectMutationStatus.REQUIRES_RECONCILIATION) return state
+            val operation = state.projectCache.itemOperations.withIndex().firstOrNull { (index, candidate) ->
+                candidate.status == ProjectMutationStatus.PENDING &&
+                    state.projectCache.itemOperations.take(index).none { it.targetId == candidate.targetId } &&
+                    candidate.dependsOnOperationId?.let { dependency ->
+                        state.projectCache.itemOperations.none { it.operationId == dependency } &&
+                            state.projectCache.commands.none { it.operationId == dependency }
+                    } != false
+            }?.value ?: return state
             if (
                 operation.type in setOf(ProjectItemMutationType.CREATE_LINK, ProjectItemMutationType.EDIT_LINK) &&
                 operation.linkUri?.let(ProjectResourceUri::canLaunch) == false
@@ -1548,7 +1659,8 @@ class ProjectSyncRepository(
                 state = state.updateProjectItemOperation(operation.operationId) {
                     it.copy(status = ProjectMutationStatus.REQUIRES_RECONCILIATION, deliveryUncertain = false)
                 }
-                return save(session, state)
+                state = save(session, state)
+                continue
             }
             try {
                 val acknowledgement = sendProjectItemOperation(session, operation)
@@ -1564,7 +1676,7 @@ class ProjectSyncRepository(
                     return save(session, state)
                 }
                 state = reconcileProjectItemConflict(session, state, operation)
-                return save(session, state)
+                state = save(session, state)
             }
         }
     }
@@ -2563,6 +2675,80 @@ class ProjectSyncRepository(
             it.operationId in locallyRemoved || it.operationId in locallyChangedIds
         } + locallyChanged
 
+        val baselineItemOperations = baseline.projectCache.itemOperations.associateBy { it.operationId }
+        val currentItemOperations = current.projectCache.itemOperations.associateBy { it.operationId }
+        val locallyRemovedItemOperations = baselineItemOperations.keys - currentItemOperations.keys
+        val locallyChangedItemOperations = current.projectCache.itemOperations.filter { operation ->
+            baselineItemOperations[operation.operationId]?.let { it != operation } == true
+        }.associateBy { it.operationId }
+        val locallyAddedItemOperations = current.projectCache.itemOperations.filter {
+            it.operationId !in baselineItemOperations
+        }
+        val proposedRetiredItemOperations = proposed.projectCache.retiredItemOperationIds.toSet()
+        fun remapItemOperation(operation: ProjectItemMutation): ProjectItemMutation =
+            mappings.fold(operation) { mapped, identity ->
+                if (mapped.projectId == identity.provisionalId) {
+                    mapped.copy(
+                        projectId = identity.serverId,
+                        dependsOnOperationId = mapped.dependsOnOperationId?.takeUnless {
+                            it in acknowledgedCreateOperations[identity.provisionalId].orEmpty()
+                        },
+                    )
+                } else {
+                    mapped
+                }
+            }
+        val proposedItemIds = proposed.projectCache.itemOperations.map { it.operationId }.toSet()
+        val itemOperationsBeforeHandoff = proposed.projectCache.itemOperations
+            .filterNot { it.operationId in locallyRemovedItemOperations }
+            .map { operation ->
+                locallyChangedItemOperations[operation.operationId]?.let(::remapItemOperation) ?: operation
+            } + locallyAddedItemOperations
+            .filterNot { it.operationId in proposedItemIds || it.operationId in proposedRetiredItemOperations }
+            .map(::remapItemOperation)
+        val survivingItemOperationIds = itemOperationsBeforeHandoff.map { it.operationId }.toSet()
+        val itemOperations = itemOperationsBeforeHandoff.map { operation ->
+            val retiredDependency = operation.dependsOnOperationId?.takeIf {
+                it !in survivingItemOperationIds && it in proposedRetiredItemOperations
+            }
+            if (retiredDependency == null) {
+                operation
+            } else {
+                val authoritativeVersion = proposed.projectCache.noteItems
+                    .firstOrNull { it.id == operation.targetId }?.rowVersion
+                    ?: proposed.projectCache.resourceLinks
+                        .firstOrNull { it.id == operation.targetId }?.rowVersion
+                require(authoritativeVersion != null && authoritativeVersion > 0) {
+                    "An acknowledged item operation must hand its authoritative version to a concurrent dependent"
+                }
+                operation.copy(
+                    ifMatch = operation.ifMatch ?: authoritativeVersion,
+                    dependsOnOperationId = null,
+                )
+            }
+        }
+
+        val locallyCreatedNoteIds = locallyAddedItemOperations.filter {
+            it.type == ProjectItemMutationType.CREATE_NOTE
+        }.map { it.targetId }.toSet()
+        val locallyCreatedLinkIds = locallyAddedItemOperations.filter {
+            it.type == ProjectItemMutationType.CREATE_LINK
+        }.map { it.targetId }.toSet()
+        val noteItems = proposed.projectCache.noteItems + current.projectCache.noteItems.filter { local ->
+            local.id in locallyCreatedNoteIds && proposed.projectCache.noteItems.none { it.id == local.id }
+        }.map { note ->
+            mappings.fold(note) { mapped, identity ->
+                if (mapped.projectId == identity.provisionalId) mapped.copy(projectId = identity.serverId) else mapped
+            }
+        }
+        val resourceLinks = proposed.projectCache.resourceLinks + current.projectCache.resourceLinks.filter { local ->
+            local.id in locallyCreatedLinkIds && proposed.projectCache.resourceLinks.none { it.id == local.id }
+        }.map { link ->
+            mappings.fold(link) { mapped, identity ->
+                if (mapped.projectId == identity.provisionalId) mapped.copy(projectId = identity.serverId) else mapped
+            }
+        }
+
         var merged = proposed.copy(
             projectDrafts = if (current.projectDrafts != baseline.projectDrafts) {
                 mappings.fold(current.projectDrafts) { drafts, identity ->
@@ -2591,44 +2777,9 @@ class ProjectSyncRepository(
                 } else {
                     proposed.projectCache.projectCovers
                 },
-                noteItems = if (current.projectCache.noteItems != baseline.projectCache.noteItems) {
-                    current.projectCache.noteItems.map { note ->
-                        mappings.fold(note) { mapped, identity ->
-                            if (mapped.projectId == identity.provisionalId) {
-                                mapped.copy(projectId = identity.serverId)
-                            } else mapped
-                        }
-                    }.distinctBy { it.id }
-                } else {
-                    proposed.projectCache.noteItems
-                },
-                resourceLinks = if (current.projectCache.resourceLinks != baseline.projectCache.resourceLinks) {
-                    current.projectCache.resourceLinks.map { link ->
-                        mappings.fold(link) { mapped, identity ->
-                            if (mapped.projectId == identity.provisionalId) {
-                                mapped.copy(projectId = identity.serverId)
-                            } else mapped
-                        }
-                    }
-                } else {
-                    proposed.projectCache.resourceLinks
-                },
-                itemOperations = if (current.projectCache.itemOperations != baseline.projectCache.itemOperations) {
-                    current.projectCache.itemOperations.map { operation ->
-                        mappings.fold(operation) { mapped, identity ->
-                            if (mapped.projectId == identity.provisionalId) {
-                                mapped.copy(
-                                    projectId = identity.serverId,
-                                    dependsOnOperationId = mapped.dependsOnOperationId?.takeUnless {
-                                        it in acknowledgedCreateOperations[identity.provisionalId].orEmpty()
-                                    },
-                                )
-                            } else mapped
-                        }
-                    }
-                } else {
-                    proposed.projectCache.itemOperations
-                },
+                noteItems = noteItems.distinctBy { it.id },
+                resourceLinks = resourceLinks.distinctBy { it.id },
+                itemOperations = itemOperations,
                 retiredItemOperationIds = (
                     proposed.projectCache.retiredItemOperationIds +
                         (current.projectCache.retiredItemOperationIds -
@@ -2686,6 +2837,9 @@ class ProjectSyncRepository(
         merged = merged.copy(
             projectCache = merged.projectCache.copy(commands = commands),
         ).reapplyPendingProjection()
+        merged.projectCache.itemOperations.map { it.targetId }.distinct().forEach { itemId ->
+            merged = merged.reapplyPendingItemProjection(itemId)
+        }
         return merged
     }
 
