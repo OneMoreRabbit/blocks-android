@@ -11,6 +11,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class ProjectPresentationControllerTest {
@@ -241,6 +242,35 @@ class ProjectPresentationControllerTest {
 
         controller.reopenProject(controller.state.archivedProjects.single())
         assertEquals(listOf(ProjectLifecycle.ACTIVE), controller.state.activeProjects.map { it.lifecycle })
+    }
+
+    @Test
+    fun archivedProjectRejectsEveryDomainMutationUntilReopened() {
+        val archived = project().copy(lifecycle = ProjectLifecycle.ARCHIVED, archivedAt = NOW)
+        val workspace = FakeWorkspace().apply {
+            cache = cache.copy(
+                activeProjects = emptyList(),
+                archivedProjects = listOf(archived),
+                pages = listOf(page().copy(project = archived)),
+            )
+        }
+        val controller = controller(workspace)
+        controller.login("identity-token")
+        controller.openProject(PROJECT_ID)
+
+        assertThrows(IllegalStateException::class.java) { controller.showParkingForm() }
+        assertThrows(IllegalStateException::class.java) { controller.updateRename("No") }
+        assertThrows(IllegalStateException::class.java) { controller.updateNotes("No") }
+        assertThrows(IllegalStateException::class.java) { controller.updateParking(ParkingDraft("a", "b", "c")) }
+        assertThrows(IllegalStateException::class.java) { controller.renameProject("No") }
+        assertThrows(IllegalStateException::class.java) { controller.saveNotes("No") }
+        assertThrows(IllegalStateException::class.java) { controller.addParking("a", "b", "c") }
+        assertThrows(IllegalStateException::class.java) { controller.archiveProject() }
+        assertThrows(IllegalStateException::class.java) { controller.prepareDirectTagWrite() }
+        assertTrue(workspace.mutations.isEmpty())
+
+        controller.reopenProject(archived)
+        assertEquals(ProjectLifecycle.ACTIVE, controller.state.activeProjects.single().lifecycle)
     }
 
     @Test

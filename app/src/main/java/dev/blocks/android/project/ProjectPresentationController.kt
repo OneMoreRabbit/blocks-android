@@ -198,27 +198,28 @@ class ProjectPresentationController(
 
     @Synchronized
     fun saveProjectCover(cover: ProjectCoverContent) {
-        val page = requireNotNull(state.projectPage) { "No project is open" }
+        val page = activeProjectPage()
         require(cover.projectId == page.project.id) { "The selected project changed during cover import" }
         applyResult(workspace.saveProjectCover(activeSession(), cover))
     }
 
     @Synchronized
     fun removeProjectCover() {
-        val page = requireNotNull(state.projectPage) { "No project is open" }
+        val page = activeProjectPage()
         applyResult(workspace.removeProjectCover(activeSession(), page.project.id))
     }
 
     @Synchronized
     fun backToDashboard() {
-        activeSession()
+        val active = activeSession()
+        val preferences = workspace.updateUiPreferences(active) { it.copy(archiveMode = false) }
         state = state.copy(
             screen = ProjectScreen.DASHBOARD,
             projectPage = null,
             parkingHistory = emptyList(),
             parkingHistoryHasMore = false,
             showParkingForm = false,
-            archiveMode = false,
+            archiveMode = preferences.archiveMode,
             invalidField = null,
             error = null,
         )
@@ -275,6 +276,7 @@ class ProjectPresentationController(
 
     @Synchronized
     fun showParkingForm() {
+        activeProjectPage()
         state = state.copy(showParkingForm = true, invalidField = null, error = null)
     }
 
@@ -302,7 +304,7 @@ class ProjectPresentationController(
 
     @Synchronized
     fun prepareDirectTagWrite(): DirectTagWritePlan {
-        val project = requireNotNull(state.projectPage).project
+        val project = activeProjectPage().project
         return workspace.prepareDirectTagWrite(activeSession(), project.id, project.name)
     }
 
@@ -315,7 +317,7 @@ class ProjectPresentationController(
     @Synchronized
     fun captureDirectTagAttemptScope(): DirectTagAttemptScope {
         val active = activeSession()
-        val project = requireNotNull(state.projectPage).project
+        val project = activeProjectPage().project
         return DirectTagAttemptScope(active.tenantId, workspace.projectLink(active, project.id).key)
     }
 
@@ -427,7 +429,7 @@ class ProjectPresentationController(
 
     @Synchronized
     fun updateRename(value: String) {
-        val projectId = requireNotNull(state.projectPage).project.id
+        val projectId = activeProjectPage().project.id
         updateDraft(renameSlot(projectId), renamePayload(projectId, value)) {
             it.copy(projectRenames = it.projectRenames + (projectId to value))
         }
@@ -435,7 +437,7 @@ class ProjectPresentationController(
 
     @Synchronized
     fun updateNotes(value: String) {
-        val projectId = requireNotNull(state.projectPage).project.id
+        val projectId = activeProjectPage().project.id
         updateDraft(notesSlot(projectId), notesPayload(projectId, value)) {
             it.copy(projectNotes = it.projectNotes + (projectId to value))
         }
@@ -443,7 +445,7 @@ class ProjectPresentationController(
 
     @Synchronized
     fun updateParking(value: ParkingDraft) {
-        val projectId = requireNotNull(state.projectPage).project.id
+        val projectId = activeProjectPage().project.id
         updateDraft(parkingSlot(projectId), parkingPayload(projectId, value)) {
             it.copy(projectParking = it.projectParking + (projectId to value))
         }
@@ -483,7 +485,7 @@ class ProjectPresentationController(
 
     @Synchronized
     fun renameProject(name: String) {
-        val page = requireNotNull(state.projectPage)
+        val page = activeProjectPage()
         persistDraft { it.copy(projectRenames = it.projectRenames + (page.project.id to name)) }
         if (name.isBlank()) return fail(ProjectFormField.RENAME, "Enter a project name.")
         if (name.length > MAX_PROJECT_NAME) {
@@ -508,7 +510,7 @@ class ProjectPresentationController(
 
     @Synchronized
     fun saveNotes(body: String) {
-        val page = requireNotNull(state.projectPage)
+        val page = activeProjectPage()
         persistDraft { it.copy(projectNotes = it.projectNotes + (page.project.id to body)) }
         if (body.length > MAX_NOTES) {
             return fail(ProjectFormField.NOTES, "Notes can contain at most 100,000 characters.")
@@ -532,7 +534,7 @@ class ProjectPresentationController(
 
     @Synchronized
     fun addParking(location: String, nextAction: String, mustNotForget: String) {
-        val page = requireNotNull(state.projectPage)
+        val page = activeProjectPage()
         val parking = ParkingDraft(location, nextAction, mustNotForget)
         persistDraft { it.copy(projectParking = it.projectParking + (page.project.id to parking)) }
         when {
@@ -569,7 +571,7 @@ class ProjectPresentationController(
 
     @Synchronized
     fun archiveProject() {
-        val project = requireNotNull(state.projectPage).project
+        val project = activeProjectPage().project
         applyResult(
             workspace.queueArchiveProject(
                 activeSession(),
@@ -583,6 +585,7 @@ class ProjectPresentationController(
 
     @Synchronized
     fun reopenProject(project: ProjectSummary) {
+        require(project.lifecycle == ProjectLifecycle.ARCHIVED) { "Only archived projects can be reopened" }
         applyResult(
             workspace.queueReopenProject(
                 activeSession(),
@@ -749,6 +752,10 @@ class ProjectPresentationController(
     }
 
     private fun activeSession(): Session = checkNotNull(session) { "No authenticated project session" }
+
+    private fun activeProjectPage(): ProjectPage = requireNotNull(state.projectPage) { "No project is open" }.also {
+        check(it.project.lifecycle == ProjectLifecycle.ACTIVE) { "Archived projects are read-only" }
+    }
 
     private fun scopedTagSession(scope: DirectTagAttemptScope): Session {
         val active = activeSession()
