@@ -1,12 +1,12 @@
 package dev.blocks.android
 
 import android.app.AlertDialog
-import android.content.ActivityNotFoundException
 import android.content.res.ColorStateList
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.ConnectivityManager
@@ -51,9 +51,7 @@ import dev.blocks.android.auth.IdentityProvider
 import dev.blocks.android.cover.AndroidProjectCoverImporter
 import dev.blocks.android.cover.AndroidProjectCoverCropper
 import dev.blocks.android.cover.AndroidEncryptedProjectCoverMediaStore
-import dev.blocks.android.cover.CoverCaptureFiles
 import dev.blocks.android.cover.PreparedProjectCoverCrop
-import dev.blocks.android.cover.PendingCameraCover
 import dev.blocks.android.cover.ProjectCoverCropper
 import dev.blocks.android.cover.ProjectCoverCropView
 import dev.blocks.android.cover.ProjectCoverImporter
@@ -64,6 +62,9 @@ import dev.blocks.android.project.ProjectFormField
 import dev.blocks.android.project.DashboardView
 import dev.blocks.android.project.DirectTagAttemptScope
 import dev.blocks.android.project.ProjectCover
+import dev.blocks.android.project.ProjectNoteItem
+import dev.blocks.android.project.ProjectResourceLink
+import dev.blocks.android.project.ProjectResourceUri
 import dev.blocks.android.project.ProjectMutationType
 import dev.blocks.android.project.ProjectPresentationController
 import dev.blocks.android.project.ProjectScreen
@@ -114,10 +115,10 @@ internal data class ProjectAppDependencies(
     val coverImporter: ProjectCoverImporter? = null,
     val coverCropper: ProjectCoverCropper? = null,
     val coverSourceActions: CoverSourceActions? = null,
+    val resourceLinkLauncher: ((String) -> Boolean)? = null,
 )
 
 internal interface CoverSourceActions {
-    fun takePhoto(projectId: String)
     fun chooseImage(projectId: String)
 }
 
@@ -140,6 +141,14 @@ private class ActiveTagAttempt(
 }
 
 private enum class TagIoStep { PROGRAM, VERIFY_WRITE, CLEAR, VERIFY_CLEAR }
+
+private data class ProjectViewSnapshot(
+    val projectId: String,
+    val contentViews: List<View>,
+    val topViews: List<View>,
+    val bottomViews: List<View>,
+    val scrollY: Int,
+)
 
 internal object ProjectUiIds {
     const val CONTENT = 1000
@@ -189,6 +198,19 @@ internal object ProjectUiIds {
     const val CROP_SURFACE = 1073
     const val CROP_CONFIRM = 1074
     const val CROP_CANCEL = 1075
+    const val ADD_NOTE = 1080
+    const val ADD_LINK = 1081
+    const val NOTE_SHEET = 1082
+    const val NOTE_BODY = 1083
+    const val SAVE_NOTE = 1084
+    const val LINK_SHEET = 1085
+    const val LINK_TITLE = 1086
+    const val LINK_URI = 1087
+    const val SAVE_LINK = 1088
+    const val PINNED_NOTES = 1089
+    const val PROJECT_ACTIVITY = 1090
+    const val PROJECT_LINKS = 1091
+    const val LOAD_MORE_LINKS = 1092
 }
 
 class MainActivity : ComponentActivity() {
@@ -200,7 +222,6 @@ class MainActivity : ComponentActivity() {
     private val nfcTagPlatform by lazy { dependencies.nfcTagPlatform ?: AndroidNfcTagPlatform(this) }
     private val coverImporter by lazy { dependencies.coverImporter ?: AndroidProjectCoverImporter(this) }
     private val coverCropper by lazy { dependencies.coverCropper ?: AndroidProjectCoverCropper(this) }
-    private val coverCaptureFiles by lazy { CoverCaptureFiles(this) }
     private val uiScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val localStateDispatcher = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "blocks-local-state")
@@ -213,9 +234,16 @@ class MainActivity : ComponentActivity() {
     private var credentialJob: Job? = null
     private var restoreProjectId: String? = null
     private var dashboardSearchQuery: String = ""
+    private var visibleProjectItemsFor: String? = null
+    private var visibleActivityItemCount = PROJECT_ITEM_PAGE_SIZE
+    private var visibleResourceLinkCount = PROJECT_ITEM_PAGE_SIZE
+    private var projectViewSnapshot: ProjectViewSnapshot? = null
     private var transientDraftsToRestore: FormDrafts? = null
     private var transientParkingToRestore: Boolean = false
-    private var pendingCameraCover: PendingCameraCover? = null
+    private var transientNoteToRestore: Boolean = false
+    private var transientEditingNoteId: String? = null
+    private var transientLinkToRestore: Boolean = false
+    private var transientEditingLinkId: String? = null
     private var pendingCoverProjectId: String? = null
     private var activeCoverCrop: PreparedProjectCoverCrop? = null
     private var renderGeneration = 0L
@@ -234,9 +262,6 @@ class MainActivity : ComponentActivity() {
     private val coverPickerLauncher = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         handleCoverPickerResult(uri)
     }
-    private val coverCameraLauncher = registerForActivityResult(ActivityResultContracts.TakePicture()) { saved ->
-        handleCoverCameraResult(saved)
-    }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         consumeTagIntent(intent, clearActivityIntent = true)
@@ -247,13 +272,12 @@ class MainActivity : ComponentActivity() {
             Gson().fromJson(it, FormDrafts::class.java)
         }
         transientParkingToRestore = savedInstanceState?.getBoolean(STATE_TRANSIENT_PARKING, false) ?: false
+        transientNoteToRestore = savedInstanceState?.getBoolean(STATE_TRANSIENT_NOTE, false) ?: false
+        transientEditingNoteId = savedInstanceState?.getString(STATE_EDITING_NOTE_ID)
+        transientLinkToRestore = savedInstanceState?.getBoolean(STATE_TRANSIENT_LINK, false) ?: false
+        transientEditingLinkId = savedInstanceState?.getString(STATE_EDITING_LINK_ID)
         pendingCoverProjectId = savedInstanceState?.getString(STATE_COVER_PROJECT_ID)
-        pendingCameraCover = coverCaptureFiles.restore(savedInstanceState?.getString(STATE_CAMERA_COVER_PATH))
-        if (savedInstanceState?.containsKey(STATE_CAMERA_COVER_PATH) == true && pendingCameraCover == null) {
-            pendingCoverProjectId = null
-        }
         uiScope.launch(Dispatchers.IO) {
-            coverCaptureFiles.cleanupOrphans(pendingCameraCover?.path)
             coverImporter.cleanupAbandonedSources()
             coverCropper.cleanupAbandonedSources()
         }
@@ -311,6 +335,12 @@ class MainActivity : ComponentActivity() {
                     if (controller.state.screen == ProjectScreen.PROJECT && controller.state.showParkingForm) {
                         controller.hideParkingForm()
                         render()
+                    } else if (controller.state.screen == ProjectScreen.PROJECT && controller.state.showNoteForm) {
+                        controller.hideNoteForm()
+                        render()
+                    } else if (controller.state.screen == ProjectScreen.PROJECT && controller.state.showLinkForm) {
+                        controller.hideLinkForm()
+                        render()
                     } else if (controller.state.screen == ProjectScreen.PROJECT) {
                         controller.backToDashboard()
                         render()
@@ -362,9 +392,12 @@ class MainActivity : ComponentActivity() {
         if (controller.isAuthenticated) {
             outState.putString(STATE_TRANSIENT_DRAFTS, Gson().toJson(controller.state.drafts))
             outState.putBoolean(STATE_TRANSIENT_PARKING, controller.state.showParkingForm)
+            outState.putBoolean(STATE_TRANSIENT_NOTE, controller.state.showNoteForm)
+            controller.state.editingNoteId?.let { outState.putString(STATE_EDITING_NOTE_ID, it) }
+            outState.putBoolean(STATE_TRANSIENT_LINK, controller.state.showLinkForm)
+            controller.state.editingLinkId?.let { outState.putString(STATE_EDITING_LINK_ID, it) }
         }
         pendingCoverProjectId?.let { outState.putString(STATE_COVER_PROJECT_ID, it) }
-        pendingCameraCover?.path?.let { outState.putString(STATE_CAMERA_COVER_PATH, it) }
         super.onSaveInstanceState(outState)
     }
 
@@ -395,12 +428,26 @@ class MainActivity : ComponentActivity() {
         renderGeneration += 1
         coverJobs.forEach { it.cancel() }
         coverJobs.clear()
+        if (
+            controller.state.screen != ProjectScreen.PROJECT ||
+            (!controller.state.showParkingForm && !controller.state.showNoteForm && !controller.state.showLinkForm)
+        ) {
+            projectViewSnapshot = null
+        }
         content.removeAllViews()
         topNavigation.removeAllViews()
         bottomActions.removeAllViews()
         if (!continuity.shouldRestore) restoreTransientDraftsIfReady()
         if (controller.state.screen == ProjectScreen.PROJECT && controller.state.showParkingForm) {
             renderParkingSheet()
+            return
+        }
+        if (controller.state.screen == ProjectScreen.PROJECT && controller.state.showNoteForm) {
+            renderNoteSheet()
+            return
+        }
+        if (controller.state.screen == ProjectScreen.PROJECT && controller.state.showLinkForm) {
+            renderLinkSheet()
             return
         }
         renderTopBar()
@@ -823,6 +870,11 @@ class MainActivity : ComponentActivity() {
     private fun renderProject() {
         content.tag = ProjectUiIds.SCREEN_PROJECT
         val page = requireNotNull(controller.state.projectPage)
+        if (visibleProjectItemsFor != page.project.id) {
+            visibleProjectItemsFor = page.project.id
+            visibleActivityItemCount = PROJECT_ITEM_PAGE_SIZE
+            visibleResourceLinkCount = PROJECT_ITEM_PAGE_SIZE
+        }
         val archived = page.project.lifecycle == dev.blocks.android.project.ProjectLifecycle.ARCHIVED
         content.addView(heading(page.project.name, 30f).apply {
             setPadding(0, dp(6), 0, dp(8))
@@ -866,112 +918,309 @@ class MainActivity : ComponentActivity() {
             },
         )
 
-        val newestParking = page.newestParking
-        val parkingCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = roundedBackground(brandColor(R.color.blocks_white), brandColor(R.color.blocks_line), 12f)
-            setPadding(dp(18), dp(16), dp(18), dp(10))
-        }
-        parkingCard.addView(heading("Where you left off", 20f))
-        if (newestParking == null) {
-            parkingCard.addView(label("No park message yet.", 16f, brandColor(R.color.blocks_muted)))
-        } else {
-            parkingCard.addView(fieldValue("Where I am", newestParking.location))
-            parkingCard.addView(divider())
-            parkingCard.addView(fieldValue("Next physical action", newestParking.nextAction))
-            parkingCard.addView(divider())
-            parkingCard.addView(fieldValue("Must not forget", newestParking.mustNotForget))
-        }
-        content.addView(parkingCard)
         if (archived) {
             bottomActions.addView(primaryButton("Reopen", R.drawable.ic_archive) { source ->
                 runRepositoryAction(source = source, syncAfter = true) { controller.reopenProject(page.project) }
             }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)))
         } else {
-            bottomActions.addView(primaryButton("Park", R.drawable.ic_park) {
+            bottomActions.addView(styledButton(
+                "Park",
+                R.drawable.ic_park,
+                brandColor(R.color.blocks_amber),
+                brandColor(R.color.blocks_ink),
+                Color.TRANSPARENT,
+            ) {
                 controller.showParkingForm()
                 render()
-            }.apply { id = ProjectUiIds.PARK }, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(48),
-            ))
+            }.apply { id = ProjectUiIds.PARK }, projectActionLayoutParams())
+            bottomActions.addView(primaryButton("Add note", R.drawable.ic_note) {
+                captureProjectView()
+                controller.showAddNoteForm()
+                render()
+            }.apply { id = ProjectUiIds.ADD_NOTE }, projectActionLayoutParams())
+            bottomActions.addView(primaryButton("Add link", R.drawable.ic_link) {
+                captureProjectView()
+                controller.showAddLinkForm()
+                render()
+            }.apply { id = ProjectUiIds.ADD_LINK }, projectActionLayoutParams(end = true))
         }
 
-        content.addView(heading("Notes", 22f))
-        val notesValue = controller.state.drafts.projectNotes[page.project.id] ?: page.notes.body
-        if (archived) {
-            content.addView(label(notesValue.ifEmpty { "No notes." }, 16f).apply {
-                id = ProjectUiIds.NOTES
-                setTextIsSelectable(true)
-                setPadding(dp(12), dp(12), dp(12), dp(12))
-                background = roundedBackground(brandColor(R.color.blocks_white), brandColor(R.color.blocks_input), 10f)
-            }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                bottomMargin = dp(20)
-            })
-        } else {
-            val notes = input("Project notes", notesValue) { value ->
-                queueDraftUpdate { controller.updateNotes(value) }
-            }.apply {
-                id = ProjectUiIds.NOTES
-                minLines = 8
-                maxLines = 14
-                gravity = Gravity.TOP
-                isVerticalScrollBarEnabled = true
-                overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
-                ViewCompat.setNestedScrollingEnabled(this, true)
-            }
-            notes.markInvalid(ProjectFormField.NOTES)
-            notes.background = roundedBackground(brandColor(R.color.blocks_white), brandColor(R.color.blocks_input), 10f)
-            content.addView(notes, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(240)))
-            content.addView(primaryButton("Save notes", R.drawable.ic_edit) { source ->
-                runRepositoryAction(source = source, syncAfter = true) {
-                    controller.saveNotes(notes.text.toString())
-                }
-            }.apply { id = ProjectUiIds.SAVE_NOTES }, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(52),
-            ).apply { topMargin = dp(10); bottomMargin = dp(20) })
-        }
-
-        val olderParking = controller.state.parkingHistory.filterNot { it.id == newestParking?.id }
-        if (olderParking.isNotEmpty() || controller.state.parkingHistoryHasMore) {
-            content.addView(heading("Parking history", 20f))
-            val history = LinearLayout(this).apply {
-                id = ProjectUiIds.PARKING_HISTORY
+        val pinned = controller.state.noteItems.filter { it.pinned }
+        if (pinned.isNotEmpty()) {
+            content.addView(heading("Pinned notes", 20f).apply { setPadding(0, dp(6), 0, dp(8)) })
+            content.addView(LinearLayout(this).apply {
+                id = ProjectUiIds.PINNED_NOTES
                 orientation = LinearLayout.VERTICAL
-            }
-            olderParking.forEachIndexed { index, record ->
-                if (index > 0) {
-                    history.addView(
-                        View(this).apply {
-                            id = ProjectUiIds.PARKING_HISTORY_DIVIDER
-                            setBackgroundColor(Color.rgb(200, 197, 188))
-                        },
-                        LinearLayout.LayoutParams(
-                            LinearLayout.LayoutParams.MATCH_PARENT,
-                            dp(1),
-                        ).apply {
-                            topMargin = dp(12)
-                            bottomMargin = dp(12)
-                        },
-                    )
-                }
-                history.addView(label(record.occurredAt, 12f, Color.GRAY))
-                history.addView(label("Where I was", 12f, Color.GRAY))
-                history.addView(label(record.location, 15f))
-                history.addView(label("Next physical action", 12f, Color.GRAY))
-                history.addView(label(record.nextAction, 15f))
-                history.addView(label("Must not forget", 12f, Color.GRAY))
-                history.addView(label(record.mustNotForget, 15f))
-            }
-            content.addView(history)
-            if (controller.state.parkingHistoryHasMore) {
-                content.addView(button("Show older park messages") { source ->
-                    runRepositoryAction(source = source) { controller.loadOlderParking() }
-                }.apply { id = ProjectUiIds.LOAD_OLDER_PARKING })
-            }
+                pinned.forEach { addView(noteCard(it, archived)) }
+            })
         }
 
+        content.addView(heading("Activity", 20f).apply { setPadding(0, dp(12), 0, dp(8)) })
+        val activity = buildList<Pair<String, () -> View>> {
+            controller.state.noteItems.filterNot { it.pinned }
+                .forEach { note -> add(note.updatedAt to { noteCard(note, archived) }) }
+            controller.state.parkingHistory
+                .forEach { record -> add(record.occurredAt to { parkingRecordCard(record) }) }
+        }.sortedByDescending { it.first }
+        content.addView(LinearLayout(this).apply {
+            id = ProjectUiIds.PROJECT_ACTIVITY
+            orientation = LinearLayout.VERTICAL
+            if (activity.isEmpty()) {
+                addView(label("No notes or park messages yet.", 15f, brandColor(R.color.blocks_muted)))
+            } else {
+                activity.take(visibleActivityItemCount).forEach { addView(it.second()) }
+            }
+        })
+        if (activity.size > visibleActivityItemCount) {
+            content.addView(button("Show older activity") {
+                visibleActivityItemCount += PROJECT_ITEM_PAGE_SIZE
+                render()
+            }.apply { id = ProjectUiIds.LOAD_OLDER_PARKING })
+        } else if (controller.state.parkingHistoryHasMore) {
+            content.addView(button("Show older park messages") { source ->
+                visibleActivityItemCount += PROJECT_ITEM_PAGE_SIZE
+                runRepositoryAction(source = source) { controller.loadOlderParking() }
+            }.apply { id = ProjectUiIds.LOAD_OLDER_PARKING })
+        }
+
+        content.addView(heading("Links", 20f).apply { setPadding(0, dp(14), 0, dp(8)) })
+        content.addView(LinearLayout(this).apply {
+            id = ProjectUiIds.PROJECT_LINKS
+            orientation = LinearLayout.VERTICAL
+            if (controller.state.resourceLinks.isEmpty()) {
+                addView(label("No links yet.", 15f, brandColor(R.color.blocks_muted)))
+            } else {
+                controller.state.resourceLinks.take(visibleResourceLinkCount)
+                    .forEach { addView(resourceLinkCard(it, archived)) }
+            }
+        })
+        if (controller.state.resourceLinks.size > visibleResourceLinkCount) {
+            content.addView(button("Show more links") {
+                visibleResourceLinkCount += PROJECT_ITEM_PAGE_SIZE
+                render()
+            }.apply { id = ProjectUiIds.LOAD_MORE_LINKS })
+        }
+    }
+
+    private fun projectActionLayoutParams(end: Boolean = false) = LinearLayout.LayoutParams(0, dp(48), 1f).apply {
+        if (!end) marginEnd = dp(6)
+    }
+
+    private fun noteCard(note: ProjectNoteItem, archived: Boolean) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(14), dp(12), dp(14), dp(10))
+        background = roundedBackground(brandColor(R.color.blocks_white), brandColor(R.color.blocks_line), 10f)
+        addView(label(note.body, 16f, brandColor(R.color.blocks_ink)).apply { setTextIsSelectable(true) })
+        addView(label(note.updatedAt, 12f, brandColor(R.color.blocks_muted)))
+        if (!archived) addView(LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.END
+            addView(iconOnlyButton(R.drawable.ic_edit, "Edit note") {
+                controller.showEditNoteForm(note.id)
+                render()
+            }, LinearLayout.LayoutParams(dp(48), dp(48)))
+            addView(iconOnlyButton(R.drawable.ic_pin, if (note.pinned) "Unpin note" else "Pin note") { source ->
+                runRepositoryAction(source = source) { controller.setNotePinned(note.id, !note.pinned) }
+            }, LinearLayout.LayoutParams(dp(48), dp(48)))
+            addView(iconOnlyButton(R.drawable.ic_delete, "Delete note") { confirmDeleteNote(note) },
+                LinearLayout.LayoutParams(dp(48), dp(48)))
+        })
+    }.also {
+        it.layoutParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ).apply { bottomMargin = dp(8) }
+    }
+
+    private fun parkingRecordCard(record: dev.blocks.android.project.ProjectParking) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(14), dp(12), dp(14), dp(12))
+        background = roundedBackground(brandColor(R.color.blocks_white), brandColor(R.color.blocks_line), 10f)
+        addView(label("Park · ${record.occurredAt}", 12f, brandColor(R.color.blocks_muted)))
+        addView(fieldValue("Where I was", record.location))
+        addView(fieldValue("Next physical action", record.nextAction))
+        addView(fieldValue("Must not forget", record.mustNotForget))
+    }.also {
+        it.layoutParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ).apply { bottomMargin = dp(8) }
+    }
+
+    private fun resourceLinkCard(link: ProjectResourceLink, archived: Boolean) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(14), dp(10), dp(10), dp(8))
+        background = roundedBackground(brandColor(R.color.blocks_white), brandColor(R.color.blocks_line), 10f)
+        addView(label(link.title, 17f, brandColor(R.color.blocks_ink)).apply { typeface = manropeTypeface })
+        addView(label(link.uri, 13f, brandColor(R.color.blocks_muted)).apply { setTextIsSelectable(true) })
+        addView(LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.END
+            addView(iconOnlyButton(R.drawable.ic_link, "Open ${link.title}") { launchProjectLink(link) },
+                LinearLayout.LayoutParams(dp(48), dp(48)))
+            if (!archived) {
+                addView(iconOnlyButton(R.drawable.ic_edit, "Edit link") {
+                    controller.showEditLinkForm(link.id)
+                    render()
+                }, LinearLayout.LayoutParams(dp(48), dp(48)))
+                addView(iconOnlyButton(R.drawable.ic_delete, "Delete link") { confirmDeleteResourceLink(link) },
+                    LinearLayout.LayoutParams(dp(48), dp(48)))
+            }
+        })
+    }.also {
+        it.layoutParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ).apply { bottomMargin = dp(8) }
+    }
+
+    private fun confirmDeleteNote(note: ProjectNoteItem) {
+        showManagedDialog(
+            AlertDialog.Builder(this)
+                .setTitle("Delete note?")
+                .setMessage("This note will be removed from this project.")
+                .setPositiveButton("Delete") { _, _ -> runRepositoryAction { controller.deleteNote(note.id) } }
+                .setNegativeButton("Cancel", null)
+                .create(),
+        )
+    }
+
+    private fun confirmDeleteResourceLink(link: ProjectResourceLink) {
+        showManagedDialog(
+            AlertDialog.Builder(this)
+                .setTitle("Delete link?")
+                .setMessage("${link.title} will be removed from this project.")
+                .setPositiveButton("Delete") { _, _ -> runRepositoryAction { controller.deleteResourceLink(link.id) } }
+                .setNegativeButton("Cancel", null)
+                .create(),
+        )
+    }
+
+    internal fun launchProjectLink(link: ProjectResourceLink): Boolean {
+        val safe = runCatching { ProjectResourceUri.validate(link.uri) }.getOrNull() ?: return false
+        dependencies.resourceLinkLauncher?.let { return it(safe) }
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(safe)).addCategory(Intent.CATEGORY_BROWSABLE)
+        return runCatching {
+            startActivity(intent)
+            true
+        }.getOrElse {
+            showMessage("Link unavailable", "No app can safely open this link.")
+            false
+        }
+    }
+
+    private fun renderNoteSheet() {
+        content.tag = ProjectUiIds.SCREEN_PROJECT
+        val projectId = requireNotNull(controller.state.projectPage).project.id
+        val noteId = controller.state.editingNoteId
+        val key = dev.blocks.android.project.noteItemDraftKey(projectId, noteId)
+        val draft = controller.state.drafts.projectNoteItems[key]?.body.orEmpty()
+        val body = input("Note", draft) { value -> queueDraftUpdate { controller.updateNoteItemDraft(value) } }.apply {
+            id = ProjectUiIds.NOTE_BODY
+            minLines = 8
+            maxLines = 18
+            gravity = Gravity.TOP
+            markInvalid(ProjectFormField.NOTE_ITEM)
+            background = roundedBackground(brandColor(R.color.blocks_white), brandColor(R.color.blocks_input), 10f)
+        }
+        topNavigation.addView(containedFormNavigation(
+            id = ProjectUiIds.NOTE_SHEET,
+            title = if (noteId == null) "Add note" else "Edit note",
+            icon = R.drawable.ic_note,
+            saveId = ProjectUiIds.SAVE_NOTE,
+            back = { controller.hideNoteForm(); render() },
+            save = { source ->
+                val priorIds = controller.state.noteItems.mapTo(mutableSetOf()) { it.id }
+                val submittedBody = body.text.toString()
+                runRepositoryAction(
+                    source = source,
+                    renderCommitted = {
+                        val added = controller.state.noteItems.singleOrNull { it.id !in priorIds }
+                        (added != null && restoreProjectView {
+                            val activity = findViewById<LinearLayout>(ProjectUiIds.PROJECT_ACTIVITY)
+                            if (activity.childCount == 1 && activity.getChildAt(0) is TextView) activity.removeAllViews()
+                            activity.addView(noteCard(added, archived = false), 0)
+                        })
+                    },
+                ) { controller.saveNoteItem(submittedBody) }
+            },
+        ))
+        content.addView(body, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ))
+    }
+
+    private fun renderLinkSheet() {
+        content.tag = ProjectUiIds.SCREEN_PROJECT
+        val projectId = requireNotNull(controller.state.projectPage).project.id
+        val linkId = controller.state.editingLinkId
+        val key = dev.blocks.android.project.resourceLinkDraftKey(projectId, linkId)
+        val draft = controller.state.drafts.projectResourceLinks[key] ?: dev.blocks.android.mvp.ProjectResourceLinkDraft()
+        var titleValue = draft.title
+        var uriValue = draft.uri
+        fun persist() = queueDraftUpdate { controller.updateResourceLinkDraft(titleValue, uriValue) }
+        val title = input("Title", titleValue) { titleValue = it; persist() }.apply {
+            id = ProjectUiIds.LINK_TITLE
+            markInvalid(ProjectFormField.LINK_TITLE)
+        }
+        val uri = input("https:// or obsidian://", uriValue) { uriValue = it; persist() }.apply {
+            id = ProjectUiIds.LINK_URI
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+            markInvalid(ProjectFormField.LINK_URI)
+        }
+        topNavigation.addView(containedFormNavigation(
+            id = ProjectUiIds.LINK_SHEET,
+            title = if (linkId == null) "Add link" else "Edit link",
+            icon = R.drawable.ic_link,
+            saveId = ProjectUiIds.SAVE_LINK,
+            back = { controller.hideLinkForm(); render() },
+            save = { source ->
+                val submittedTitle = title.text.toString()
+                val priorIds = controller.state.resourceLinks.mapTo(mutableSetOf()) { it.id }
+                runRepositoryAction(
+                    source = source,
+                    renderCommitted = {
+                        val added = controller.state.resourceLinks.singleOrNull { it.id !in priorIds }
+                        added != null && restoreProjectView {
+                            val links = findViewById<LinearLayout>(ProjectUiIds.PROJECT_LINKS)
+                            if (links.childCount == 1 && links.getChildAt(0) is TextView) links.removeAllViews()
+                            links.addView(resourceLinkCard(added, archived = false), 0)
+                        }
+                    },
+                    complete = {
+                        if (!controller.state.showLinkForm) scrollProjectToText(submittedTitle)
+                    },
+                ) { controller.saveResourceLink(submittedTitle, uri.text.toString()) }
+            },
+        ))
+        content.addView(title, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ).apply { bottomMargin = dp(10) })
+        content.addView(uri, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ))
+    }
+
+    private fun containedFormNavigation(
+        id: Int,
+        title: String,
+        icon: Int,
+        saveId: Int,
+        back: () -> Unit,
+        save: (View) -> Unit,
+    ) = LinearLayout(this).apply {
+        this.id = id
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        addView(iconOnlyButton(R.drawable.ic_back, "Back") { back() }.apply { this.id = ProjectUiIds.BACK },
+            LinearLayout.LayoutParams(dp(48), dp(48)))
+        addView(label(title, 24f, brandColor(R.color.blocks_ink)).apply { gravity = Gravity.CENTER_VERTICAL },
+            LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(8) })
+        addView(primaryButton("Save", icon, save).apply { this.id = saveId },
+            LinearLayout.LayoutParams(dp(112), dp(48)))
     }
 
     private fun renderParkingSheet() {
@@ -1139,7 +1388,6 @@ class MainActivity : ComponentActivity() {
         if (page.project.lifecycle != dev.blocks.android.project.ProjectLifecycle.ACTIVE) return
         val hasCover = controller.state.projectCovers.any { it.projectId == page.project.id }
         val items = buildList {
-            add(if (hasCover) "Take replacement photo" else "Take photo")
             add(if (hasCover) "Choose replacement image" else "Choose image")
             if (hasCover) add("Remove cover")
         }
@@ -1148,10 +1396,6 @@ class MainActivity : ComponentActivity() {
                 .setTitle("Project cover")
                 .setItems(items.toTypedArray()) { _, which ->
                     when (items[which]) {
-                        "Take photo", "Take replacement photo" -> {
-                            dependencies.coverSourceActions?.takePhoto(page.project.id)
-                                ?: launchCoverCamera(page.project.id)
-                        }
                         "Choose image", "Choose replacement image" -> {
                             dependencies.coverSourceActions?.chooseImage(page.project.id)
                                 ?: launchCoverPicker(page.project.id)
@@ -1174,54 +1418,23 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun launchCoverCamera(projectId: String) {
-        val capture = runCatching { coverCaptureFiles.create() }.getOrElse {
-            showMessage("Camera unavailable", "Blocks could not create a private temporary photo. Your current cover is unchanged.")
-            return
-        }
-        stagePendingCover(projectId, capture)
-        try {
-            coverCameraLauncher.launch(capture.uri)
-        } catch (_: ActivityNotFoundException) {
-            discardPendingCameraCover()
-            showMessage("Camera unavailable", "No camera app is available. Your current cover is unchanged.")
-        } catch (_: SecurityException) {
-            discardPendingCameraCover()
-            showMessage("Camera unavailable", "The camera did not accept the private photo destination. Your current cover is unchanged.")
-        }
-    }
-
     internal fun handleCoverPickerResult(uri: Uri?) {
         val projectId = pendingCoverProjectId
         pendingCoverProjectId = null
         if (uri != null && projectId != null) beginCoverCrop(projectId, uri)
     }
 
-    internal fun stagePendingCover(projectId: String, capture: PendingCameraCover? = null) {
+    internal fun stagePendingCover(projectId: String) {
         pendingCoverProjectId = projectId
-        pendingCameraCover = capture
     }
 
-    internal fun handleCoverCameraResult(saved: Boolean) {
-        val projectId = pendingCoverProjectId
-        val capture = pendingCameraCover
-        pendingCoverProjectId = null
-        pendingCameraCover = null
-        if (!saved || projectId == null || capture == null) {
-            uiScope.launch(Dispatchers.IO) { runCatching { coverCaptureFiles.delete(capture) } }
-            return
-        }
-        beginCoverCrop(projectId, capture.uri, capture)
-    }
-
-    private fun beginCoverCrop(projectId: String, uri: Uri, capture: PendingCameraCover? = null) {
+    private fun beginCoverCrop(projectId: String, uri: Uri) {
         val tenantId = controller.activeTenantId
         val page = controller.state.projectPage
         if (
             tenantId == null || page?.project?.id != projectId ||
             page.project.lifecycle != dev.blocks.android.project.ProjectLifecycle.ACTIVE
         ) {
-            coverCaptureFiles.delete(capture)
             return
         }
         uiScope.launch {
@@ -1231,10 +1444,6 @@ class MainActivity : ComponentActivity() {
                 controller.reportError("Blocks could not open that image. Your current cover is unchanged.")
                 render()
                 return@launch
-            } finally {
-                if (capture != null) withContext(NonCancellable + Dispatchers.IO) {
-                    coverCaptureFiles.delete(capture)
-                }
             }
             if (
                 controller.activeTenantId != tenantId ||
@@ -1322,12 +1531,9 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    internal fun importCover(projectId: String, uri: Uri, capture: PendingCameraCover? = null) {
+    internal fun importCover(projectId: String, uri: Uri) {
         val tenantId = controller.activeTenantId
-        if (tenantId == null) {
-            coverCaptureFiles.delete(capture)
-            return
-        }
+        if (tenantId == null) return
         uiScope.launch {
             var imported: dev.blocks.android.project.ProjectCoverContent? = null
             try {
@@ -1343,9 +1549,6 @@ class MainActivity : ComponentActivity() {
                 controller.reportError("Blocks could not save that cover on this device. Your current cover is unchanged.")
             } finally {
                 imported?.clear()
-                if (capture != null) withContext(NonCancellable + Dispatchers.IO) {
-                    coverCaptureFiles.delete(capture)
-                }
             }
             render()
         }
@@ -1361,13 +1564,6 @@ class MainActivity : ComponentActivity() {
             .setNegativeButton("Cancel", null)
             .create()
         showManagedDialog(dialog)
-    }
-
-    private fun discardPendingCameraCover() {
-        val capture = pendingCameraCover
-        pendingCameraCover = null
-        pendingCoverProjectId = null
-        uiScope.launch(Dispatchers.IO) { runCatching { coverCaptureFiles.delete(capture) } }
     }
 
     private fun showSetTag() {
@@ -2003,10 +2199,7 @@ class MainActivity : ComponentActivity() {
         coverJobs.forEach { it.cancel() }
         coverJobs.clear()
         coverBitmaps.evictAll()
-        val capture = pendingCameraCover
-        pendingCameraCover = null
         pendingCoverProjectId = null
-        uiScope.launch(Dispatchers.IO) { runCatching { coverCaptureFiles.delete(capture) } }
         discardActiveCoverCrop()
     }
 
@@ -2331,17 +2524,70 @@ class MainActivity : ComponentActivity() {
         dialog.show()
     }
 
-    /** Form edits are deliberately memory-only; explicit buttons own persistence. */
+    /** Routes text changes to the controller; each form decides whether its draft is durable. */
     private fun queueDraftUpdate(action: () -> Unit) {
         action()
+    }
+
+    private fun scrollProjectToText(value: String) {
+        rootScroll.post {
+            val matches = arrayListOf<View>()
+            content.findViewsWithText(matches, value, View.FIND_VIEWS_WITH_TEXT)
+            val target = matches.filterIsInstance<TextView>()
+                .firstOrNull { it.text.toString() == value && it.isShown }
+                ?: matches.filterIsInstance<TextView>().firstOrNull { it.text.toString() == value }
+                ?: return@post
+            val bounds = Rect()
+            target.getDrawingRect(bounds)
+            rootScroll.offsetDescendantRectToMyCoords(target, bounds)
+            rootScroll.scrollTo(0, (bounds.top - dp(16)).coerceAtLeast(0))
+        }
+    }
+
+    private fun captureProjectView() {
+        val projectId = controller.state.projectPage?.project?.id ?: return
+        projectViewSnapshot = ProjectViewSnapshot(
+            projectId = projectId,
+            contentViews = (0 until content.childCount).map(content::getChildAt),
+            topViews = (0 until topNavigation.childCount).map(topNavigation::getChildAt),
+            bottomViews = (0 until bottomActions.childCount).map(bottomActions::getChildAt),
+            scrollY = rootScroll.scrollY,
+        )
+    }
+
+    private fun restoreProjectView(update: MainActivity.() -> Unit): Boolean {
+        val snapshot = projectViewSnapshot ?: return false
+        if (controller.state.projectPage?.project?.id != snapshot.projectId) return false
+        content.removeAllViews()
+        topNavigation.removeAllViews()
+        bottomActions.removeAllViews()
+        snapshot.contentViews.forEach(content::addView)
+        snapshot.topViews.forEach(topNavigation::addView)
+        snapshot.bottomViews.forEach(bottomActions::addView)
+        content.tag = ProjectUiIds.SCREEN_PROJECT
+        projectViewSnapshot = null
+        update()
+        rootScroll.scrollTo(0, snapshot.scrollY)
+        return true
     }
 
     private fun restoreTransientDraftsIfReady() {
         val drafts = transientDraftsToRestore ?: return
         if (!controller.isAuthenticated) return
-        controller.restoreTransientDrafts(drafts, transientParkingToRestore)
+        controller.restoreTransientDrafts(
+            drafts,
+            transientParkingToRestore,
+            transientNoteToRestore,
+            transientEditingNoteId,
+            transientLinkToRestore,
+            transientEditingLinkId,
+        )
         transientDraftsToRestore = null
         transientParkingToRestore = false
+        transientNoteToRestore = false
+        transientEditingNoteId = null
+        transientLinkToRestore = false
+        transientEditingLinkId = null
     }
 
     private suspend fun handleRepositoryError(error: Exception) {
@@ -2368,7 +2614,6 @@ class MainActivity : ComponentActivity() {
         coverJobs.clear()
         coverBitmaps.evictAll()
         discardActiveCoverCrop()
-        if (!isChangingConfigurations) coverCaptureFiles.delete(pendingCameraCover)
         uiScope.cancel()
         localStateDispatcher.close()
         super.onDestroy()
@@ -2385,10 +2630,14 @@ class MainActivity : ComponentActivity() {
     internal companion object {
         private const val STATE_PROJECT_ID = "project_id"
         private const val STATE_COVER_PROJECT_ID = "cover_project_id"
-        private const val STATE_CAMERA_COVER_PATH = "camera_cover_path"
         private const val STATE_TRANSIENT_DRAFTS = "transient_form_drafts"
         private const val STATE_TRANSIENT_PARKING = "transient_parking_form"
+        private const val STATE_TRANSIENT_NOTE = "transient_note_form"
+        private const val STATE_EDITING_NOTE_ID = "editing_note_id"
+        private const val STATE_TRANSIENT_LINK = "transient_link_form"
+        private const val STATE_EDITING_LINK_ID = "editing_link_id"
         private const val DASHBOARD_COLLECTION_TAG = "dashboard_collection"
+        private const val PROJECT_ITEM_PAGE_SIZE = 10
 
         @Volatile
         var dependencyFactory: ((MainActivity) -> ProjectAppDependencies)? = null

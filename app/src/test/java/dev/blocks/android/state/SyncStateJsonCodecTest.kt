@@ -21,6 +21,8 @@ import dev.blocks.android.project.ProjectParking
 import dev.blocks.android.project.ProjectSummary
 import dev.blocks.android.project.DashboardView
 import dev.blocks.android.project.ProjectUiPreferences
+import dev.blocks.android.project.legacyNoteItemIdentity
+import dev.blocks.android.project.noteItemDraftKey
 import dev.blocks.android.tag.LocalBlockOperation
 import dev.blocks.android.tag.LocalBlockOperationType
 import dev.blocks.android.tag.LocalBlockRecord
@@ -33,6 +35,55 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SyncStateStorageCodecTest {
+    @Test
+    fun schemaNineMigratesEachNonEmptySingletonNoteOnceAndPreservesItsPendingDraft() {
+        val first = ProjectSummary(
+            id = "10000000-0000-4000-8000-000000000001",
+            tenantId = "tenant-a",
+            name = "First",
+            lifecycle = ProjectLifecycle.ACTIVE,
+            rowVersion = 1,
+            createdAt = "2026-09-16T09:00:00Z",
+            updatedAt = "2026-09-16T09:00:00Z",
+        )
+        val second = first.copy(id = "20000000-0000-4000-8000-000000000002", name = "Second")
+        val body = "A".repeat(20_000)
+        val state = TenantSyncState(
+            projectCache = ProjectCacheState(
+                activeProjects = listOf(first, second),
+                pages = listOf(
+                    ProjectPage(first, ProjectNotes(first.id, body, 7, first.updatedAt), null),
+                    ProjectPage(second, ProjectNotes(second.id, "", 1, second.updatedAt), null),
+                ),
+            ),
+            projectDrafts = FormDrafts(projectNotes = mapOf(first.id to "Pending edit")),
+            projectDraftsMigrated = true,
+        )
+        val oldRows = SyncStateRowCodec().encode(state).copy(
+            schemaVersion = 9,
+            projectNoteItems = emptyList(),
+            projectResourceLinks = emptyList(),
+            projectItemOperations = emptyList(),
+            retiredProjectItemOperations = emptyList(),
+        )
+
+        val migrated = SyncStateRowCodec().decode(oldRows)
+        val note = migrated.projectCache.noteItems.single()
+        assertEquals(legacyNoteItemIdentity(first.id), note.id)
+        assertEquals(body, note.body)
+        assertTrue(note.legacySingleton)
+        assertEquals(
+            "Pending edit",
+            migrated.projectDrafts.projectNoteItems[
+                noteItemDraftKey(first.id, legacyNoteItemIdentity(first.id))
+            ]?.body,
+        )
+        assertTrue(migrated.projectDrafts.projectNotes.isEmpty())
+
+        val restarted = SyncStateRowCodec().decode(SyncStateRowCodec().encode(migrated))
+        assertEquals(listOf(note), restarted.projectCache.noteItems)
+    }
+
     @Test
     fun roundTripsTheVersionedQueueCacheCursorAndRetiredKeys() {
         val state = TenantSyncState(
@@ -66,7 +117,7 @@ class SyncStateStorageCodecTest {
         val rows = SyncStateRowCodec().encode(state)
         val decoded = SyncStateRowCodec().decode(rows)
 
-        assertEquals(9, rows.schemaVersion)
+        assertEquals(10, rows.schemaVersion)
         assertEquals(1, rows.projects.size)
         assertEquals(1, rows.commands.size)
         assertEquals(1, rows.retiredIdempotencyKeys.size)
@@ -131,7 +182,7 @@ class SyncStateStorageCodecTest {
 
     @Test
     fun rejectsAnUnknownDatabaseRowSchemaWithoutDiscardingIt() {
-        val rows = SyncStateRowCodec().encode(TenantSyncState()).copy(schemaVersion = 10)
+        val rows = SyncStateRowCodec().encode(TenantSyncState()).copy(schemaVersion = 11)
 
         val error = runCatching { SyncStateRowCodec().decode(rows) }.exceptionOrNull()
 
@@ -318,7 +369,7 @@ class SyncStateStorageCodecTest {
         val rows = SyncStateRowCodec().encode(state)
         val decoded = SyncStateRowCodec().decode(rows)
 
-        assertEquals(9, rows.schemaVersion)
+        assertEquals(10, rows.schemaVersion)
         assertEquals(
             state,
             decoded.copy(projectCache = decoded.projectCache.copy(projectLinks = emptyList())),

@@ -5,18 +5,27 @@ import android.database.sqlite.SQLiteDatabase
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.blocks.android.mvp.FormDrafts
+import dev.blocks.android.mvp.NoteItemDraft
 import dev.blocks.android.mvp.ParkingDraft
+import dev.blocks.android.mvp.ProjectResourceLinkDraft
 import dev.blocks.android.mvp.TenantSyncState
 import dev.blocks.android.project.ProjectCacheState
 import dev.blocks.android.project.ProjectCover
 import dev.blocks.android.project.ProjectIdentityMapping
+import dev.blocks.android.project.ProjectItemMutation
+import dev.blocks.android.project.ProjectItemMutationType
 import dev.blocks.android.project.ProjectLifecycle
 import dev.blocks.android.project.ProjectMutation
 import dev.blocks.android.project.ProjectMutationType
 import dev.blocks.android.project.ProjectNotes
+import dev.blocks.android.project.ProjectNoteItem
 import dev.blocks.android.project.ProjectPage
 import dev.blocks.android.project.ProjectParking
+import dev.blocks.android.project.ProjectResourceLink
 import dev.blocks.android.project.ProjectSummary
+import dev.blocks.android.project.legacyNoteItemIdentity
+import dev.blocks.android.project.noteItemDraftKey
+import dev.blocks.android.project.resourceLinkDraftKey
 import dev.blocks.android.tag.LocalBlockOperation
 import dev.blocks.android.tag.LocalBlockOperationType
 import dev.blocks.android.tag.LocalBlockRecord
@@ -123,6 +132,44 @@ class AndroidNormalizedSyncStateStoreTest {
     }
 
     @Test
+    fun releasedSchemaNineUpgradesTablesAndMigratesPendingSingletonNoteExactlyOnceAcrossRestart() {
+        val initial = state(TENANT).copy(
+            projectCache = state(TENANT).projectCache.copy(
+                pages = state(TENANT).projectCache.pages.mapIndexed { index, page ->
+                    if (index == 0) page.copy(notes = page.notes.copy(body = "Pending singleton note"))
+                    else page.copy(notes = page.notes.copy(body = ""))
+                },
+                noteItems = emptyList(),
+                resourceLinks = emptyList(),
+                itemOperations = emptyList(),
+                retiredItemOperationIds = emptyList(),
+            ),
+            projectDrafts = FormDrafts(projectNotes = mapOf(PROJECT to "Unsubmitted pending edit")),
+        )
+        store.saveSyncState(TENANT, initial)
+        SQLiteDatabase.openDatabase(normalizedDatabase(TENANT).path, null, SQLiteDatabase.OPEN_READWRITE).use { db ->
+            AndroidSyncStateStore.PROJECT_ITEM_TABLES.forEach { db.execSQL("DROP TABLE $it") }
+            db.execSQL(
+                "UPDATE ${AndroidSyncStateStore.TABLE_METADATA} SET value = '9' WHERE record_id = ?",
+                arrayOf(AndroidSyncStateStore.META_SCHEMA_VERSION),
+            )
+            db.version = 1
+        }
+
+        val migrated = store.loadSyncState(TENANT)
+        val note = migrated.projectCache.noteItems.single()
+        assertEquals(legacyNoteItemIdentity(PROJECT), note.id)
+        assertEquals("Pending singleton note", note.body)
+        assertEquals(
+            NoteItemDraft("Unsubmitted pending edit"),
+            migrated.projectDrafts.projectNoteItems[noteItemDraftKey(PROJECT, note.id)],
+        )
+        assertTrue(migrated.projectDrafts.projectNotes.isEmpty())
+        assertEquals(migrated, store.loadSyncState(TENANT))
+        assertEquals(1, store.loadSyncState(TENANT).projectCache.noteItems.size)
+    }
+
+    @Test
     fun notesSubmitTouchesOnlyNotesAndQueueRowsInOneTransaction() {
         val initial = state(TENANT).copy(projectCache = state(TENANT).projectCache.copy(commands = emptyList()))
         store.saveSyncState(TENANT, initial)
@@ -206,6 +253,62 @@ class AndroidNormalizedSyncStateStoreTest {
     @Test
     fun parkFailureCommitsNeitherDomainNorQueueRows() {
         assertMutationRollsBack(ProjectMutationType.ADD_PARKING) { it.withAddedParking() }
+    }
+
+    @Test
+    fun everyProjectItemActionTouchesOnlyItsDomainRowAndOrderedOperationRow() {
+        ProjectItemMutationType.entries.forEachIndexed { index, type ->
+            store.clearSyncState(TENANT)
+            val initial = state(TENANT).withoutCommands().withExistingItems().withItemDraft(type)
+            store.saveSyncState(TENANT, initial)
+            installAuditTriggers(TENANT)
+            val updated = initial.withItemMutation(type, index)
+
+            store.saveProjectItemMutation(TENANT, initial, updated, type)
+
+            assertEquals(updated, store.loadSyncState(TENANT))
+            assertEquals(
+                "Unexpected write set for $type",
+                buildSet {
+                    add(
+                    if (type.name.endsWith("NOTE")) {
+                        AndroidSyncStateStore.TABLE_PROJECT_NOTE_ITEMS
+                    } else {
+                        AndroidSyncStateStore.TABLE_PROJECT_RESOURCE_LINKS
+                    })
+                    add(AndroidSyncStateStore.TABLE_PROJECT_ITEM_OPERATIONS)
+                    if (type in setOf(
+                            ProjectItemMutationType.CREATE_NOTE,
+                            ProjectItemMutationType.EDIT_NOTE,
+                            ProjectItemMutationType.CREATE_LINK,
+                            ProjectItemMutationType.EDIT_LINK,
+                        )
+                    ) add(AndroidSyncStateStore.TABLE_PROJECT_DRAFTS)
+                },
+                auditedTables(TENANT),
+            )
+        }
+    }
+
+    @Test
+    fun everyProjectItemActionRollsBackItsDomainRowAndOperationTogether() {
+        ProjectItemMutationType.entries.forEachIndexed { index, type ->
+            store.clearSyncState(TENANT)
+            val initial = state(TENANT).withoutCommands().withExistingItems().withItemDraft(type)
+            store.saveSyncState(TENANT, initial)
+            installAuditTriggers(TENANT)
+            val failing = AndroidSyncStateStore(context, beforeItemMutationCommit = { attempted ->
+                if (attempted == type) error("simulated item commit failure")
+            })
+
+            assertTrue(
+                runCatching {
+                    failing.saveProjectItemMutation(TENANT, initial, initial.withItemMutation(type, index), type)
+                }.isFailure,
+            )
+            assertEquals(initial, store.loadSyncState(TENANT))
+            assertTrue(auditedTables(TENANT).isEmpty())
+        }
     }
 
     @Test
@@ -423,6 +526,107 @@ class AndroidNormalizedSyncStateStoreTest {
         )
     }
 
+    private fun TenantSyncState.withExistingItems(): TenantSyncState = copy(
+        projectCache = projectCache.copy(
+            noteItems = listOf(
+                ProjectNoteItem(NOTE_ID, PROJECT, "Existing note", false, "local", NOW, NOW),
+            ),
+            resourceLinks = listOf(
+                ProjectResourceLink(LINK_ID, PROJECT, "Existing link", "https://example.com", NOW, NOW),
+            ),
+            itemOperations = emptyList(),
+        ),
+    )
+
+    private fun TenantSyncState.withItemDraft(type: ProjectItemMutationType): TenantSyncState = when (type) {
+        ProjectItemMutationType.CREATE_NOTE -> copy(projectDrafts = projectDrafts.copy(
+            projectNoteItems = mapOf(noteItemDraftKey(PROJECT) to NoteItemDraft("Updated note")),
+        ))
+        ProjectItemMutationType.EDIT_NOTE -> copy(projectDrafts = projectDrafts.copy(
+            projectNoteItems = mapOf(noteItemDraftKey(PROJECT, NOTE_ID) to NoteItemDraft("Updated note")),
+        ))
+        ProjectItemMutationType.CREATE_LINK -> copy(projectDrafts = projectDrafts.copy(
+            projectResourceLinks = mapOf(
+                resourceLinkDraftKey(PROJECT) to ProjectResourceLinkDraft("Updated link", "https://example.com/updated"),
+            ),
+        ))
+        ProjectItemMutationType.EDIT_LINK -> copy(projectDrafts = projectDrafts.copy(
+            projectResourceLinks = mapOf(
+                resourceLinkDraftKey(PROJECT, LINK_ID) to
+                    ProjectResourceLinkDraft("Updated link", "https://example.com/updated"),
+            ),
+        ))
+        else -> this
+    }
+
+    private fun TenantSyncState.withItemMutation(type: ProjectItemMutationType, index: Int): TenantSyncState {
+        val target = when (type) {
+            ProjectItemMutationType.CREATE_NOTE -> "50000000-0000-4000-8000-00000000000$index"
+            ProjectItemMutationType.CREATE_LINK -> "60000000-0000-4000-8000-00000000000$index"
+            ProjectItemMutationType.EDIT_NOTE,
+            ProjectItemMutationType.PIN_NOTE,
+            ProjectItemMutationType.DELETE_NOTE,
+            -> NOTE_ID
+            else -> LINK_ID
+        }
+        val operation = ProjectItemMutation(
+            operationId = "item-operation-$index",
+            type = type,
+            targetId = target,
+            projectId = PROJECT,
+            clientResourceId = target.takeIf { type == ProjectItemMutationType.CREATE_NOTE || type == ProjectItemMutationType.CREATE_LINK },
+            noteBody = "Updated note".takeIf { type == ProjectItemMutationType.CREATE_NOTE || type == ProjectItemMutationType.EDIT_NOTE },
+            pinned = true.takeIf { type == ProjectItemMutationType.PIN_NOTE },
+            linkTitle = "Updated link".takeIf { type == ProjectItemMutationType.CREATE_LINK || type == ProjectItemMutationType.EDIT_LINK },
+            linkUri = "https://example.com/updated".takeIf {
+                type == ProjectItemMutationType.CREATE_LINK || type == ProjectItemMutationType.EDIT_LINK
+            },
+            createdAt = NOW,
+        )
+        val notes = when (type) {
+            ProjectItemMutationType.CREATE_NOTE -> projectCache.noteItems +
+                ProjectNoteItem(target, PROJECT, "Updated note", false, "local", NOW, NOW)
+            ProjectItemMutationType.EDIT_NOTE -> projectCache.noteItems.map {
+                if (it.id == target) it.copy(body = "Updated note") else it
+            }
+            ProjectItemMutationType.PIN_NOTE -> projectCache.noteItems.map {
+                if (it.id == target) it.copy(pinned = true) else it
+            }
+            ProjectItemMutationType.DELETE_NOTE -> projectCache.noteItems.map {
+                if (it.id == target) it.copy(deletedAt = NOW) else it
+            }
+            else -> projectCache.noteItems
+        }
+        val links = when (type) {
+            ProjectItemMutationType.CREATE_LINK -> projectCache.resourceLinks +
+                ProjectResourceLink(target, PROJECT, "Updated link", "https://example.com/updated", NOW, NOW)
+            ProjectItemMutationType.EDIT_LINK -> projectCache.resourceLinks.map {
+                if (it.id == target) it.copy(title = "Updated link", uri = "https://example.com/updated") else it
+            }
+            ProjectItemMutationType.DELETE_LINK -> projectCache.resourceLinks.map {
+                if (it.id == target) it.copy(deletedAt = NOW) else it
+            }
+            else -> projectCache.resourceLinks
+        }
+        val clearedDrafts = when (type) {
+            ProjectItemMutationType.CREATE_NOTE,
+            ProjectItemMutationType.EDIT_NOTE,
+            -> projectDrafts.copy(projectNoteItems = emptyMap())
+            ProjectItemMutationType.CREATE_LINK,
+            ProjectItemMutationType.EDIT_LINK,
+            -> projectDrafts.copy(projectResourceLinks = emptyMap())
+            else -> projectDrafts
+        }
+        return copy(
+            projectCache = projectCache.copy(
+                noteItems = notes,
+                resourceLinks = links,
+                itemOperations = listOf(operation),
+            ),
+            projectDrafts = clearedDrafts,
+        )
+    }
+
     private fun assertMutationRollsBack(
         type: ProjectMutationType,
         update: (TenantSyncState) -> TenantSyncState,
@@ -492,6 +696,8 @@ class AndroidNormalizedSyncStateStoreTest {
         const val OTHER_PROJECT = "223e4567-e89b-12d3-a456-426614174073"
         const val CREATED_PROJECT = "323e4567-e89b-12d3-a456-426614174074"
         const val CREATED_PARKING = "423e4567-e89b-12d3-a456-426614174075"
+        const val NOTE_ID = "523e4567-e89b-42d3-a456-426614174075"
+        const val LINK_ID = "623e4567-e89b-42d3-a456-426614174075"
         const val NOW = "2026-09-15T12:00:00Z"
         val TAG_TOKEN = OpaqueTagToken.fromBytes(ByteArray(32) { (it + 41).toByte() })
     }

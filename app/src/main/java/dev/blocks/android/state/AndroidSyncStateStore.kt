@@ -20,12 +20,20 @@ import dev.blocks.android.project.PhysicalBlock
 import dev.blocks.android.project.ProjectCacheState
 import dev.blocks.android.project.ProjectCover
 import dev.blocks.android.project.ProjectIdentityMapping
+import dev.blocks.android.project.ProjectItemMutation
+import dev.blocks.android.project.ProjectItemMutationType
 import dev.blocks.android.project.ProjectMutation
 import dev.blocks.android.project.ProjectMutationType
+import dev.blocks.android.project.ProjectNoteItem
 import dev.blocks.android.project.ProjectPage
 import dev.blocks.android.project.ProjectParking
+import dev.blocks.android.project.ProjectResourceLink
+import dev.blocks.android.project.ProjectResourceUri
 import dev.blocks.android.project.ProjectSummary
 import dev.blocks.android.project.ProjectUiPreferences
+import dev.blocks.android.project.legacyNoteItemIdentity
+import dev.blocks.android.project.noteItemDraftKey
+import dev.blocks.android.mvp.NoteItemDraft
 import dev.blocks.android.project.ensureProjectLinks
 import dev.blocks.android.tag.LocalBlockOperation
 import dev.blocks.android.tag.LocalBlockOperationType
@@ -67,6 +75,10 @@ internal data class EncodedSyncRows(
     val localBlockOperations: List<String> = emptyList(),
     val projectLinks: List<String> = emptyList(),
     val projectCovers: List<String> = emptyList(),
+    val projectNoteItems: List<String> = emptyList(),
+    val projectResourceLinks: List<String> = emptyList(),
+    val projectItemOperations: List<String> = emptyList(),
+    val retiredProjectItemOperations: List<String> = emptyList(),
     val projectCommands: List<String> = emptyList(),
     val retiredOperationIds: List<String> = emptyList(),
     val provisionalProjectIds: List<String> = emptyList(),
@@ -114,6 +126,10 @@ internal class SyncStateRowCodec(
             localBlockOperations = projectCache.localBlockOperations.map(gson::toJson),
             projectLinks = projectCache.projectLinks.map(gson::toJson),
             projectCovers = projectCache.projectCovers.map(gson::toJson),
+            projectNoteItems = projectCache.noteItems.map(gson::toJson),
+            projectResourceLinks = projectCache.resourceLinks.map(gson::toJson),
+            projectItemOperations = projectCache.itemOperations.map(gson::toJson),
+            retiredProjectItemOperations = projectCache.retiredItemOperationIds,
             projectCommands = projectCache.commands.map(gson::toJson),
             retiredOperationIds = projectCache.retiredOperationIds.distinct(),
             provisionalProjectIds = projectCache.provisionalProjectIds.distinct(),
@@ -137,7 +153,7 @@ internal class SyncStateRowCodec(
         require(commands.none { it.idempotencyKey in retiredKeys }) {
             "A queued idempotency key is already retired"
         }
-        val projectCache = if (rows.schemaVersion == PILOT_SCHEMA_VERSION) {
+        var projectCache = if (rows.schemaVersion == PILOT_SCHEMA_VERSION) {
             ProjectCacheState()
         } else {
             ProjectCacheState(
@@ -181,6 +197,26 @@ internal class SyncStateRowCodec(
                 } else {
                     emptyList()
                 },
+                noteItems = if (rows.schemaVersion >= PROJECT_ITEM_SCHEMA_VERSION) {
+                    rows.projectNoteItems.map { gson.fromJson(it, ProjectNoteItem::class.java) }
+                } else {
+                    emptyList()
+                },
+                resourceLinks = if (rows.schemaVersion >= PROJECT_ITEM_SCHEMA_VERSION) {
+                    rows.projectResourceLinks.map { gson.fromJson(it, ProjectResourceLink::class.java) }
+                } else {
+                    emptyList()
+                },
+                itemOperations = if (rows.schemaVersion >= PROJECT_ITEM_SCHEMA_VERSION) {
+                    rows.projectItemOperations.map { gson.fromJson(it, ProjectItemMutation::class.java) }
+                } else {
+                    emptyList()
+                },
+                retiredItemOperationIds = if (rows.schemaVersion >= PROJECT_ITEM_SCHEMA_VERSION) {
+                    rows.retiredProjectItemOperations.distinct()
+                } else {
+                    emptyList()
+                },
                 commands = rows.projectCommands.map {
                     gson.fromJson(it, ProjectMutation::class.java).migrateFrom(rows.schemaVersion)
                 },
@@ -200,7 +236,42 @@ internal class SyncStateRowCodec(
                 } else {
                     emptyList()
                 },
-            ).ensureProjectLinks(projectKeyFactory).also(::validateProjectCache)
+            ).ensureProjectLinks(projectKeyFactory)
+        }
+        if (rows.schemaVersion < PROJECT_ITEM_SCHEMA_VERSION) {
+            projectCache = projectCache.copy(
+                noteItems = projectCache.pages.mapNotNull { page ->
+                    page.notes.body.takeIf(String::isNotEmpty)?.let { body ->
+                        ProjectNoteItem(
+                            id = legacyNoteItemIdentity(page.project.id),
+                            projectId = page.project.id,
+                            body = body,
+                            pinned = false,
+                            authoredByUserId = "legacy",
+                            createdAt = page.notes.updatedAt,
+                            updatedAt = page.notes.updatedAt,
+                            rowVersion = page.notes.rowVersion,
+                            legacySingleton = true,
+                        )
+                    }
+                },
+            )
+        }
+        validateProjectCache(projectCache)
+        val decodedDrafts = if (rows.schemaVersion >= LOCAL_FIRST_SCHEMA_VERSION) {
+            rows.projectDrafts?.let { gson.fromJson(it, FormDrafts::class.java) } ?: FormDrafts()
+        } else {
+            FormDrafts()
+        }
+        val migratedDrafts = if (rows.schemaVersion < PROJECT_ITEM_SCHEMA_VERSION) {
+            decodedDrafts.copy(
+                projectNoteItems = decodedDrafts.projectNoteItems + decodedDrafts.projectNotes.mapKeys { (projectId, _) ->
+                    noteItemDraftKey(projectId, legacyNoteItemIdentity(projectId))
+                }.mapValues { (_, body) -> NoteItemDraft(body) },
+                projectNotes = emptyMap(),
+            )
+        } else {
+            decodedDrafts
         }
         return TenantSyncState(
             projects = projects,
@@ -212,11 +283,7 @@ internal class SyncStateRowCodec(
             retiredIdempotencyKeys = retiredKeys,
             notice = rows.notice,
             projectCache = projectCache,
-            projectDrafts = if (rows.schemaVersion >= LOCAL_FIRST_SCHEMA_VERSION) {
-                rows.projectDrafts?.let { gson.fromJson(it, FormDrafts::class.java) } ?: FormDrafts()
-            } else {
-                FormDrafts()
-            },
+            projectDrafts = migratedDrafts,
             projectDraftsMigrated = rows.schemaVersion >= LOCAL_FIRST_SCHEMA_VERSION && rows.projectDraftsMigrated,
             projectUiPreferences = if (rows.schemaVersion >= STANDALONE_SCHEMA_VERSION) {
                 rows.projectUiPreferences?.let { gson.fromJson(it, ProjectUiPreferences::class.java) }
@@ -245,7 +312,8 @@ internal class SyncStateRowCodec(
         const val LOCAL_TAG_SCHEMA_VERSION = 7
         const val PROJECT_LINK_SCHEMA_VERSION = 8
         const val PROJECT_COVER_SCHEMA_VERSION = 9
-        const val CURRENT_SCHEMA_VERSION = PROJECT_COVER_SCHEMA_VERSION
+        const val PROJECT_ITEM_SCHEMA_VERSION = 10
+        const val CURRENT_SCHEMA_VERSION = PROJECT_ITEM_SCHEMA_VERSION
     }
 }
 
@@ -434,6 +502,52 @@ private fun validateProjectCache(cache: ProjectCacheState) {
         require(cover.revision > 0) { "A local cover revision is invalid" }
         require(cover.createdAt.isNotBlank() && cover.updatedAt.isNotBlank()) { "A local cover timestamp is missing" }
     }
+    require(cache.noteItems.map { it.id }.distinct().size == cache.noteItems.size) {
+        "Project note item identifiers are not unique"
+    }
+    cache.noteItems.forEach { note ->
+        require(note.id.isCanonicalUuid()) { "A project note item identity is invalid" }
+        require(note.projectId in knownProjectIds) { "A project note item references an unknown project" }
+        require(note.body.length <= 100_000) { "A project note item exceeds the local body limit" }
+        require(note.rowVersion >= 0) { "A project note item row version is invalid" }
+    }
+    require(cache.resourceLinks.map { it.id }.distinct().size == cache.resourceLinks.size) {
+        "Project resource link identifiers are not unique"
+    }
+    cache.resourceLinks.forEach { link ->
+        require(link.id.isCanonicalUuid()) { "A project resource link identity is invalid" }
+        require(link.projectId in knownProjectIds) { "A project resource link references an unknown project" }
+        require(link.title.isNotBlank()) { "A project resource link title is missing" }
+        require(link.title.length <= 200) { "A project resource link title exceeds the local limit" }
+        require(runCatching { ProjectResourceUri.validate(link.uri) }.getOrNull() == link.uri) {
+            "A project resource link URI is unsafe or non-canonical"
+        }
+        require(link.rowVersion >= 0) { "A project resource link row version is invalid" }
+    }
+    require(cache.itemOperations.map { it.operationId }.distinct().size == cache.itemOperations.size) {
+        "Project item operation identifiers are not unique"
+    }
+    require(cache.itemOperations.none { it.operationId in cache.retiredItemOperationIds }) {
+        "A pending project item operation is already retired"
+    }
+    val itemOperationPositions = cache.itemOperations.mapIndexed { index, operation ->
+        operation.operationId to index
+    }.toMap()
+    cache.itemOperations.forEachIndexed { index, operation ->
+        require(operation.operationId.isNotBlank()) { "A project item operation identity is missing" }
+        require(operation.projectId in knownProjectIds) { "A project item operation references an unknown project" }
+        require(operation.contractVersion == "0.6") { "A project item operation has the wrong contract boundary" }
+        operation.dependsOnOperationId?.let { dependency ->
+            val pendingPosition = itemOperationPositions[dependency]
+            val validPending = pendingPosition != null && pendingPosition < index
+            val validLegacyProjectCreate = cache.commands.any {
+                it.operationId == dependency && it.type == dev.blocks.android.project.ProjectMutationType.CREATE_PROJECT
+            }
+            require(validPending || validLegacyProjectCreate) {
+                "A project item operation dependency must precede the dependent operation"
+            }
+        }
+    }
     require(cache.localBlockOperations.map { it.operationId }.distinct().size == cache.localBlockOperations.size) {
         "Local block operation identities are not unique"
     }
@@ -503,6 +617,10 @@ private fun validateProjectCache(cache: ProjectCacheState) {
         "Projects awaiting a notes baseline are not unique"
     }
 }
+
+private fun String.isCanonicalUuid(): Boolean = runCatching {
+    java.util.UUID.fromString(this).toString() == lowercase()
+}.getOrDefault(false)
 
 private fun validateProjectMutation(command: ProjectMutation) {
     require(command.operationId.isNotBlank()) { "Queued project operation identity is missing" }
@@ -721,6 +839,15 @@ internal class LegacyEncryptedSyncStateStore(context: Context) : SyncStateStore 
             localBlockOperations = readRows(database, tenantId, secretKey, TABLE_LOCAL_BLOCK_OPERATIONS),
             projectLinks = readRows(database, tenantId, secretKey, TABLE_PROJECT_LINKS),
             projectCovers = readRows(database, tenantId, secretKey, TABLE_PROJECT_COVERS),
+            projectNoteItems = readRows(database, tenantId, secretKey, TABLE_PROJECT_NOTE_ITEMS),
+            projectResourceLinks = readRows(database, tenantId, secretKey, TABLE_PROJECT_RESOURCE_LINKS),
+            projectItemOperations = readRows(database, tenantId, secretKey, TABLE_PROJECT_ITEM_OPERATIONS),
+            retiredProjectItemOperations = readRows(
+                database,
+                tenantId,
+                secretKey,
+                TABLE_RETIRED_PROJECT_ITEM_OPERATIONS,
+            ),
             projectCommands = readRows(database, tenantId, secretKey, TABLE_PROJECT_COMMANDS),
             retiredOperationIds = readRows(database, tenantId, secretKey, TABLE_RETIRED_OPERATIONS),
             provisionalProjectIds = readRows(database, tenantId, secretKey, TABLE_PROVISIONAL_PROJECTS),
@@ -802,6 +929,16 @@ internal class LegacyEncryptedSyncStateStore(context: Context) : SyncStateStore 
         writeRows(database, tenantId, secretKey, TABLE_LOCAL_BLOCK_OPERATIONS, rows.localBlockOperations)
         writeRows(database, tenantId, secretKey, TABLE_PROJECT_LINKS, rows.projectLinks)
         writeRows(database, tenantId, secretKey, TABLE_PROJECT_COVERS, rows.projectCovers)
+        writeRows(database, tenantId, secretKey, TABLE_PROJECT_NOTE_ITEMS, rows.projectNoteItems)
+        writeRows(database, tenantId, secretKey, TABLE_PROJECT_RESOURCE_LINKS, rows.projectResourceLinks)
+        writeRows(database, tenantId, secretKey, TABLE_PROJECT_ITEM_OPERATIONS, rows.projectItemOperations)
+        writeRows(
+            database,
+            tenantId,
+            secretKey,
+            TABLE_RETIRED_PROJECT_ITEM_OPERATIONS,
+            rows.retiredProjectItemOperations,
+        )
         writeRows(database, tenantId, secretKey, TABLE_PROJECT_COMMANDS, rows.projectCommands)
         writeRows(database, tenantId, secretKey, TABLE_RETIRED_OPERATIONS, rows.retiredOperationIds)
         writeRows(database, tenantId, secretKey, TABLE_PROVISIONAL_PROJECTS, rows.provisionalProjectIds)
@@ -1019,6 +1156,7 @@ internal class LegacyEncryptedSyncStateStore(context: Context) : SyncStateStore 
             if (oldVersion < 6) LOCAL_TAG_TABLES.forEach { table -> createPositionTable(database, table) }
             if (oldVersion < 7) PROJECT_LINK_TABLES.forEach { table -> createPositionTable(database, table) }
             if (oldVersion < 8) PROJECT_COVER_TABLES.forEach { table -> createPositionTable(database, table) }
+            if (oldVersion < 9) PROJECT_ITEM_TABLES.forEach { table -> createPositionTable(database, table) }
         }
 
         override fun onDowngrade(database: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -1035,7 +1173,7 @@ internal class LegacyEncryptedSyncStateStore(context: Context) : SyncStateStore 
     }
 
     private companion object {
-        const val DATABASE_VERSION = 8
+        const val DATABASE_VERSION = 9
         const val DATABASE_PREFIX = "blocks_sync_"
         const val DATABASE_KEY_PREFIX = "blocks-sync-db-v1-"
         const val LEGACY_PREFERENCES_PREFIX = "encrypted_sync_state_v1_"
@@ -1058,6 +1196,10 @@ internal class LegacyEncryptedSyncStateStore(context: Context) : SyncStateStore 
         const val TABLE_LOCAL_BLOCK_OPERATIONS = "local_block_operations_v7"
         const val TABLE_PROJECT_LINKS = "project_links_v8"
         const val TABLE_PROJECT_COVERS = "project_covers_v9"
+        const val TABLE_PROJECT_NOTE_ITEMS = "project_note_items_v10"
+        const val TABLE_PROJECT_RESOURCE_LINKS = "project_resource_links_v10"
+        const val TABLE_PROJECT_ITEM_OPERATIONS = "project_item_operations_v10"
+        const val TABLE_RETIRED_PROJECT_ITEM_OPERATIONS = "retired_project_item_operations_v10"
         const val TABLE_PROJECT_COMMANDS = "pending_project_commands_v3"
         const val TABLE_RETIRED_OPERATIONS = "retired_project_operations_v3"
         const val TABLE_PROVISIONAL_PROJECTS = "provisional_projects_v4"
@@ -1097,13 +1239,20 @@ internal class LegacyEncryptedSyncStateStore(context: Context) : SyncStateStore 
         val LOCAL_TAG_TABLES = listOf(TABLE_LOCAL_BLOCKS, TABLE_LOCAL_BLOCK_OPERATIONS)
         val PROJECT_LINK_TABLES = listOf(TABLE_PROJECT_LINKS)
         val PROJECT_COVER_TABLES = listOf(TABLE_PROJECT_COVERS)
+        val PROJECT_ITEM_TABLES = listOf(
+            TABLE_PROJECT_NOTE_ITEMS,
+            TABLE_PROJECT_RESOURCE_LINKS,
+            TABLE_PROJECT_ITEM_OPERATIONS,
+            TABLE_RETIRED_PROJECT_ITEM_OPERATIONS,
+        )
         val POSITION_TABLES = listOf(
             TABLE_PROJECTS,
             TABLE_REENTRY,
             TABLE_COMMANDS,
             TABLE_RETIRED_KEYS,
         ) + PROJECT_MODEL_TABLES + LOCAL_FIRST_TABLES + STANDALONE_TABLES +
-            PARKING_HISTORY_TABLES + LOCAL_TAG_TABLES + PROJECT_LINK_TABLES + PROJECT_COVER_TABLES
+            PARKING_HISTORY_TABLES + LOCAL_TAG_TABLES + PROJECT_LINK_TABLES + PROJECT_COVER_TABLES +
+            PROJECT_ITEM_TABLES
         val TABLES = listOf(
             TABLE_METADATA,
         ) + POSITION_TABLES

@@ -4,8 +4,10 @@ import dev.blocks.android.api.IncompatibleServiceApiException
 import dev.blocks.android.api.ServiceException
 import dev.blocks.android.mvp.FormDrafts
 import dev.blocks.android.mvp.MembershipRevokedException
+import dev.blocks.android.mvp.NoteItemDraft
 import dev.blocks.android.mvp.ParkingDraft
 import dev.blocks.android.mvp.PendingMutation
+import dev.blocks.android.mvp.ProjectResourceLinkDraft
 import dev.blocks.android.mvp.Session
 import dev.blocks.android.tag.LocalBlockRecord
 import dev.blocks.android.tag.LocalTagResolution
@@ -24,6 +26,9 @@ enum class ProjectFormField {
     PROJECT_NAME,
     RENAME,
     NOTES,
+    NOTE_ITEM,
+    LINK_TITLE,
+    LINK_URI,
     PARKING_LOCATION,
     PARKING_NEXT_ACTION,
     PARKING_MUST_NOT_FORGET,
@@ -36,11 +41,17 @@ data class ProjectPresentationState(
     val projectPage: ProjectPage? = null,
     val parkingHistory: List<ProjectParking> = emptyList(),
     val parkingHistoryHasMore: Boolean = false,
+    val noteItems: List<ProjectNoteItem> = emptyList(),
+    val resourceLinks: List<ProjectResourceLink> = emptyList(),
     val localBlocks: List<LocalBlockRecord> = emptyList(),
     val projectCovers: List<ProjectCover> = emptyList(),
     val drafts: FormDrafts = FormDrafts(),
     val invalidField: ProjectFormField? = null,
     val showParkingForm: Boolean = false,
+    val showNoteForm: Boolean = false,
+    val editingNoteId: String? = null,
+    val showLinkForm: Boolean = false,
+    val editingLinkId: String? = null,
     val dashboardView: DashboardView = DashboardView.TILES,
     val archiveMode: Boolean = false,
     val pendingChanges: Boolean = false,
@@ -179,11 +190,14 @@ class ProjectPresentationController(
         val page = workspace.projectPage(active, projectId)
         val history = workspace.parkingHistory(active, page.project.id, 0, PARKING_HISTORY_PAGE_SIZE)
         val drafts = workspace.projectDrafts(active)
+        val cache = workspace.snapshot(active).cache
         state = state.copy(
             screen = ProjectScreen.PROJECT,
             projectPage = page,
             parkingHistory = history.records,
             parkingHistoryHasMore = history.hasMore,
+            noteItems = cache.noteItemsFor(page.project.id),
+            resourceLinks = cache.resourceLinksFor(page.project.id),
             drafts = drafts,
             showParkingForm = drafts.projectParking[projectId]?.hasContent() == true,
             invalidField = null,
@@ -219,6 +233,10 @@ class ProjectPresentationController(
             parkingHistory = emptyList(),
             parkingHistoryHasMore = false,
             showParkingForm = false,
+            showNoteForm = false,
+            editingNoteId = null,
+            showLinkForm = false,
+            editingLinkId = null,
             archiveMode = preferences.archiveMode,
             invalidField = null,
             error = null,
@@ -283,6 +301,145 @@ class ProjectPresentationController(
     @Synchronized
     fun hideParkingForm() {
         state = state.copy(showParkingForm = false, invalidField = null, error = null)
+    }
+
+    @Synchronized
+    fun showAddNoteForm() {
+        val projectId = activeProjectPage().project.id
+        val key = noteItemDraftKey(projectId)
+        if (key !in state.drafts.projectNoteItems) {
+            persistDurableItemDraft { it.copy(projectNoteItems = it.projectNoteItems + (key to NoteItemDraft())) }
+        }
+        state = state.copy(showNoteForm = true, editingNoteId = null, invalidField = null, error = null)
+    }
+
+    @Synchronized
+    fun showEditNoteForm(noteId: String) {
+        val page = activeProjectPage()
+        val note = state.noteItems.single { it.id == noteId && it.projectId == page.project.id && it.deletedAt == null }
+        val key = noteItemDraftKey(page.project.id, noteId)
+        if (key !in state.drafts.projectNoteItems) {
+            persistDurableItemDraft { it.copy(projectNoteItems = it.projectNoteItems + (key to NoteItemDraft(note.body))) }
+        }
+        state = state.copy(showNoteForm = true, editingNoteId = noteId, invalidField = null, error = null)
+    }
+
+    @Synchronized
+    fun hideNoteForm(discard: Boolean = false) {
+        val projectId = state.projectPage?.project?.id
+        if (discard && projectId != null) {
+            val key = noteItemDraftKey(projectId, state.editingNoteId)
+            persistDurableItemDraft { it.copy(projectNoteItems = it.projectNoteItems - key) }
+        }
+        state = state.copy(showNoteForm = false, editingNoteId = null, invalidField = null, error = null)
+    }
+
+    @Synchronized
+    fun updateNoteItemDraft(body: String) {
+        val projectId = activeProjectPage().project.id
+        val key = noteItemDraftKey(projectId, state.editingNoteId)
+        persistDurableItemDraft { it.copy(projectNoteItems = it.projectNoteItems + (key to NoteItemDraft(body))) }
+    }
+
+    @Synchronized
+    fun saveNoteItem(body: String) {
+        val page = activeProjectPage()
+        val draftKey = noteItemDraftKey(page.project.id, state.editingNoteId)
+        if (state.drafts.projectNoteItems[draftKey]?.body != body) updateNoteItemDraft(body)
+        when {
+            body.isBlank() -> return fail(ProjectFormField.NOTE_ITEM, "Enter a note.")
+            body.length > MAX_NOTES -> return fail(ProjectFormField.NOTE_ITEM, "Notes can contain at most 100,000 characters.")
+        }
+        val result = state.editingNoteId?.let { workspace.editNoteItem(activeSession(), it, body) }
+            ?: workspace.addNoteItem(activeSession(), page.project.id, body)
+        applyResult(result)
+        state = state.copy(showNoteForm = false, editingNoteId = null)
+    }
+
+    @Synchronized
+    fun setNotePinned(noteId: String, pinned: Boolean) {
+        activeProjectPage()
+        applyResult(workspace.setNoteItemPinned(activeSession(), noteId, pinned))
+    }
+
+    @Synchronized
+    fun deleteNote(noteId: String) {
+        activeProjectPage()
+        applyResult(workspace.deleteNoteItem(activeSession(), noteId))
+    }
+
+    @Synchronized
+    fun showAddLinkForm() {
+        val projectId = activeProjectPage().project.id
+        val key = resourceLinkDraftKey(projectId)
+        if (key !in state.drafts.projectResourceLinks) {
+            persistDurableItemDraft {
+                it.copy(projectResourceLinks = it.projectResourceLinks + (key to ProjectResourceLinkDraft()))
+            }
+        }
+        state = state.copy(showLinkForm = true, editingLinkId = null, invalidField = null, error = null)
+    }
+
+    @Synchronized
+    fun showEditLinkForm(linkId: String) {
+        val page = activeProjectPage()
+        val link = state.resourceLinks.single { it.id == linkId && it.projectId == page.project.id && it.deletedAt == null }
+        val key = resourceLinkDraftKey(page.project.id, linkId)
+        if (key !in state.drafts.projectResourceLinks) {
+            persistDurableItemDraft {
+                it.copy(projectResourceLinks = it.projectResourceLinks +
+                    (key to ProjectResourceLinkDraft(link.title, link.uri)))
+            }
+        }
+        state = state.copy(showLinkForm = true, editingLinkId = linkId, invalidField = null, error = null)
+    }
+
+    @Synchronized
+    fun hideLinkForm(discard: Boolean = false) {
+        val projectId = state.projectPage?.project?.id
+        if (discard && projectId != null) {
+            val key = resourceLinkDraftKey(projectId, state.editingLinkId)
+            persistDurableItemDraft { it.copy(projectResourceLinks = it.projectResourceLinks - key) }
+        }
+        state = state.copy(showLinkForm = false, editingLinkId = null, invalidField = null, error = null)
+    }
+
+    @Synchronized
+    fun updateResourceLinkDraft(title: String, uri: String) {
+        val projectId = activeProjectPage().project.id
+        val key = resourceLinkDraftKey(projectId, state.editingLinkId)
+        persistDurableItemDraft {
+            it.copy(projectResourceLinks = it.projectResourceLinks + (key to ProjectResourceLinkDraft(title, uri)))
+        }
+    }
+
+    @Synchronized
+    fun saveResourceLink(title: String, uri: String) {
+        val page = activeProjectPage()
+        val draftKey = resourceLinkDraftKey(page.project.id, state.editingLinkId)
+        if (state.drafts.projectResourceLinks[draftKey] != ProjectResourceLinkDraft(title, uri)) {
+            updateResourceLinkDraft(title, uri)
+        }
+        when {
+            title.isBlank() -> return fail(ProjectFormField.LINK_TITLE, "Enter a link title.")
+            title.trim().length > MAX_LINK_TITLE -> return fail(ProjectFormField.LINK_TITLE, "Link titles can contain at most 200 characters.")
+        }
+        val cleanUri = try {
+            ProjectResourceUri.validate(uri)
+        } catch (error: IllegalArgumentException) {
+            return fail(ProjectFormField.LINK_URI, error.message ?: "Enter a safe web or Obsidian link.")
+        }
+        val result = state.editingLinkId?.let {
+            workspace.editResourceLink(activeSession(), it, title, cleanUri)
+        } ?: workspace.addResourceLink(activeSession(), page.project.id, title, cleanUri)
+        applyResult(result)
+        state = state.copy(showLinkForm = false, editingLinkId = null)
+    }
+
+    @Synchronized
+    fun deleteResourceLink(linkId: String) {
+        activeProjectPage()
+        applyResult(workspace.deleteResourceLink(activeSession(), linkId))
     }
 
     @Synchronized
@@ -454,9 +611,28 @@ class ProjectPresentationController(
 
     /** Restores configuration-only form state; this never crosses the persistence boundary. */
     @Synchronized
-    fun restoreTransientDrafts(drafts: FormDrafts, showParkingForm: Boolean) {
+    fun restoreTransientDrafts(
+        drafts: FormDrafts,
+        showParkingForm: Boolean,
+        showNoteForm: Boolean = false,
+        editingNoteId: String? = null,
+        showLinkForm: Boolean = false,
+        editingLinkId: String? = null,
+    ) {
         activeSession()
-        state = state.copy(drafts = drafts, showParkingForm = showParkingForm)
+        val durable = workspace.projectDrafts(activeSession())
+        val merged = drafts.copy(
+            projectNoteItems = durable.projectNoteItems + drafts.projectNoteItems,
+            projectResourceLinks = durable.projectResourceLinks + drafts.projectResourceLinks,
+        )
+        state = state.copy(
+            drafts = merged,
+            showParkingForm = showParkingForm,
+            showNoteForm = showNoteForm,
+            editingNoteId = editingNoteId,
+            showLinkForm = showLinkForm,
+            editingLinkId = editingLinkId,
+        )
     }
 
     @Synchronized
@@ -689,7 +865,8 @@ class ProjectPresentationController(
         }
         val pending = result.pendingLegacyOperations +
             result.pendingProjectOperations +
-            result.pendingBlockOperations
+            result.pendingBlockOperations +
+            result.pendingItemOperations
         val preferences = workspace.uiPreferences(active)
         state = state.copy(
             activeProjects = result.cache.activeProjects.sortedBy { it.name.lowercase() },
@@ -699,6 +876,8 @@ class ProjectPresentationController(
             parkingHistoryHasMore = history?.hasMore ?: false,
             localBlocks = result.cache.localBlocks,
             projectCovers = result.cache.projectCovers,
+            noteItems = resolvedSelectedId?.let(result.cache::noteItemsFor).orEmpty(),
+            resourceLinks = resolvedSelectedId?.let(result.cache::resourceLinksFor).orEmpty(),
             drafts = drafts,
             dashboardView = preferences.dashboardView,
             archiveMode = preferences.archiveMode,
@@ -729,6 +908,11 @@ class ProjectPresentationController(
     private fun persistDraft(update: (FormDrafts) -> FormDrafts) {
         activeSession()
         state = state.copy(drafts = update(state.drafts))
+    }
+
+    private fun persistDurableItemDraft(update: (FormDrafts) -> FormDrafts) {
+        val active = activeSession()
+        state = state.copy(drafts = workspace.updateProjectDrafts(active, update))
     }
 
     private fun mutation(slot: String, operation: String, targetId: String, payload: String): PendingMutation {
@@ -790,6 +974,7 @@ class ProjectPresentationController(
         const val CREATE_SLOT = "project-create"
         const val MAX_PROJECT_NAME = 200
         const val MAX_NOTES = 100_000
+        const val MAX_LINK_TITLE = 200
         const val MAX_PARKING_FIELD = 2_000
         const val PARKING_HISTORY_PAGE_SIZE = 10
         fun renameSlot(projectId: String) = "project-rename:$projectId"
@@ -797,3 +982,11 @@ class ProjectPresentationController(
         fun parkingSlot(projectId: String) = "project-parking:$projectId"
     }
 }
+
+private fun ProjectCacheState.noteItemsFor(projectId: String): List<ProjectNoteItem> = noteItems
+    .filter { it.projectId == projectId && it.deletedAt == null }
+    .sortedWith(compareByDescending<ProjectNoteItem> { it.pinned }.thenByDescending { it.updatedAt })
+
+private fun ProjectCacheState.resourceLinksFor(projectId: String): List<ProjectResourceLink> = resourceLinks
+    .filter { it.projectId == projectId && it.deletedAt == null }
+    .sortedByDescending { it.updatedAt }

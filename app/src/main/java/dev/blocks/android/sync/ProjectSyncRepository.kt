@@ -21,20 +21,28 @@ import dev.blocks.android.project.ProjectConflict
 import dev.blocks.android.project.ProjectCover
 import dev.blocks.android.project.ProjectCoverContent
 import dev.blocks.android.project.ProjectIdentityMapping
+import dev.blocks.android.project.ProjectItemMutation
+import dev.blocks.android.project.ProjectItemMutationType
 import dev.blocks.android.project.ProjectLifecycle
 import dev.blocks.android.project.ProjectMutation
 import dev.blocks.android.project.ProjectMutationStatus
 import dev.blocks.android.project.ProjectMutationType
 import dev.blocks.android.project.ProjectNotes
+import dev.blocks.android.project.ProjectNoteItem
 import dev.blocks.android.project.ParkingHistoryPage
 import dev.blocks.android.project.ProjectPage
 import dev.blocks.android.project.ProjectParking
 import dev.blocks.android.project.ProjectService
 import dev.blocks.android.project.ProjectSummary
+import dev.blocks.android.project.ProjectResourceLink
+import dev.blocks.android.project.ProjectResourceUri
 import dev.blocks.android.project.ProjectUiPreferences
 import dev.blocks.android.project.ProjectWorkspace
 import dev.blocks.android.project.ensureProjectLinks
 import dev.blocks.android.project.newOperationIdentity
+import dev.blocks.android.project.legacyNoteItemIdentity
+import dev.blocks.android.project.noteItemDraftKey
+import dev.blocks.android.project.resourceLinkDraftKey
 import dev.blocks.android.tag.LocalBlockOperation
 import dev.blocks.android.tag.LocalBlockOperationType
 import dev.blocks.android.tag.LocalBlockRecord
@@ -880,6 +888,231 @@ class ProjectSyncRepository(
     }
 
     @Synchronized
+    override fun addNoteItem(
+        session: Session,
+        projectId: String,
+        body: String,
+        operationId: String,
+        clientId: String,
+    ): BackgroundSyncResult {
+        require(body.isNotBlank()) { "Enter a note." }
+        require(body.length <= MAX_NOTE_BODY) { "Notes can contain at most 100,000 characters." }
+        require(runCatching { java.util.UUID.fromString(clientId) }.isSuccess) { "Note identity must be a UUID." }
+        val state = activeState(session)
+        require(state.projectCache.pages.single { it.project.id == projectId }.project.lifecycle == ProjectLifecycle.ACTIVE)
+        val timestamp = now()
+        val note = ProjectNoteItem(
+            id = clientId,
+            projectId = projectId,
+            body = body,
+            pinned = false,
+            authoredByUserId = "local",
+            createdAt = timestamp,
+            updatedAt = timestamp,
+        )
+        val operation = ProjectItemMutation(
+            operationId = operationId,
+            type = ProjectItemMutationType.CREATE_NOTE,
+            targetId = clientId,
+            projectId = projectId,
+            clientResourceId = clientId,
+            noteBody = body,
+            dependsOnOperationId = state.projectCache.latestItemDependency(projectId, clientId),
+            createdAt = timestamp,
+        )
+        return commitItemLocal(session, operation) { current ->
+            current.copy(
+                projectCache = current.projectCache.copy(noteItems = current.projectCache.noteItems + note),
+                projectDrafts = current.projectDrafts.copy(
+                    projectNoteItems = current.projectDrafts.projectNoteItems - noteItemDraftKey(projectId),
+                ),
+            )
+        }
+    }
+
+    @Synchronized
+    override fun editNoteItem(
+        session: Session,
+        noteId: String,
+        body: String,
+        operationId: String,
+    ): BackgroundSyncResult {
+        require(body.isNotBlank()) { "Enter a note." }
+        require(body.length <= MAX_NOTE_BODY) { "Notes can contain at most 100,000 characters." }
+        val state = activeState(session)
+        val existing = state.projectCache.noteItems.single { it.id == noteId && it.deletedAt == null }
+        require(state.projectCache.pages.single { it.project.id == existing.projectId }.project.lifecycle == ProjectLifecycle.ACTIVE)
+        val timestamp = now()
+        val operation = ProjectItemMutation(
+            operationId = operationId,
+            type = ProjectItemMutationType.EDIT_NOTE,
+            targetId = noteId,
+            projectId = existing.projectId,
+            ifMatch = existing.rowVersion.takeIf { it > 0 },
+            noteBody = body,
+            dependsOnOperationId = state.projectCache.latestItemDependency(existing.projectId, noteId),
+            createdAt = timestamp,
+        )
+        return commitItemLocal(session, operation) { current ->
+            current.updateNote(noteId) { it.copy(body = body, updatedAt = timestamp) }.copy(
+                projectDrafts = current.projectDrafts.copy(
+                    projectNoteItems = current.projectDrafts.projectNoteItems - noteItemDraftKey(existing.projectId, noteId),
+                ),
+            )
+        }
+    }
+
+    @Synchronized
+    override fun setNoteItemPinned(
+        session: Session,
+        noteId: String,
+        pinned: Boolean,
+        operationId: String,
+    ): BackgroundSyncResult {
+        val state = activeState(session)
+        val existing = state.projectCache.noteItems.single { it.id == noteId && it.deletedAt == null }
+        require(state.projectCache.pages.single { it.project.id == existing.projectId }.project.lifecycle == ProjectLifecycle.ACTIVE)
+        val timestamp = now()
+        val operation = ProjectItemMutation(
+            operationId = operationId,
+            type = ProjectItemMutationType.PIN_NOTE,
+            targetId = noteId,
+            projectId = existing.projectId,
+            ifMatch = existing.rowVersion.takeIf { it > 0 },
+            pinned = pinned,
+            dependsOnOperationId = state.projectCache.latestItemDependency(existing.projectId, noteId),
+            createdAt = timestamp,
+        )
+        return commitItemLocal(session, operation) { current ->
+            current.updateNote(noteId) { it.copy(pinned = pinned, updatedAt = timestamp) }
+        }
+    }
+
+    @Synchronized
+    override fun deleteNoteItem(
+        session: Session,
+        noteId: String,
+        operationId: String,
+    ): BackgroundSyncResult {
+        val state = activeState(session)
+        val existing = state.projectCache.noteItems.single { it.id == noteId && it.deletedAt == null }
+        require(state.projectCache.pages.single { it.project.id == existing.projectId }.project.lifecycle == ProjectLifecycle.ACTIVE)
+        val timestamp = now()
+        val operation = ProjectItemMutation(
+            operationId = operationId,
+            type = ProjectItemMutationType.DELETE_NOTE,
+            targetId = noteId,
+            projectId = existing.projectId,
+            ifMatch = existing.rowVersion.takeIf { it > 0 },
+            dependsOnOperationId = state.projectCache.latestItemDependency(existing.projectId, noteId),
+            createdAt = timestamp,
+        )
+        return commitItemLocal(session, operation) { current ->
+            current.updateNote(noteId) { it.copy(updatedAt = timestamp, deletedAt = timestamp) }
+        }
+    }
+
+    @Synchronized
+    override fun addResourceLink(
+        session: Session,
+        projectId: String,
+        title: String,
+        uri: String,
+        operationId: String,
+        clientId: String,
+    ): BackgroundSyncResult {
+        val cleanTitle = title.trim()
+        require(cleanTitle.isNotEmpty() && cleanTitle.length <= MAX_LINK_TITLE) { "Enter a link title." }
+        val cleanUri = ProjectResourceUri.validate(uri)
+        require(runCatching { java.util.UUID.fromString(clientId) }.isSuccess) { "Link identity must be a UUID." }
+        val state = activeState(session)
+        require(state.projectCache.pages.single { it.project.id == projectId }.project.lifecycle == ProjectLifecycle.ACTIVE)
+        val timestamp = now()
+        val link = ProjectResourceLink(clientId, projectId, cleanTitle, cleanUri, timestamp, timestamp)
+        val operation = ProjectItemMutation(
+            operationId = operationId,
+            type = ProjectItemMutationType.CREATE_LINK,
+            targetId = clientId,
+            projectId = projectId,
+            clientResourceId = clientId,
+            linkTitle = cleanTitle,
+            linkUri = cleanUri,
+            dependsOnOperationId = state.projectCache.latestItemDependency(projectId, clientId),
+            createdAt = timestamp,
+        )
+        return commitItemLocal(session, operation) { current ->
+            current.copy(
+                projectCache = current.projectCache.copy(resourceLinks = current.projectCache.resourceLinks + link),
+                projectDrafts = current.projectDrafts.copy(
+                    projectResourceLinks = current.projectDrafts.projectResourceLinks - resourceLinkDraftKey(projectId),
+                ),
+            )
+        }
+    }
+
+    @Synchronized
+    override fun editResourceLink(
+        session: Session,
+        linkId: String,
+        title: String,
+        uri: String,
+        operationId: String,
+    ): BackgroundSyncResult {
+        val cleanTitle = title.trim()
+        require(cleanTitle.isNotEmpty() && cleanTitle.length <= MAX_LINK_TITLE) { "Enter a link title." }
+        val cleanUri = ProjectResourceUri.validate(uri)
+        val state = activeState(session)
+        val existing = state.projectCache.resourceLinks.single { it.id == linkId && it.deletedAt == null }
+        require(state.projectCache.pages.single { it.project.id == existing.projectId }.project.lifecycle == ProjectLifecycle.ACTIVE)
+        val timestamp = now()
+        val operation = ProjectItemMutation(
+            operationId = operationId,
+            type = ProjectItemMutationType.EDIT_LINK,
+            targetId = linkId,
+            projectId = existing.projectId,
+            ifMatch = existing.rowVersion.takeIf { it > 0 },
+            linkTitle = cleanTitle,
+            linkUri = cleanUri,
+            dependsOnOperationId = state.projectCache.latestItemDependency(existing.projectId, linkId),
+            createdAt = timestamp,
+        )
+        return commitItemLocal(session, operation) { current ->
+            current.updateResourceLink(linkId) {
+                it.copy(title = cleanTitle, uri = cleanUri, updatedAt = timestamp)
+            }.copy(
+                projectDrafts = current.projectDrafts.copy(
+                    projectResourceLinks = current.projectDrafts.projectResourceLinks -
+                        resourceLinkDraftKey(existing.projectId, linkId),
+                ),
+            )
+        }
+    }
+
+    @Synchronized
+    override fun deleteResourceLink(
+        session: Session,
+        linkId: String,
+        operationId: String,
+    ): BackgroundSyncResult {
+        val state = activeState(session)
+        val existing = state.projectCache.resourceLinks.single { it.id == linkId && it.deletedAt == null }
+        require(state.projectCache.pages.single { it.project.id == existing.projectId }.project.lifecycle == ProjectLifecycle.ACTIVE)
+        val timestamp = now()
+        val operation = ProjectItemMutation(
+            operationId = operationId,
+            type = ProjectItemMutationType.DELETE_LINK,
+            targetId = linkId,
+            projectId = existing.projectId,
+            ifMatch = existing.rowVersion.takeIf { it > 0 },
+            dependsOnOperationId = state.projectCache.latestItemDependency(existing.projectId, linkId),
+            createdAt = timestamp,
+        )
+        return commitItemLocal(session, operation) { current ->
+            current.updateResourceLink(linkId) { it.copy(updatedAt = timestamp, deletedAt = timestamp) }
+        }
+    }
+
+    @Synchronized
     override fun discardConflict(session: Session, operationId: String): BackgroundSyncResult {
         val state = activeState(session)
         val command = state.projectCache.commands.firstOrNull { it.operationId == operationId }
@@ -1089,6 +1322,31 @@ class ProjectSyncRepository(
         return updated.toResult()
     }
 
+    private fun commitItemLocal(
+        session: Session,
+        operation: ProjectItemMutation,
+        projection: (TenantSyncState) -> TenantSyncState,
+    ): BackgroundSyncResult {
+        val state = activeState(session)
+        require(operation.operationId !in state.projectCache.retiredItemOperationIds) {
+            "A retired project item operation identity cannot be reused"
+        }
+        val existing = state.projectCache.itemOperations.firstOrNull { it.operationId == operation.operationId }
+        if (existing != null) {
+            require(existing == operation) { "A project item operation identity cannot describe two requests" }
+            return state.toResult()
+        }
+        val projected = projection(state)
+        val updated = projected.copy(
+            projectCache = projected.projectCache.copy(
+                itemOperations = projected.projectCache.itemOperations + operation,
+            ),
+        )
+        syncStore.saveProjectItemMutation(session.tenantId, state, updated, operation.type)
+        activeStateCache = updated
+        return updated.toResult()
+    }
+
     private fun drainProjectQueue(session: Session, initial: TenantSyncState): TenantSyncState {
         var state = initial
         while (true) {
@@ -1241,6 +1499,7 @@ class ProjectSyncRepository(
             state.withProject(outcome.value)
         }
         is ProjectOutcome.Notes -> state.updatePage(outcome.value.projectId) { it.copy(notes = outcome.value) }
+            .withLegacyNote(outcome.value)
         is ProjectOutcome.Parking -> {
             if (command.contractVersion == "0.4") {
                 check(outcome.value.clientId == command.clientResourceId) {
@@ -1402,6 +1661,9 @@ class ProjectSyncRepository(
         serverProject: ProjectSummary,
     ): TenantSyncState {
         val serverId = serverProject.id
+        val createOperationIds = projectCache.commands.filter {
+            it.type == ProjectMutationType.CREATE_PROJECT && it.targetId == provisionalId
+        }.mapTo(mutableSetOf()) { it.operationId }
         val localPage = projectCache.pages.firstOrNull { it.project.id == provisionalId }
         val commands = projectCache.commands.map { command ->
             command.copy(
@@ -1452,6 +1714,21 @@ class ProjectSyncRepository(
                 projectCovers = projectCache.projectCovers.map { cover ->
                     if (cover.projectId == provisionalId) cover.copy(projectId = serverId) else cover
                 }.distinctBy { it.projectId },
+                noteItems = projectCache.noteItems.map { note ->
+                    if (note.projectId == provisionalId) note.copy(projectId = serverId) else note
+                },
+                resourceLinks = projectCache.resourceLinks.map { link ->
+                    if (link.projectId == provisionalId) link.copy(projectId = serverId) else link
+                },
+                itemOperations = projectCache.itemOperations.map { operation ->
+                    if (operation.projectId == provisionalId) {
+                        operation.copy(
+                            projectId = serverId,
+                            dependsOnOperationId = operation.dependsOnOperationId
+                                ?.takeUnless { it in createOperationIds },
+                        )
+                    } else operation
+                },
             ),
             projectDrafts = mappedDrafts,
         ).withProjectedLists()
@@ -1587,7 +1864,45 @@ class ProjectSyncRepository(
                 stalePageIds = projectCache.stalePageIds - page.project.id,
             ),
         )
-        return withPage.withProjectedLists()
+        return withPage.withLegacyNote(page.notes).withProjectedLists()
+    }
+
+    private fun TenantSyncState.withLegacyNote(notes: ProjectNotes): TenantSyncState {
+        val noteId = legacyNoteItemIdentity(notes.projectId)
+        val existing = projectCache.noteItems.firstOrNull { it.id == noteId }
+        // API 0.4 may refresh its singleton notes row while a local API-0.6-shaped edit is pending.
+        // The newer local projection wins until that exact operation can be acknowledged by API 0.6.
+        if (projectCache.itemOperations.any { it.targetId == noteId }) return this
+        val updated = if (notes.body.isEmpty()) {
+            existing?.copy(body = "", updatedAt = notes.updatedAt, rowVersion = notes.rowVersion, deletedAt = notes.updatedAt)
+        } else {
+            existing?.copy(
+                body = notes.body,
+                updatedAt = notes.updatedAt,
+                rowVersion = notes.rowVersion,
+                deletedAt = null,
+                legacySingleton = true,
+            ) ?: ProjectNoteItem(
+                id = noteId,
+                projectId = notes.projectId,
+                body = notes.body,
+                pinned = false,
+                authoredByUserId = "legacy",
+                createdAt = notes.updatedAt,
+                updatedAt = notes.updatedAt,
+                rowVersion = notes.rowVersion,
+                legacySingleton = true,
+            )
+        }
+        return copy(
+            projectCache = projectCache.copy(
+                noteItems = if (updated == null) {
+                    projectCache.noteItems
+                } else {
+                    projectCache.noteItems.filterNot { it.id == noteId } + updated
+                },
+            ),
+        )
     }
 
     private fun TenantSyncState.withParkingRecord(record: ProjectParking): TenantSyncState {
@@ -1648,6 +1963,24 @@ class ProjectSyncRepository(
         )
     }
 
+    private fun TenantSyncState.updateNote(
+        noteId: String,
+        update: (ProjectNoteItem) -> ProjectNoteItem,
+    ): TenantSyncState = copy(
+        projectCache = projectCache.copy(
+            noteItems = projectCache.noteItems.map { if (it.id == noteId) update(it) else it },
+        ),
+    )
+
+    private fun TenantSyncState.updateResourceLink(
+        linkId: String,
+        update: (ProjectResourceLink) -> ProjectResourceLink,
+    ): TenantSyncState = copy(
+        projectCache = projectCache.copy(
+            resourceLinks = projectCache.resourceLinks.map { if (it.id == linkId) update(it) else it },
+        ),
+    )
+
     private fun TenantSyncState.updateProject(
         projectId: String,
         update: (ProjectSummary) -> ProjectSummary,
@@ -1680,6 +2013,13 @@ class ProjectSyncRepository(
     private fun ProjectCacheState.latestProjectDependency(projectId: String): String? = commands.lastOrNull {
         it.targetId == projectId || it.projectId == projectId
     }?.operationId
+
+    private fun ProjectCacheState.latestItemDependency(projectId: String, itemId: String): String? =
+        itemOperations.lastOrNull { it.targetId == itemId }?.operationId
+            ?: commands.lastOrNull {
+                it.type == ProjectMutationType.CREATE_PROJECT &&
+                    (it.targetId == projectId || it.projectId == projectId)
+            }?.operationId
 
     private fun FormDrafts.cleanAfter(command: ProjectMutation): FormDrafts {
         val contentCleaned = when (command.type) {
@@ -1819,6 +2159,7 @@ class ProjectSyncRepository(
                 )
             },
             pendingBlockOperations = projectCache.localBlockOperations.size,
+            pendingItemOperations = projectCache.itemOperations.size,
         )
     }
 
@@ -1871,6 +2212,11 @@ class ProjectSyncRepository(
         val currentCommands = current.projectCache.commands.associateBy { it.operationId }
         val locallyRemoved = baselineCommands.keys - currentCommands.keys
         val mappings = proposed.projectCache.projectIdMappings
+        val acknowledgedCreateOperations = mappings.associate { identity ->
+            identity.provisionalId to baseline.projectCache.commands.filter {
+                it.type == ProjectMutationType.CREATE_PROJECT && it.targetId == identity.provisionalId
+            }.map { it.operationId }.toSet()
+        }
         val locallyChanged = current.projectCache.commands.filter {
             baselineCommands[it.operationId] != it
         }.map { command ->
@@ -1911,6 +2257,49 @@ class ProjectSyncRepository(
                 } else {
                     proposed.projectCache.projectCovers
                 },
+                noteItems = if (current.projectCache.noteItems != baseline.projectCache.noteItems) {
+                    current.projectCache.noteItems.map { note ->
+                        mappings.fold(note) { mapped, identity ->
+                            if (mapped.projectId == identity.provisionalId) {
+                                mapped.copy(projectId = identity.serverId)
+                            } else mapped
+                        }
+                    }
+                } else {
+                    proposed.projectCache.noteItems
+                },
+                resourceLinks = if (current.projectCache.resourceLinks != baseline.projectCache.resourceLinks) {
+                    current.projectCache.resourceLinks.map { link ->
+                        mappings.fold(link) { mapped, identity ->
+                            if (mapped.projectId == identity.provisionalId) {
+                                mapped.copy(projectId = identity.serverId)
+                            } else mapped
+                        }
+                    }
+                } else {
+                    proposed.projectCache.resourceLinks
+                },
+                itemOperations = if (current.projectCache.itemOperations != baseline.projectCache.itemOperations) {
+                    current.projectCache.itemOperations.map { operation ->
+                        mappings.fold(operation) { mapped, identity ->
+                            if (mapped.projectId == identity.provisionalId) {
+                                mapped.copy(
+                                    projectId = identity.serverId,
+                                    dependsOnOperationId = mapped.dependsOnOperationId?.takeUnless {
+                                        it in acknowledgedCreateOperations[identity.provisionalId].orEmpty()
+                                    },
+                                )
+                            } else mapped
+                        }
+                    }
+                } else {
+                    proposed.projectCache.itemOperations
+                },
+                retiredItemOperationIds = (
+                    proposed.projectCache.retiredItemOperationIds +
+                        (current.projectCache.retiredItemOperationIds -
+                            baseline.projectCache.retiredItemOperationIds.toSet())
+                    ).distinct(),
                 localBlocks = if (current.projectCache.localBlocks != baseline.projectCache.localBlocks) {
                     current.projectCache.localBlocks.map { local ->
                         mappings.fold(local) { mapped, identity ->
@@ -2085,6 +2474,8 @@ class ProjectSyncRepository(
     private companion object {
         const val CHANGE_PAGE_SIZE = 100
         const val MAX_BLOCK_LABEL = 200
+        const val MAX_NOTE_BODY = 100_000
+        const val MAX_LINK_TITLE = 200
         val PENDING_TAG_STATES = setOf(LocalBlockState.AWAITING_WRITE, LocalBlockState.WRITE_UNCERTAIN)
         val UNCERTAIN_TAG_FAILURES = setOf(
             TagProgrammingFailure.IO_UNCERTAIN,

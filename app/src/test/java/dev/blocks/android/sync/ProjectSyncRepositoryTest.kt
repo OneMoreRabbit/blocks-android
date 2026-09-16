@@ -32,6 +32,7 @@ import dev.blocks.android.project.PhysicalBlock
 import dev.blocks.android.project.ProjectCacheState
 import dev.blocks.android.project.ProjectCoverContent
 import dev.blocks.android.project.ProjectIdentityMapping
+import dev.blocks.android.project.ProjectItemMutationType
 import dev.blocks.android.project.ProjectLifecycle
 import dev.blocks.android.project.ProjectMutationType
 import dev.blocks.android.project.ProjectMutationStatus
@@ -60,6 +61,102 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ProjectSyncRepositoryTest {
+    @Test
+    fun noteAndLinkActionsCommitOneLocalProjectionAndOneOrderedApi06IntentWithoutService() {
+        val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
+        val service = FakeProjectService().apply { offline = true }
+        val repository = repository(service, MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+        val noteId = "10000000-0000-4000-8000-000000000001"
+        val linkId = "20000000-0000-4000-8000-000000000002"
+
+        repository.addNoteItem(SESSION_A, PROJECT_ID, "First note", "note-create", noteId)
+        repository.editNoteItem(SESSION_A, noteId, "Edited note", "note-edit")
+        repository.setNoteItemPinned(SESSION_A, noteId, true, "note-pin")
+        repository.addResourceLink(
+            SESSION_A,
+            PROJECT_ID,
+            "Reference",
+            "https://example.com/reference",
+            "link-create",
+            linkId,
+        )
+        repository.editResourceLink(
+            SESSION_A,
+            linkId,
+            "Vault",
+            "obsidian://open?vault=Blocks&file=Project",
+            "link-edit",
+        )
+
+        val saved = state.loadSyncState(TENANT_A).projectCache
+        assertEquals("Edited note", saved.noteItems.single { it.id == noteId }.body)
+        assertTrue(saved.noteItems.single { it.id == noteId }.pinned)
+        assertEquals("obsidian://open?vault=Blocks&file=Project", saved.resourceLinks.single().uri)
+        assertEquals(
+            listOf(
+                ProjectItemMutationType.CREATE_NOTE,
+                ProjectItemMutationType.EDIT_NOTE,
+                ProjectItemMutationType.PIN_NOTE,
+                ProjectItemMutationType.CREATE_LINK,
+                ProjectItemMutationType.EDIT_LINK,
+            ),
+            saved.itemOperations.map { it.type },
+        )
+        assertEquals("note-create", saved.itemOperations[1].dependsOnOperationId)
+        assertEquals("note-edit", saved.itemOperations[2].dependsOnOperationId)
+        assertEquals("link-create", saved.itemOperations[4].dependsOnOperationId)
+    }
+
+    @Test
+    fun itemDeletesPersistTombstonesAndUnsafeLinksWriteNothing() {
+        val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
+        val repository = repository(FakeProjectService(), MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+        val noteId = "30000000-0000-4000-8000-000000000003"
+        val linkId = "40000000-0000-4000-8000-000000000004"
+        repository.addNoteItem(SESSION_A, PROJECT_ID, "Delete me", "note-create", noteId)
+        repository.addResourceLink(
+            SESSION_A,
+            PROJECT_ID,
+            "Safe",
+            "https://example.com",
+            "link-create",
+            linkId,
+        )
+        val savesBeforeUnsafe = state.saved.size
+
+        listOf(
+            "intent://open/#Intent;scheme=https;end",
+            "file:///tmp/private",
+            "content://provider/item",
+            "https://user:secret@example.com/path",
+            "not a URI",
+        ).forEachIndexed { index, unsafe ->
+            assertTrue(
+                runCatching {
+                    repository.addResourceLink(
+                        SESSION_A,
+                        PROJECT_ID,
+                        "Unsafe",
+                        unsafe,
+                        "unsafe-$index",
+                        "50000000-0000-4000-8000-00000000000$index",
+                    )
+                }.isFailure,
+            )
+        }
+        assertEquals(savesBeforeUnsafe, state.saved.size)
+
+        repository.deleteNoteItem(SESSION_A, noteId, "note-delete")
+        repository.deleteResourceLink(SESSION_A, linkId, "link-delete")
+        val saved = state.loadSyncState(TENANT_A).projectCache
+        assertNotNull(saved.noteItems.single().deletedAt)
+        assertNotNull(saved.resourceLinks.single().deletedAt)
+        assertEquals(ProjectItemMutationType.DELETE_NOTE, saved.itemOperations[saved.itemOperations.lastIndex - 1].type)
+        assertEquals(ProjectItemMutationType.DELETE_LINK, saved.itemOperations.last().type)
+    }
+
     @Test
     fun legacyProjectGetsOneStableCollisionCheckedKeyWithoutCreatingWireOperations() {
         val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
@@ -578,6 +675,21 @@ class ProjectSyncRepositoryTest {
             body = "Saved while create waits",
             operationId = "notes-concurrent",
         )
+        repository.addNoteItem(
+            SESSION_A,
+            "client-concurrent",
+            "Item saved while create waits",
+            operationId = "item-concurrent",
+            clientId = "70000000-0000-4000-8000-000000000007",
+        )
+        repository.addResourceLink(
+            SESSION_A,
+            "client-concurrent",
+            "Concurrent reference",
+            "https://example.com/concurrent",
+            operationId = "link-concurrent",
+            clientId = "80000000-0000-4000-8000-000000000008",
+        )
         service.allowCreate.countDown()
         background.join(2_000)
 
@@ -590,6 +702,10 @@ class ProjectSyncRepositoryTest {
         assertTrue(durable.parkingRecords.none { it.projectId == "client-concurrent" })
         assertEquals("Saved while create waits", durable.pages.single { it.project.id == PROJECT_ID }.notes.body)
         assertEquals(listOf("Saved while create waits"), service.savedNotesBodies)
+        assertEquals(setOf(PROJECT_ID), durable.noteItems.map { it.projectId }.toSet())
+        assertEquals(setOf(PROJECT_ID), durable.resourceLinks.map { it.projectId }.toSet())
+        assertEquals(2, durable.itemOperations.size)
+        assertTrue(durable.itemOperations.all { it.projectId == PROJECT_ID && it.dependsOnOperationId == null })
     }
 
     @Test

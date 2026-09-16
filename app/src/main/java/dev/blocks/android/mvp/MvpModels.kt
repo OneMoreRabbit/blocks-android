@@ -90,6 +90,15 @@ data class PendingMutation(
     val idempotencyKey: String,
 )
 
+data class NoteItemDraft(
+    val body: String = "",
+)
+
+data class ProjectResourceLinkDraft(
+    val title: String = "",
+    val uri: String = "",
+)
+
 data class FormDrafts(
     val projectName: String = "",
     val pickups: Map<String, PickupDraft> = emptyMap(),
@@ -97,6 +106,8 @@ data class FormDrafts(
     val projectNotes: Map<String, String> = emptyMap(),
     val projectParking: Map<String, ParkingDraft> = emptyMap(),
     val projectRenames: Map<String, String> = emptyMap(),
+    val projectNoteItems: Map<String, NoteItemDraft> = emptyMap(),
+    val projectResourceLinks: Map<String, ProjectResourceLinkDraft> = emptyMap(),
     val pendingMutations: Map<String, PendingMutation> = emptyMap(),
 )
 

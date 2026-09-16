@@ -34,7 +34,6 @@ import dev.blocks.android.auth.AndroidEncryptedAcceptedTenantContinuityStore
 import dev.blocks.android.auth.IdentityProvider
 import dev.blocks.android.cover.ProjectCoverImporter
 import dev.blocks.android.cover.CoverCropSelection
-import dev.blocks.android.cover.CoverCaptureFiles
 import dev.blocks.android.cover.AndroidEncryptedProjectCoverMediaStore
 import dev.blocks.android.cover.CoverImportFiles
 import dev.blocks.android.cover.PreparedProjectCoverCrop
@@ -57,13 +56,17 @@ import dev.blocks.android.project.ProjectCover
 import dev.blocks.android.project.ProjectCoverContent
 import dev.blocks.android.project.ProjectLifecycle
 import dev.blocks.android.project.ProjectIdentityMapping
+import dev.blocks.android.project.ProjectItemMutation
+import dev.blocks.android.project.ProjectItemMutationType
 import dev.blocks.android.project.ProjectMutation
 import dev.blocks.android.project.ProjectMutationStatus
 import dev.blocks.android.project.ProjectMutationType
 import dev.blocks.android.project.ProjectNotes
+import dev.blocks.android.project.ProjectNoteItem
 import dev.blocks.android.project.ProjectPage
 import dev.blocks.android.project.ProjectParking
 import dev.blocks.android.project.ProjectPresentationController
+import dev.blocks.android.project.ProjectResourceLink
 import dev.blocks.android.project.ProjectScreen
 import dev.blocks.android.project.ProjectService
 import dev.blocks.android.project.ProjectSummary
@@ -123,6 +126,7 @@ class MainActivityPresentationTest {
     private lateinit var coverImporter: FakeCoverImporter
     private lateinit var coverCropper: FakeCoverCropper
     private lateinit var coverSourceActions: FakeCoverSourceActions
+    private lateinit var launchedResourceLinks: MutableList<String>
     @Volatile
     private var sessionExchangeOffline = false
     @Volatile
@@ -145,6 +149,7 @@ class MainActivityPresentationTest {
         coverImporter = FakeCoverImporter(context)
         coverCropper = FakeCoverCropper(coverImporter)
         coverSourceActions = FakeCoverSourceActions()
+        launchedResourceLinks = mutableListOf()
         MainActivity.dependencyFactory = { activity ->
             val drafts = AndroidEncryptedDraftStore(activity)
             presentationController = ProjectPresentationController(
@@ -170,6 +175,7 @@ class MainActivityPresentationTest {
                 coverImporter = coverImporter,
                 coverCropper = coverCropper,
                 coverSourceActions = coverSourceActions,
+                resourceLinkLauncher = { uri -> launchedResourceLinks += uri; true },
             )
         }
     }
@@ -894,7 +900,7 @@ class MainActivityPresentationTest {
                 activity.selectDialogItem("About")
                 val about = activity.dialogTexts().joinToString("\n")
                 assertTrue(about.contains("Blocks Android"))
-                assertTrue(about.contains("Version 0.7.2 (13)"))
+                assertTrue(about.contains("Version 0.8.0 (14)"))
                 assertTrue(about.contains("dev.blocks.android/debug"))
                 assertFalse(about.contains("tenant", ignoreCase = true))
                 assertFalse(about.contains("token", ignoreCase = true))
@@ -1246,10 +1252,26 @@ class MainActivityPresentationTest {
             }
             waitFor(first) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
             first.onActivity { activity ->
-                activity.findViewById<EditText>(ProjectUiIds.NOTES).setText("Offline notes")
-                activity.findViewById<Button>(ProjectUiIds.SAVE_NOTES).performClick()
+                activity.findViewById<Button>(ProjectUiIds.ADD_NOTE).performClick()
             }
-            waitUntil { presentationController.state.projectPage?.notes?.body == "Offline notes" }
+            waitFor(first) { it.findViewById<View>(ProjectUiIds.NOTE_SHEET) != null }
+            first.onActivity { activity ->
+                val note = activity.findViewById<EditText>(ProjectUiIds.NOTE_BODY)
+                note.setText("Offline notes")
+                note.requestFocus()
+                activity.getSystemService(InputMethodManager::class.java)
+                    .showSoftInput(note, InputMethodManager.SHOW_IMPLICIT)
+            }
+            waitFor(first) { activity ->
+                ViewCompat.getRootWindowInsets(activity.findViewById(ProjectUiIds.NOTE_BODY))
+                    ?.isVisible(WindowInsetsCompat.Type.ime()) == true
+            }
+            first.onActivity { activity ->
+                val save = activity.findViewById<Button>(ProjectUiIds.SAVE_NOTE)
+                assertTrue(save.isShown && save.height > 0)
+                save.performClick()
+            }
+            waitUntil { presentationController.state.noteItems.singleOrNull()?.body == "Offline notes" }
             first.onActivity { it.findViewById<Button>(ProjectUiIds.PARK).performClick() }
             first.onActivity { activity ->
                 activity.findViewById<EditText>(ProjectUiIds.PARKING_LOCATION).setText("Workbench")
@@ -1290,6 +1312,8 @@ class MainActivityPresentationTest {
                 persistedAfterPark.commands.single { it.type == ProjectMutationType.ADD_PARKING }.parking,
             )
             assertEquals("Workbench", persistedAfterPark.parkingRecords.single().location)
+            assertEquals("Offline notes", persistedAfterPark.noteItems.single().body)
+            assertEquals(ProjectItemMutationType.CREATE_NOTE, persistedAfterPark.itemOperations.single().type)
             first.onActivity { activity ->
                 val projectId = requireNotNull(presentationController.state.projectPage).project.id
                 activity.importCover(projectId, Uri.parse("content://test/real-store-cover"))
@@ -1306,7 +1330,7 @@ class MainActivityPresentationTest {
             restarted.onActivity { it.button("Offline project").performClick() }
             waitFor(restarted) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
             restarted.onActivity { activity ->
-                assertEquals("Offline notes", activity.findViewById<EditText>(ProjectUiIds.NOTES).text.toString())
+                assertTrue(activity.texts().contains("Offline notes"))
                 assertEquals(coverImporter.importedDigest(1), presentationController.state.projectCovers.single().contentDigest)
                 assertTrue(activity.texts().contains("Workbench"))
                 assertTrue(activity.texts().contains("Fit bracket"))
@@ -1523,6 +1547,9 @@ class MainActivityPresentationTest {
             activeProjects = emptyList(),
             archivedProjects = listOf(archived),
             pages = listOf(page().copy(project = archived, notes = page().notes.copy(body = "Retained notes"))),
+            noteItems = listOf(
+                ProjectNoteItem(NOTE_ITEM_ID, PROJECT_ID, "Retained notes", false, "legacy", NOW, NOW),
+            ),
         )
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
@@ -1538,8 +1565,8 @@ class MainActivityPresentationTest {
                 assertEquals("Settings", activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS).contentDescription)
                 assertTrue(activity.findViewById<View>(ProjectUiIds.EDIT_COVER) == null)
                 assertTrue(activity.findViewById<View>(ProjectUiIds.PARK) == null)
-                assertTrue(activity.findViewById<View>(ProjectUiIds.SAVE_NOTES) == null)
-                assertFalse(activity.findViewById<View>(ProjectUiIds.NOTES) is EditText)
+                assertTrue(activity.findViewById<View>(ProjectUiIds.ADD_NOTE) == null)
+                assertTrue(activity.findViewById<View>(ProjectUiIds.ADD_LINK) == null)
                 assertTrue(activity.texts().contains("Retained notes"))
                 activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS).performClick()
                 assertEquals(listOf("View QR", "Reopen"), activity.dialogItems())
@@ -1547,10 +1574,85 @@ class MainActivityPresentationTest {
                 activity.dialogButton("Reopen").callOnClick()
             }
             waitFor(scenario) {
-                it.findViewById<View>(ProjectUiIds.ARCHIVED_LABEL) == null &&
+                    it.findViewById<View>(ProjectUiIds.ARCHIVED_LABEL) == null &&
                     it.findViewById<Button>(ProjectUiIds.PARK) != null &&
-                    it.findViewById<EditText>(ProjectUiIds.NOTES) != null
+                    it.findViewById<Button>(ProjectUiIds.ADD_NOTE) != null
             }
+        }
+    }
+
+    @Test
+    fun projectItemsUseContainedLocalFormsPinOrderingSafeValidationAndConfirmedDelete() {
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { it.button("Active project").performClick() }
+            waitFor(scenario) { it.findViewById<Button>(ProjectUiIds.ADD_NOTE) != null }
+            scenario.onActivity { activity ->
+                assertTrue(activity.findViewById<Button>(ProjectUiIds.PARK).height >= 48)
+                assertTrue(activity.findViewById<Button>(ProjectUiIds.ADD_NOTE).height >= 48)
+                assertTrue(activity.findViewById<Button>(ProjectUiIds.ADD_LINK).height >= 48)
+                activity.findViewById<Button>(ProjectUiIds.ADD_NOTE).performClick()
+            }
+            waitFor(scenario) { it.findViewById<View>(ProjectUiIds.NOTE_SHEET) != null }
+            val operationsBeforeInvalidNote = workspace.cache.itemOperations.size
+            scenario.onActivity { it.findViewById<Button>(ProjectUiIds.SAVE_NOTE).performClick() }
+            waitFor(scenario) { it.findViewById<EditText>(ProjectUiIds.NOTE_BODY).error != null }
+            assertEquals(operationsBeforeInvalidNote, workspace.cache.itemOperations.size)
+            scenario.onActivity { activity ->
+                activity.findViewById<EditText>(ProjectUiIds.NOTE_BODY).setText("Pinned workshop context")
+                activity.findViewById<Button>(ProjectUiIds.SAVE_NOTE).performClick()
+            }
+            waitFor(scenario) { it.texts().contains("Pinned workshop context") }
+            scenario.onActivity { it.buttonWithDescription("Pin note").performClick() }
+            waitUntil { workspace.cache.noteItems.single().pinned }
+            scenario.onActivity { activity ->
+                assertTrue(activity.findViewById<View>(ProjectUiIds.PINNED_NOTES) != null)
+                activity.buttonWithDescription("Edit note").performClick()
+            }
+            waitFor(scenario) { it.findViewById<EditText>(ProjectUiIds.NOTE_BODY) != null }
+            scenario.onActivity { activity ->
+                activity.findViewById<EditText>(ProjectUiIds.NOTE_BODY).setText("Edited pinned context")
+                activity.findViewById<Button>(ProjectUiIds.SAVE_NOTE).performClick()
+            }
+            waitFor(scenario) {
+                it.findViewById<Button>(ProjectUiIds.ADD_LINK) != null && it.texts().contains("Edited pinned context")
+            }
+
+            scenario.onActivity { it.findViewById<Button>(ProjectUiIds.ADD_LINK).performClick() }
+            waitFor(scenario) { it.findViewById<View>(ProjectUiIds.LINK_SHEET) != null }
+            val operationsBeforeUnsafeLink = workspace.cache.itemOperations.size
+            scenario.onActivity { activity ->
+                activity.findViewById<EditText>(ProjectUiIds.LINK_TITLE).setText("Unsafe")
+                activity.findViewById<EditText>(ProjectUiIds.LINK_URI).setText("intent://private")
+                activity.findViewById<Button>(ProjectUiIds.SAVE_LINK).performClick()
+            }
+            waitFor(scenario) { it.findViewById<EditText>(ProjectUiIds.LINK_URI).error != null }
+            assertEquals(operationsBeforeUnsafeLink, workspace.cache.itemOperations.size)
+            scenario.onActivity { activity ->
+                activity.findViewById<EditText>(ProjectUiIds.LINK_TITLE).setText("Workshop vault")
+                activity.findViewById<EditText>(ProjectUiIds.LINK_URI)
+                    .setText("obsidian://open?vault=Blocks&file=Workshop")
+                activity.findViewById<Button>(ProjectUiIds.SAVE_LINK).performClick()
+            }
+            waitFor(scenario) {
+                it.findViewById<Button>(ProjectUiIds.ADD_LINK) != null && it.texts().contains("Workshop vault")
+            }
+            scenario.onActivity { activity ->
+                assertTrue(activity.buttonWithDescription("Open Workshop vault").isShown)
+                activity.buttonWithDescription("Open Workshop vault").performClick()
+                assertEquals(listOf("obsidian://open?vault=Blocks&file=Workshop"), launchedResourceLinks)
+                activity.buttonWithDescription("Delete link").performClick()
+                activity.dialogButton("Cancel").performClick()
+                assertEquals(null, workspace.cache.resourceLinks.single().deletedAt)
+                activity.buttonWithDescription("Delete link").performClick()
+                activity.dialogButton("Delete").performClick()
+            }
+            waitUntil { workspace.cache.resourceLinks.single().deletedAt != null }
+            scenario.onActivity { activity ->
+                activity.buttonWithDescription("Delete note").performClick()
+                activity.dialogButton("Delete").performClick()
+            }
+            waitUntil { workspace.cache.noteItems.single().deletedAt != null }
         }
     }
 
@@ -1558,26 +1660,28 @@ class MainActivityPresentationTest {
     fun longNotesRestoreAndOverLimitSaveCreatesNoMutation() {
         val valid = "n".repeat(100_000)
         workspace.cache = workspace.cache.copy(
-            pages = listOf(page().copy(notes = page().notes.copy(body = valid))),
+            noteItems = listOf(ProjectNoteItem(NOTE_ITEM_ID, PROJECT_ID, valid, false, "local", NOW, NOW)),
         )
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             scenario.onActivity { it.button("Active project").performClick() }
-            waitFor(scenario) { it.findViewById<EditText>(ProjectUiIds.NOTES)?.text?.length == valid.length }
+            waitFor(scenario) { it.texts().any { text -> text.length == valid.length } }
+            scenario.onActivity { activity -> activity.buttonWithDescription("Edit note").performClick() }
+            waitFor(scenario) { it.findViewById<EditText>(ProjectUiIds.NOTE_BODY)?.text?.length == valid.length }
             scenario.recreate()
-            waitFor(scenario) { it.findViewById<EditText>(ProjectUiIds.NOTES)?.text?.length == valid.length }
-            val before = workspace.cache.commands.size
+            waitFor(scenario) { it.findViewById<EditText>(ProjectUiIds.NOTE_BODY)?.text?.length == valid.length }
+            val before = workspace.cache.itemOperations.size
             scenario.onActivity { activity ->
-                val notes = activity.findViewById<EditText>(ProjectUiIds.NOTES)
+                val notes = activity.findViewById<EditText>(ProjectUiIds.NOTE_BODY)
                 notes.setText(valid + "x")
-                activity.findViewById<Button>(ProjectUiIds.SAVE_NOTES).performClick()
+                activity.findViewById<Button>(ProjectUiIds.SAVE_NOTE).performClick()
             }
             waitFor(scenario) {
-                it.findViewById<EditText>(ProjectUiIds.NOTES)?.error?.toString()?.contains("100,000") == true
+                it.findViewById<EditText>(ProjectUiIds.NOTE_BODY)?.error?.toString()?.contains("100,000") == true
             }
             scenario.onActivity { activity ->
-                assertEquals(100_001, activity.findViewById<EditText>(ProjectUiIds.NOTES).text.length)
-                assertEquals(before, workspace.cache.commands.size)
+                assertEquals(100_001, activity.findViewById<EditText>(ProjectUiIds.NOTE_BODY).text.length)
+                assertEquals(before, workspace.cache.itemOperations.size)
             }
         }
     }
@@ -1624,13 +1728,18 @@ class MainActivityPresentationTest {
     }
 
     @Test
-    fun notesAndAllThreeParkingFieldsSurviveConfigurationButNotProcessDeath() {
+    fun noteAndParkingDraftsSurviveConfigurationAndNoteDraftSurvivesProcessRestart() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             scenario.onActivity { it.button("Active project").performClick() }
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
             scenario.onActivity { activity ->
-                activity.findViewById<EditText>(ProjectUiIds.NOTES).setText("Draft after recreation")
+                activity.findViewById<Button>(ProjectUiIds.ADD_NOTE).performClick()
+            }
+            waitFor(scenario) { it.findViewById<EditText>(ProjectUiIds.NOTE_BODY) != null }
+            scenario.onActivity { activity ->
+                activity.findViewById<EditText>(ProjectUiIds.NOTE_BODY).setText("Draft after recreation")
+                activity.findViewById<Button>(ProjectUiIds.BACK).performClick()
                 activity.findViewById<Button>(ProjectUiIds.PARK).performClick()
             }
             scenario.onActivity { activity ->
@@ -1656,10 +1765,10 @@ class MainActivityPresentationTest {
                     activity.findViewById<EditText>(ProjectUiIds.PARKING_MUST_NOT_FORGET).text.toString(),
                 )
                 activity.findViewById<Button>(ProjectUiIds.BACK).performClick()
-                assertEquals(
-                    "Draft after recreation",
-                    activity.findViewById<EditText>(ProjectUiIds.NOTES).text.toString(),
-                )
+                activity.findViewById<Button>(ProjectUiIds.ADD_NOTE).performClick()
+            }
+            scenario.onActivity { activity ->
+                assertEquals("Draft after recreation", activity.findViewById<EditText>(ProjectUiIds.NOTE_BODY).text.toString())
             }
             assertEquals(0, identity.signInCalls)
         }
@@ -1670,7 +1779,10 @@ class MainActivityPresentationTest {
             waitFor(restarted) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
             restarted.onActivity { activity ->
                 assertTrue(activity.findViewById<View>(ProjectUiIds.PARK_SHEET) == null)
-                assertEquals("Server notes", activity.findViewById<EditText>(ProjectUiIds.NOTES).text.toString())
+                activity.findViewById<Button>(ProjectUiIds.ADD_NOTE).performClick()
+            }
+            restarted.onActivity { activity ->
+                assertEquals("Draft after recreation", activity.findViewById<EditText>(ProjectUiIds.NOTE_BODY).text.toString())
             }
         }
     }
@@ -1693,11 +1805,7 @@ class MainActivityPresentationTest {
                 assertTrue(text.contains("Place 22"))
                 assertTrue(text.contains("Place 13"))
                 assertFalse(text.contains("Place 12"))
-                assertEquals(
-                    8,
-                    activity.findViewById<ViewGroup>(ProjectUiIds.PARKING_HISTORY)
-                        .descendants().count { it.id == ProjectUiIds.PARKING_HISTORY_DIVIDER },
-                )
+                assertEquals(10, activity.findViewById<ViewGroup>(ProjectUiIds.PROJECT_ACTIVITY).childCount)
                 activity.findViewById<Button>(ProjectUiIds.LOAD_OLDER_PARKING).performClick()
             }
             waitFor(scenario) { it.texts().contains("Place 3") }
@@ -1709,9 +1817,8 @@ class MainActivityPresentationTest {
             scenario.onActivity { activity ->
                 assertTrue(activity.findViewById<Button>(ProjectUiIds.LOAD_OLDER_PARKING) == null)
                 assertEquals(
-                    21,
-                    activity.findViewById<ViewGroup>(ProjectUiIds.PARKING_HISTORY)
-                        .descendants().count { it.id == ProjectUiIds.PARKING_HISTORY_DIVIDER },
+                    23,
+                    activity.findViewById<ViewGroup>(ProjectUiIds.PROJECT_ACTIVITY).childCount,
                 )
             }
 
@@ -1722,56 +1829,6 @@ class MainActivityPresentationTest {
                 assertTrue(activity.findViewById<Button>(ProjectUiIds.LOAD_OLDER_PARKING) != null)
                 assertEquals(0, identity.signInCalls)
             }
-        }
-    }
-
-    @Test
-    fun offlineSaveRetriesAutomaticallyOnResumeAndConflictNeverDropsTheEdit() {
-        workspace.offline = true
-        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
-            scenario.onActivity { activity ->
-                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
-                activity.selectDialogItem("Reconnect Google account")
-            }
-            waitUntil { !presentationController.state.sessionConfirmationRequired }
-            scenario.onActivity { it.button("Active project").performClick() }
-            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
-            scenario.onActivity { activity ->
-                activity.findViewById<EditText>(ProjectUiIds.NOTES).setText("Offline notes")
-                activity.findViewById<Button>(ProjectUiIds.SAVE_NOTES).performClick()
-            }
-            waitUntil { workspace.cache.commands.isNotEmpty() }
-
-            workspace.offline = false
-            scenario.moveToState(Lifecycle.State.CREATED)
-            scenario.moveToState(Lifecycle.State.RESUMED)
-            waitUntil { workspace.cache.commands.isEmpty() }
-
-            workspace.conflict = true
-            scenario.onActivity { activity ->
-                activity.findViewById<EditText>(ProjectUiIds.NOTES).setText("Conflict notes")
-                activity.findViewById<Button>(ProjectUiIds.SAVE_NOTES).performClick()
-            }
-            waitUntil { workspace.cache.commands.any { it.status == ProjectMutationStatus.REQUIRES_RECONCILIATION } }
-            scenario.onActivity { activity ->
-                assertEquals(
-                    "Conflict notes",
-                    activity.findViewById<EditText>(ProjectUiIds.NOTES).text.toString(),
-                )
-                assertTrue(activity.findViewById<Button>(ProjectUiIds.RESOLVE_CONFLICT) != null)
-                assertTrue(activity.findViewById<View>(ProjectUiIds.PENDING_CHANGES) == null)
-                assertFalse(activity.texts().any { it.contains("service", ignoreCase = true) })
-                assertTrue(activity.findViewById<Button>(ProjectUiIds.RESOLVE_CONFLICT) != null)
-            }
-
-            workspace.conflict = false
-            scenario.onActivity { activity ->
-                activity.findViewById<Button>(ProjectUiIds.RESOLVE_CONFLICT).performClick()
-                assertTrue(activity.dialogTexts().any { it.contains("Current service value") })
-                activity.dialogButton("Retry with latest").callOnClick()
-            }
-            waitUntil { workspace.cache.commands.isEmpty() }
         }
     }
 
@@ -1900,19 +1957,12 @@ class MainActivityPresentationTest {
             scenario.onActivity { it.button("Active project").performClick() }
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
             scenario.onActivity { it.findViewById<Button>(ProjectUiIds.EDIT_COVER).performClick() }
-            waitFor(scenario) { it.visibleDialogItems().containsAll(listOf("Take photo", "Choose image")) }
+            waitFor(scenario) { it.visibleDialogItems().contains("Choose image") }
             scenario.onActivity { activity ->
                 val before = presentationController.state.projectCovers
                 assertFalse(activity.visibleDialogItems().contains("Remove cover"))
                 activity.dialogButton("Cancel").performClick()
                 assertEquals(before, presentationController.state.projectCovers)
-                activity.findViewById<Button>(ProjectUiIds.EDIT_COVER).performClick()
-            }
-            waitFor(scenario) { it.visibleDialogItems().contains("Take photo") }
-            scenario.onActivity { activity ->
-                activity.activateVisibleDialogItem("Take photo")
-                assertEquals(listOf(PROJECT_ID), coverSourceActions.cameraProjects)
-                assertTrue(presentationController.state.projectCovers.isEmpty())
                 activity.findViewById<Button>(ProjectUiIds.EDIT_COVER).performClick()
             }
             waitFor(scenario) { it.visibleDialogItems().contains("Choose image") }
@@ -1932,17 +1982,16 @@ class MainActivityPresentationTest {
                 val texts = activity.visibleDialogItems()
                 assertTrue(
                     texts.containsAll(
-                        listOf("Take replacement photo", "Choose replacement image", "Remove cover"),
+                        listOf("Choose replacement image", "Remove cover"),
                     ),
                 )
-                assertFalse(texts.contains("Take photo"))
                 assertFalse(texts.contains("Choose image"))
             }
         }
     }
 
     @Test
-    fun galleryAndCameraUseSharedExplicitCropConfirmCancelPath() {
+    fun galleryUsesExplicitCropConfirmCancelPath() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             scenario.onActivity { it.button("Active project").performClick() }
@@ -1963,13 +2012,9 @@ class MainActivityPresentationTest {
             waitUntil { coverCropper.discarded > discardedBefore }
             assertTrue(workspace.cache.projectCovers.isEmpty())
 
-            lateinit var capturePath: String
             scenario.onActivity { activity ->
-                val capture = CoverCaptureFiles(activity).create()
-                java.io.File(capture.path).writeBytes(byteArrayOf(1))
-                capturePath = capture.path
-                activity.stagePendingCover(PROJECT_ID, capture)
-                activity.handleCoverCameraResult(true)
+                activity.stagePendingCover(PROJECT_ID)
+                activity.handleCoverPickerResult(Uri.parse("content://test/gallery-confirm"))
             }
             waitFor(scenario) { it.activeDialog?.findViewById<View>(ProjectUiIds.CROP_SURFACE) != null }
             scenario.onActivity { activity ->
@@ -1978,7 +2023,7 @@ class MainActivityPresentationTest {
                 crop.setSelectionForTest(CoverCropSelection(0.6f, 0.5f, 1.5f))
                 activity.dialogButton("Confirm").callOnClick()
             }
-            waitUntil { workspace.cache.projectCovers.isNotEmpty() && !java.io.File(capturePath).exists() }
+            waitUntil { workspace.cache.projectCovers.isNotEmpty() }
             assertEquals(CoverCropSelection(0.6f, 0.5f, 1.5f), coverCropper.confirmedSelections.single())
         }
     }
@@ -2002,26 +2047,19 @@ class MainActivityPresentationTest {
                     .filterIsInstance<android.widget.ImageView>()
                     .all { it.contentDescription == null }
             }
-            lateinit var successfulCapturePath: String
             scenario.onActivity { activity ->
-                val capture = CoverCaptureFiles(activity).create()
-                successfulCapturePath = capture.path
-                activity.stagePendingCover(PROJECT_ID, capture)
-                activity.handleCoverCameraResult(true)
+                activity.stagePendingCover(PROJECT_ID)
+                activity.handleCoverPickerResult(Uri.parse("content://test/replacement"))
             }
             waitFor(scenario) { it.activeDialog?.findViewById<View>(ProjectUiIds.CROP_SURFACE) != null }
             scenario.onActivity { it.dialogButton("Confirm").callOnClick() }
-            waitUntil {
-                workspace.cache.projectCovers.singleOrNull()?.contentDigest == coverImporter.importedDigest(2) &&
-                    !java.io.File(successfulCapturePath).exists()
-            }
+            waitUntil { workspace.cache.projectCovers.singleOrNull()?.contentDigest == coverImporter.importedDigest(2) }
 
             scenario.recreate()
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
             assertEquals(coverImporter.importedDigest(2), workspace.cache.projectCovers.single().contentDigest)
 
             coverImporter.failure = java.io.IOException("denied")
-            lateinit var cancelledCapturePath: String
             scenario.onActivity { activity ->
                 activity.stagePendingCover(PROJECT_ID)
                 activity.handleCoverPickerResult(Uri.parse("content://test/denied"))
@@ -2034,12 +2072,7 @@ class MainActivityPresentationTest {
             scenario.onActivity { activity ->
                 activity.stagePendingCover(PROJECT_ID)
                 activity.handleCoverPickerResult(null)
-                val capture = CoverCaptureFiles(activity).create()
-                cancelledCapturePath = capture.path
-                activity.stagePendingCover(PROJECT_ID, capture)
-                activity.handleCoverCameraResult(false)
             }
-            waitUntil { !java.io.File(cancelledCapturePath).exists() }
             assertEquals(coverImporter.importedDigest(2), workspace.cache.projectCovers.single().contentDigest)
 
             coverImporter.failure = null
@@ -2053,71 +2086,6 @@ class MainActivityPresentationTest {
                 assertTrue(activity.texts().contains("Active project"))
                 assertTrue(activity.findViewById<View>(ProjectUiIds.PROJECT_COVER) != null)
             }
-        }
-    }
-
-    @Test
-    fun cameraTempsAreCleanedForLostScopeRecreationAndFailedMetadataCommit() {
-        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
-            scenario.onActivity { it.button("Active project").performClick() }
-            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
-
-            lateinit var orphanPath: String
-            scenario.onActivity { activity ->
-                orphanPath = CoverCaptureFiles(activity).create().path
-                java.io.File(orphanPath).writeBytes(byteArrayOf(1, 2, 3))
-            }
-            scenario.recreate()
-            waitUntil { !java.io.File(orphanPath).exists() }
-
-            lateinit var recreatedPath: String
-            scenario.onActivity { activity ->
-                val capture = CoverCaptureFiles(activity).create()
-                recreatedPath = capture.path
-                java.io.File(recreatedPath).writeBytes(byteArrayOf(4, 5, 6))
-                activity.stagePendingCover(PROJECT_ID, capture)
-            }
-            scenario.recreate()
-            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
-            assertTrue(java.io.File(recreatedPath).exists())
-            scenario.onActivity { it.handleCoverCameraResult(false) }
-            waitUntil { !java.io.File(recreatedPath).exists() }
-
-            lateinit var changedProjectPath: String
-            workspace.addProject(OTHER_PROJECT_ID, OTHER_PROJECT_KEY, "Other project")
-            scenario.onActivity { activity ->
-                val capture = CoverCaptureFiles(activity).create()
-                changedProjectPath = capture.path
-                activity.stagePendingCover(PROJECT_ID, capture)
-                presentationController.openProject(OTHER_PROJECT_ID)
-                activity.importCover(PROJECT_ID, capture.uri, capture)
-            }
-            waitUntil { !java.io.File(changedProjectPath).exists() }
-
-            lateinit var failedCommitPath: String
-            scenario.onActivity { activity ->
-                presentationController.openProject(PROJECT_ID)
-                workspace.failCoverSave = true
-                val capture = CoverCaptureFiles(activity).create()
-                failedCommitPath = capture.path
-                activity.stagePendingCover(PROJECT_ID, capture)
-                activity.handleCoverCameraResult(true)
-            }
-            waitFor(scenario) { it.activeDialog?.findViewById<View>(ProjectUiIds.CROP_SURFACE) != null }
-            scenario.onActivity { it.dialogButton("Confirm").callOnClick() }
-            waitUntil { !java.io.File(failedCommitPath).exists() }
-            assertTrue(workspace.cache.projectCovers.isEmpty())
-            workspace.failCoverSave = false
-
-            lateinit var lostTenantPath: String
-            scenario.onActivity { activity ->
-                val capture = CoverCaptureFiles(activity).create()
-                lostTenantPath = capture.path
-                presentationController.lock()
-                activity.importCover(PROJECT_ID, capture.uri, capture)
-            }
-            assertFalse(java.io.File(lostTenantPath).exists())
         }
     }
 
@@ -2205,7 +2173,8 @@ class MainActivityPresentationTest {
                 scenario.onActivity { activity ->
                     assertTrue(activity.findViewById<Button>(ProjectUiIds.EDIT_COVER) != null)
                     assertTrue(activity.findViewById<Button>(ProjectUiIds.PARK) != null)
-                    assertTrue(activity.findViewById<Button>(ProjectUiIds.SAVE_NOTES) != null)
+                    assertTrue(activity.findViewById<Button>(ProjectUiIds.ADD_NOTE) != null)
+                    assertTrue(activity.findViewById<Button>(ProjectUiIds.ADD_LINK) != null)
                     assertTrue(
                         activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS)
                             .contentDescription.toString().isNotBlank(),
@@ -2273,6 +2242,12 @@ class MainActivityPresentationTest {
         .descendants()
         .filterIsInstance<Button>()
         .single { it.text.toString() == text }
+
+    private fun Activity.buttonWithDescription(description: String): Button =
+        findViewById<ViewGroup>(android.R.id.content)
+            .descendants()
+            .filterIsInstance<Button>()
+            .single { it.contentDescription?.toString() == description }
 
     private fun Activity.hasButton(text: String) = findViewById<ViewGroup>(android.R.id.content)
         .descendants()
@@ -2351,12 +2326,7 @@ class MainActivityPresentationTest {
     }
 
     private class FakeCoverSourceActions : CoverSourceActions {
-        val cameraProjects = mutableListOf<String>()
         val pickerProjects = mutableListOf<String>()
-
-        override fun takePhoto(projectId: String) {
-            cameraProjects += projectId
-        }
 
         override fun chooseImage(projectId: String) {
             pickerProjects += projectId
@@ -3169,6 +3139,84 @@ class MainActivityPresentationTest {
             operationId: String,
             clientId: String,
         ) = queue(ProjectMutation(operationId, ProjectMutationType.ADD_PARKING, projectId, parking = parking))
+        override fun addNoteItem(
+            session: Session,
+            projectId: String,
+            body: String,
+            operationId: String,
+            clientId: String,
+        ): BackgroundSyncResult = item(
+            ProjectItemMutation(operationId, ProjectItemMutationType.CREATE_NOTE, clientId, projectId,
+                clientResourceId = clientId, noteBody = body, createdAt = NOW),
+        ) { current -> current.copy(noteItems = current.noteItems +
+            ProjectNoteItem(clientId, projectId, body, false, "local", NOW, NOW)) }
+        override fun editNoteItem(
+            session: Session,
+            noteId: String,
+            body: String,
+            operationId: String,
+        ): BackgroundSyncResult = item(
+            ProjectItemMutation(operationId, ProjectItemMutationType.EDIT_NOTE, noteId,
+                cache.noteItems.single { it.id == noteId }.projectId, noteBody = body, createdAt = NOW),
+        ) { current -> current.copy(noteItems = current.noteItems.map {
+            if (it.id == noteId) it.copy(body = body, updatedAt = NOW) else it
+        }) }
+        override fun setNoteItemPinned(
+            session: Session,
+            noteId: String,
+            pinned: Boolean,
+            operationId: String,
+        ): BackgroundSyncResult = item(
+            ProjectItemMutation(operationId, ProjectItemMutationType.PIN_NOTE, noteId,
+                cache.noteItems.single { it.id == noteId }.projectId, pinned = pinned, createdAt = NOW),
+        ) { current -> current.copy(noteItems = current.noteItems.map {
+            if (it.id == noteId) it.copy(pinned = pinned, updatedAt = NOW) else it
+        }) }
+        override fun deleteNoteItem(
+            session: Session,
+            noteId: String,
+            operationId: String,
+        ): BackgroundSyncResult = item(
+            ProjectItemMutation(operationId, ProjectItemMutationType.DELETE_NOTE, noteId,
+                cache.noteItems.single { it.id == noteId }.projectId, createdAt = NOW),
+        ) { current -> current.copy(noteItems = current.noteItems.map {
+            if (it.id == noteId) it.copy(deletedAt = NOW, updatedAt = NOW) else it
+        }) }
+        override fun addResourceLink(
+            session: Session,
+            projectId: String,
+            title: String,
+            uri: String,
+            operationId: String,
+            clientId: String,
+        ): BackgroundSyncResult = item(
+            ProjectItemMutation(operationId, ProjectItemMutationType.CREATE_LINK, clientId, projectId,
+                clientResourceId = clientId, linkTitle = title, linkUri = uri, createdAt = NOW),
+        ) { current -> current.copy(resourceLinks = current.resourceLinks +
+            ProjectResourceLink(clientId, projectId, title, uri, NOW, NOW)) }
+        override fun editResourceLink(
+            session: Session,
+            linkId: String,
+            title: String,
+            uri: String,
+            operationId: String,
+        ): BackgroundSyncResult = item(
+            ProjectItemMutation(operationId, ProjectItemMutationType.EDIT_LINK, linkId,
+                cache.resourceLinks.single { it.id == linkId }.projectId,
+                linkTitle = title, linkUri = uri, createdAt = NOW),
+        ) { current -> current.copy(resourceLinks = current.resourceLinks.map {
+            if (it.id == linkId) it.copy(title = title, uri = uri, updatedAt = NOW) else it
+        }) }
+        override fun deleteResourceLink(
+            session: Session,
+            linkId: String,
+            operationId: String,
+        ): BackgroundSyncResult = item(
+            ProjectItemMutation(operationId, ProjectItemMutationType.DELETE_LINK, linkId,
+                cache.resourceLinks.single { it.id == linkId }.projectId, createdAt = NOW),
+        ) { current -> current.copy(resourceLinks = current.resourceLinks.map {
+            if (it.id == linkId) it.copy(deletedAt = NOW, updatedAt = NOW) else it
+        }) }
         override fun discardConflict(session: Session, operationId: String): BackgroundSyncResult {
             cache = cache.copy(
                 commands = cache.commands.filterNot { it.operationId == operationId },
@@ -3238,6 +3286,16 @@ class MainActivityPresentationTest {
             return result()
         }
 
+        @Synchronized
+        private fun item(
+            operation: ProjectItemMutation,
+            update: (ProjectCacheState) -> ProjectCacheState,
+        ): BackgroundSyncResult {
+            mutations += operation.type.name
+            cache = update(cache).copy(itemOperations = cache.itemOperations + operation)
+            return result()
+        }
+
         private fun result(): BackgroundSyncResult {
             val conflicting = cache.commands.firstOrNull {
                 it.status == ProjectMutationStatus.REQUIRES_RECONCILIATION
@@ -3260,6 +3318,7 @@ class MainActivityPresentationTest {
                 )
             },
             pendingBlockOperations = cache.localBlockOperations.size,
+            pendingItemOperations = cache.itemOperations.size,
             )
         }
     }
@@ -3340,6 +3399,7 @@ class MainActivityPresentationTest {
         private const val PROJECT_ID = "00000000-0000-0000-0000-000000000012"
         private const val CANONICAL_PROJECT_ID = "00000000-0000-0000-0000-000000000014"
         private const val OTHER_PROJECT_ID = "00000000-0000-0000-0000-000000000015"
+        private const val NOTE_ITEM_ID = "10000000-0000-4000-8000-000000000012"
         private val OTHER_PROJECT_KEY = ProjectKey.parse("00000000-0000-0000-0000-000000000016")!!
         private val PROJECT_KEY = ProjectKey.parse("00000000-0000-0000-0000-000000000013")!!
         private val PROJECT_LINK = ProjectLink.create(PROJECT_KEY)
