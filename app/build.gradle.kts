@@ -55,16 +55,26 @@ plugins {
 }
 
 val serviceApiContractDir = rootProject.layout.projectDirectory.dir("contracts/blocks-service-api")
-val serviceApiSpec = serviceApiContractDir.file("blocks-service-api-openapi-v0_4.json")
+val serviceApiSpec = serviceApiContractDir.file("blocks-service-api-openapi-v0_6.json")
+val legacyV04ServiceApiContractDir = rootProject.layout.projectDirectory.dir("contracts/blocks-service-api-legacy-v0_4")
+val legacyV04ServiceApiSpec = legacyV04ServiceApiContractDir.file("blocks-service-api-openapi-v0_4.json")
 val legacyServiceApiContractDir = rootProject.layout.projectDirectory.dir("contracts/blocks-service-api-legacy-v0_2")
 val legacyServiceApiSpec = legacyServiceApiContractDir.file("blocks-service-api-openapi-v0_2.json")
-val generatedServiceApi = layout.buildDirectory.dir("generated/openapi-v0_4")
+val generatedServiceApi = layout.buildDirectory.dir("generated/openapi-v0_6")
+val generatedLegacyV04ServiceApi = layout.buildDirectory.dir("generated/openapi-v0_4")
 val generatedLegacyServiceApi = layout.buildDirectory.dir("generated/openapi-v0_2")
 
 val verifyServiceApiContract by tasks.registering(VerifyContractArtifacts::class) {
     group = "verification"
-    description = "Verifies the Atlas-delivered Service API 0.4 artifacts."
+    description = "Verifies the Atlas-delivered Service API 0.6 artifacts."
     contractDirectory.set(serviceApiContractDir)
+    expectedArtifactCount.set(22)
+}
+
+val verifyLegacyV04ServiceApiContract by tasks.registering(VerifyContractArtifacts::class) {
+    group = "verification"
+    description = "Verifies the frozen Service API 0.4 compatibility artifacts."
+    contractDirectory.set(legacyV04ServiceApiContractDir)
     expectedArtifactCount.set(15)
 }
 
@@ -79,6 +89,34 @@ openApiGenerate {
     generatorName.set("kotlin")
     inputSpec.set(serviceApiSpec.asFile.absolutePath)
     outputDir.set(generatedServiceApi.get().asFile.absolutePath)
+    modelPackage.set("dev.blocks.android.api.generated.v06.model")
+    packageName.set("dev.blocks.android.api.generated.v06")
+    validateSpec.set(true)
+    configOptions.set(
+        mapOf(
+            "dateLibrary" to "string",
+            "enumPropertyNaming" to "UPPERCASE",
+            "library" to "jvm-okhttp4",
+            "serializationLibrary" to "gson",
+            "sourceFolder" to "src/main/kotlin",
+        ),
+    )
+    globalProperties.set(
+        mapOf(
+            "apiDocs" to "false",
+            "apis" to "false",
+            "modelDocs" to "false",
+            "models" to "",
+            "modelTests" to "false",
+            "supportingFiles" to "false",
+        ),
+    )
+}
+
+val openApiGenerateLegacyV04 by tasks.registering(GenerateTask::class) {
+    generatorName.set("kotlin")
+    inputSpec.set(legacyV04ServiceApiSpec.asFile.absolutePath)
+    outputDir.set(generatedLegacyV04ServiceApi.get().asFile.absolutePath)
     modelPackage.set("dev.blocks.android.api.generated.v04.model")
     packageName.set("dev.blocks.android.api.generated.v04")
     validateSpec.set(true)
@@ -101,6 +139,7 @@ openApiGenerate {
             "supportingFiles" to "false",
         ),
     )
+    dependsOn(verifyLegacyV04ServiceApiContract)
 }
 
 val openApiGenerateLegacyV02 by tasks.registering(GenerateTask::class) {
@@ -150,7 +189,7 @@ android {
             "BLOCKS_GOOGLE_SERVER_CLIENT_ID",
             "\"12259488358-ogmpp0cg1a8v1pbvkoivo9lgr94n0kb9.apps.googleusercontent.com\"",
         )
-        buildConfigField("String", "BLOCKS_SERVICE_API_VERSION", "\"0.4\"")
+        buildConfigField("String", "BLOCKS_SERVICE_API_VERSION", "\"0.6\"")
     }
 
     buildTypes {
@@ -176,6 +215,7 @@ dependencies {
     implementation("androidx.credentials:credentials-play-services-auth:1.6.0")
     implementation("com.google.android.libraries.identity.googleid:googleid:1.2.0")
     implementation("com.google.code.gson:gson:2.14.0")
+    implementation("com.squareup.okhttp3:okhttp:5.3.0")
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("org.json:json:20250517")
@@ -195,6 +235,10 @@ val openApiGenerateTask = tasks.named<GenerateTask>("openApiGenerate")
 androidComponents.onVariants { variant ->
     variant.sources.kotlin?.addGeneratedSourceDirectory(
         openApiGenerateTask,
+        GenerateTask::outputDir,
+    )
+    variant.sources.kotlin?.addGeneratedSourceDirectory(
+        openApiGenerateLegacyV04,
         GenerateTask::outputDir,
     )
     variant.sources.kotlin?.addGeneratedSourceDirectory(

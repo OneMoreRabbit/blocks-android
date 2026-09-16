@@ -1055,6 +1055,9 @@ class MainActivity : ComponentActivity() {
         background = roundedBackground(brandColor(R.color.blocks_white), brandColor(R.color.blocks_line), 10f)
         addView(label(link.title, 17f, brandColor(R.color.blocks_ink)).apply { typeface = manropeTypeface })
         addView(label(link.uri, 13f, brandColor(R.color.blocks_muted)).apply { setTextIsSelectable(true) })
+        if (link.requiresReconciliation) {
+            addView(label("Update this link before it can sync.", 12f, brandColor(R.color.blocks_ink)))
+        }
         addView(LinearLayout(this@MainActivity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.END

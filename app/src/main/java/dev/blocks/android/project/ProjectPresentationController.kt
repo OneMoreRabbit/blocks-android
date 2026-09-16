@@ -866,7 +866,8 @@ class ProjectPresentationController(
         val pending = result.pendingLegacyOperations +
             result.pendingProjectOperations +
             result.pendingBlockOperations +
-            result.pendingItemOperations
+            result.pendingItemOperations +
+            result.pendingNavigationAliases
         val preferences = workspace.uiPreferences(active)
         state = state.copy(
             activeProjects = result.cache.activeProjects.sortedBy { it.name.lowercase() },

@@ -13,7 +13,7 @@ import org.junit.Test
 
 class ProjectApiClientTest {
     @Test
-    fun sendsApi04NotesAndParkingToTenantScopedProjectRoutes() {
+    fun sendsLegacyNotesAndParkingToTenantScopedProjectRoutesWithApi06Negotiation() {
         val captured = mutableListOf<Request>()
         val server = server(captured::add)
         try {
@@ -39,8 +39,55 @@ class ProjectApiClientTest {
             assertEquals("POST", captured[1].method)
             assertEquals("/v1/tenants/$tenant/projects/$project/parking", captured[1].path)
             assertEquals("parking-key", captured[1].idempotencyKey)
-            assertEquals(listOf("0.4", "0.4"), captured.map { it.clientVersion })
+            assertEquals(listOf("0.6", "0.6"), captured.map { it.clientVersion })
             assertTrue(captured.all { it.authorization == "Bearer token" })
+        } finally {
+            server.stop(0)
+        }
+    }
+
+    @Test
+    fun sendsApi06ItemsAndAliasesOnlyThroughTenantAndProjectScopedBodies() {
+        val captured = mutableListOf<Request>()
+        val server = server(captured::add)
+        try {
+            val client = ProjectApiClient(URI("http://127.0.0.1:${server.address.port}"))
+            val tenant = "tenant-a"
+            val project = "project-a"
+            val item = "item-a"
+            val key = "navigation-secret"
+
+            client.createNote("token", tenant, project, """{"operation_id":"create-a"}""")
+            client.editNote("token", tenant, project, item, 3, """{"operation_id":"edit-a"}""")
+            client.pinNote("token", tenant, project, item, 4, """{"operation_id":"pin-a"}""")
+            client.deleteNote("token", tenant, project, item, 5, """{"operation_id":"delete-a"}""")
+            client.createLink("token", tenant, project, """{"operation_id":"link-a"}""")
+            client.editLink("token", tenant, project, item, 6, """{"operation_id":"link-b"}""")
+            client.deleteLink("token", tenant, project, item, 7, """{"operation_id":"link-c"}""")
+            client.attachNavigationAlias("token", tenant, project, """{"key":"$key"}""")
+            client.resolveNavigationAlias("token", tenant, """{"key":"$key"}""")
+
+            assertEquals(
+                listOf("POST", "PATCH", "PUT", "POST", "POST", "PATCH", "POST", "POST", "POST"),
+                captured.map { it.method },
+            )
+            assertEquals(
+                listOf(
+                    "/v1/tenants/$tenant/projects/$project/items/notes",
+                    "/v1/tenants/$tenant/projects/$project/items/notes/$item",
+                    "/v1/tenants/$tenant/projects/$project/items/notes/$item/pin",
+                    "/v1/tenants/$tenant/projects/$project/items/notes/$item/delete",
+                    "/v1/tenants/$tenant/projects/$project/items/links",
+                    "/v1/tenants/$tenant/projects/$project/items/links/$item",
+                    "/v1/tenants/$tenant/projects/$project/items/links/$item/delete",
+                    "/v1/tenants/$tenant/projects/$project/navigation-aliases",
+                    "/v1/tenants/$tenant/projects/resolve-key",
+                ),
+                captured.map { it.path },
+            )
+            assertEquals(listOf(null, "3", "4", "5", null, "6", "7", null, null), captured.map { it.ifMatch })
+            assertTrue(captured.none { it.path.contains(key) || it.query?.contains(key) == true })
+            assertEquals(listOf("0.6"), captured.map { it.clientVersion }.distinct())
         } finally {
             server.stop(0)
         }

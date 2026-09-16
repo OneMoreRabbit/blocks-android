@@ -1,9 +1,12 @@
 package dev.blocks.android.api
 
-import java.net.HttpURLConnection
 import java.net.URI
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 
-/** API 0.4 transport. It intentionally exposes no retired session or map route. */
+/** Active API 0.6 transport. It intentionally exposes no retired session or map route. */
 interface ProjectTransport {
     fun listProjects(identityToken: String, tenantId: String, status: String): ApiResponse
     fun createProject(
@@ -55,11 +58,68 @@ interface ProjectTransport {
     fun unbindBlock(identityToken: String, tenantId: String, blockId: String): ApiResponse
     fun lookupBlock(identityToken: String, tenantId: String, body: String): ApiResponse
     fun changes(identityToken: String, tenantId: String, cursor: String?, limit: Int): ApiResponse
+    fun createNote(identityToken: String, tenantId: String, projectId: String, body: String): ApiResponse =
+        throw UnsupportedOperationException("API 0.6 note transport is unavailable")
+    fun readNote(identityToken: String, tenantId: String, projectId: String, itemId: String): ApiResponse =
+        throw UnsupportedOperationException("API 0.6 note transport is unavailable")
+    fun editNote(
+        identityToken: String,
+        tenantId: String,
+        projectId: String,
+        itemId: String,
+        rowVersion: Int,
+        body: String,
+    ): ApiResponse = throw UnsupportedOperationException("API 0.6 note transport is unavailable")
+    fun pinNote(
+        identityToken: String,
+        tenantId: String,
+        projectId: String,
+        itemId: String,
+        rowVersion: Int,
+        body: String,
+    ): ApiResponse = throw UnsupportedOperationException("API 0.6 note transport is unavailable")
+    fun deleteNote(
+        identityToken: String,
+        tenantId: String,
+        projectId: String,
+        itemId: String,
+        rowVersion: Int,
+        body: String,
+    ): ApiResponse = throw UnsupportedOperationException("API 0.6 note transport is unavailable")
+    fun createLink(identityToken: String, tenantId: String, projectId: String, body: String): ApiResponse =
+        throw UnsupportedOperationException("API 0.6 link transport is unavailable")
+    fun readLink(identityToken: String, tenantId: String, projectId: String, itemId: String): ApiResponse =
+        throw UnsupportedOperationException("API 0.6 link transport is unavailable")
+    fun editLink(
+        identityToken: String,
+        tenantId: String,
+        projectId: String,
+        itemId: String,
+        rowVersion: Int,
+        body: String,
+    ): ApiResponse = throw UnsupportedOperationException("API 0.6 link transport is unavailable")
+    fun deleteLink(
+        identityToken: String,
+        tenantId: String,
+        projectId: String,
+        itemId: String,
+        rowVersion: Int,
+        body: String,
+    ): ApiResponse = throw UnsupportedOperationException("API 0.6 link transport is unavailable")
+    fun attachNavigationAlias(
+        identityToken: String,
+        tenantId: String,
+        projectId: String,
+        body: String,
+    ): ApiResponse = throw UnsupportedOperationException("API 0.6 navigation aliases are unavailable")
+    fun resolveNavigationAlias(identityToken: String, tenantId: String, body: String): ApiResponse =
+        throw UnsupportedOperationException("API 0.6 navigation aliases are unavailable")
 }
 
 class ProjectApiClient(
     private val baseUri: URI,
-    private val clientVersion: String = "0.4",
+    private val clientVersion: String = "0.6",
+    private val httpClient: OkHttpClient = OkHttpClient(),
 ) : ProjectTransport {
     override fun listProjects(identityToken: String, tenantId: String, status: String) = request(
         "GET",
@@ -201,6 +261,117 @@ class ProjectApiClient(
         return request("GET", "/v1/tenants/${encoded(tenantId)}/changes?$query", identityToken)
     }
 
+    override fun createNote(identityToken: String, tenantId: String, projectId: String, body: String) = request(
+        "POST",
+        "${itemPath(tenantId, projectId, "notes")}",
+        identityToken,
+        body,
+    )
+
+    override fun readNote(identityToken: String, tenantId: String, projectId: String, itemId: String) = request(
+        "GET",
+        "${itemPath(tenantId, projectId, "notes")}/${encoded(itemId)}",
+        identityToken,
+    )
+
+    override fun editNote(
+        identityToken: String,
+        tenantId: String,
+        projectId: String,
+        itemId: String,
+        rowVersion: Int,
+        body: String,
+    ) = itemMutation("PATCH", "notes", null, identityToken, tenantId, projectId, itemId, rowVersion, body)
+
+    override fun pinNote(
+        identityToken: String,
+        tenantId: String,
+        projectId: String,
+        itemId: String,
+        rowVersion: Int,
+        body: String,
+    ) = itemMutation("PUT", "notes", "pin", identityToken, tenantId, projectId, itemId, rowVersion, body)
+
+    override fun deleteNote(
+        identityToken: String,
+        tenantId: String,
+        projectId: String,
+        itemId: String,
+        rowVersion: Int,
+        body: String,
+    ) = itemMutation("POST", "notes", "delete", identityToken, tenantId, projectId, itemId, rowVersion, body)
+
+    override fun createLink(identityToken: String, tenantId: String, projectId: String, body: String) = request(
+        "POST",
+        itemPath(tenantId, projectId, "links"),
+        identityToken,
+        body,
+    )
+
+    override fun readLink(identityToken: String, tenantId: String, projectId: String, itemId: String) = request(
+        "GET",
+        "${itemPath(tenantId, projectId, "links")}/${encoded(itemId)}",
+        identityToken,
+    )
+
+    override fun editLink(
+        identityToken: String,
+        tenantId: String,
+        projectId: String,
+        itemId: String,
+        rowVersion: Int,
+        body: String,
+    ) = itemMutation("PATCH", "links", null, identityToken, tenantId, projectId, itemId, rowVersion, body)
+
+    override fun deleteLink(
+        identityToken: String,
+        tenantId: String,
+        projectId: String,
+        itemId: String,
+        rowVersion: Int,
+        body: String,
+    ) = itemMutation("POST", "links", "delete", identityToken, tenantId, projectId, itemId, rowVersion, body)
+
+    override fun attachNavigationAlias(
+        identityToken: String,
+        tenantId: String,
+        projectId: String,
+        body: String,
+    ) = request(
+        "POST",
+        "${projectPath(tenantId, projectId)}/navigation-aliases",
+        identityToken,
+        body,
+    )
+
+    override fun resolveNavigationAlias(identityToken: String, tenantId: String, body: String) = request(
+        "POST",
+        "/v1/tenants/${encoded(tenantId)}/projects/resolve-key",
+        identityToken,
+        body,
+    )
+
+    private fun itemMutation(
+        method: String,
+        kind: String,
+        action: String?,
+        identityToken: String,
+        tenantId: String,
+        projectId: String,
+        itemId: String,
+        rowVersion: Int,
+        body: String,
+    ): ApiResponse {
+        val suffix = action?.let { "/$it" }.orEmpty()
+        return request(
+            method,
+            "${itemPath(tenantId, projectId, kind)}/${encoded(itemId)}$suffix",
+            identityToken,
+            body,
+            mapOf("If-Match" to rowVersion.toString()),
+        )
+    }
+
     private fun versionedProjectAction(
         action: String,
         identityToken: String,
@@ -217,6 +388,9 @@ class ProjectApiClient(
     private fun projectPath(tenantId: String, projectId: String) =
         "/v1/tenants/${encoded(tenantId)}/projects/${encoded(projectId)}"
 
+    private fun itemPath(tenantId: String, projectId: String, kind: String) =
+        "${projectPath(tenantId, projectId)}/items/$kind"
+
     private fun request(
         method: String,
         path: String,
@@ -224,25 +398,20 @@ class ProjectApiClient(
         body: String? = null,
         headers: Map<String, String> = emptyMap(),
     ): ApiResponse {
-        val connection = baseUri.resolve(path).toURL().openConnection() as HttpURLConnection
-        return try {
-            connection.requestMethod = method
-            connection.setRequestProperty("Authorization", "Bearer $token")
-            connection.setRequestProperty("Accept", "application/json")
-            connection.setRequestProperty("X-Blocks-Client-Version", clientVersion)
-            headers.forEach(connection::setRequestProperty)
-            connection.connectTimeout = 10_000
-            connection.readTimeout = 10_000
-            if (body != null) {
-                connection.doOutput = true
-                connection.setRequestProperty("Content-Type", "application/json")
-                connection.outputStream.bufferedWriter(Charsets.UTF_8).use { it.write(body) }
-            }
-            val status = connection.responseCode
-            val responseBody = (if (status in 200..299) connection.inputStream else connection.errorStream)
-                ?.bufferedReader(Charsets.UTF_8)
-                ?.use { it.readText() }
-                .orEmpty()
+        val mediaType = "application/json; charset=utf-8".toMediaType()
+        val requestBody = body?.toRequestBody(mediaType)
+            ?: if (method in METHODS_REQUIRING_BODY) "".toRequestBody(mediaType) else null
+        val request = Request.Builder()
+            .url(baseUri.resolve(path).toString())
+            .header("Authorization", "Bearer $token")
+            .header("Accept", "application/json")
+            .header("X-Blocks-Client-Version", clientVersion)
+            .apply { headers.forEach(::header) }
+            .method(method, requestBody)
+            .build()
+        return httpClient.newCall(request).execute().use { response ->
+            val status = response.code
+            val responseBody = response.body.string()
             if (status in 200..299) {
                 ApiResponse.Success(status, responseBody)
             } else {
@@ -251,11 +420,13 @@ class ProjectApiClient(
                     parseApiError(responseBody) ?: ApiError(ApiErrorCode.UNKNOWN, "Unparseable service error"),
                 )
             }
-        } finally {
-            connection.disconnect()
         }
     }
 
     private fun encoded(value: String) =
         java.net.URLEncoder.encode(value, Charsets.UTF_8.name()).replace("+", "%20")
+
+    private companion object {
+        val METHODS_REQUIRING_BODY = setOf("POST", "PUT", "PATCH")
+    }
 }

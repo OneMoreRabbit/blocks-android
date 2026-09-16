@@ -2,22 +2,36 @@ package dev.blocks.android.api
 
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
-import dev.blocks.android.api.generated.v04.model.BindIn
-import dev.blocks.android.api.generated.v04.model.BindingOut
-import dev.blocks.android.api.generated.v04.model.BlockIn
-import dev.blocks.android.api.generated.v04.model.BlockOut
-import dev.blocks.android.api.generated.v04.model.ChangesOut
-import dev.blocks.android.api.generated.v04.model.LookupIn
-import dev.blocks.android.api.generated.v04.model.LookupOut
-import dev.blocks.android.api.generated.v04.model.NotesIn
-import dev.blocks.android.api.generated.v04.model.NotesOut
-import dev.blocks.android.api.generated.v04.model.ProjectIn
-import dev.blocks.android.api.generated.v04.model.ProjectOut
-import dev.blocks.android.api.generated.v04.model.ProjectPageOut
-import dev.blocks.android.api.generated.v04.model.ProjectParkIn
-import dev.blocks.android.api.generated.v04.model.ProjectParkingOut
-import dev.blocks.android.api.generated.v04.model.ProjectRename
-import dev.blocks.android.api.generated.v04.model.RegisteredBlockOut
+import dev.blocks.android.api.generated.v06.model.AliasIn
+import dev.blocks.android.api.generated.v06.model.AliasOut
+import dev.blocks.android.api.generated.v06.model.BindIn
+import dev.blocks.android.api.generated.v06.model.BindingOut
+import dev.blocks.android.api.generated.v06.model.BlockOut
+import dev.blocks.android.api.generated.v06.model.ChangesOut
+import dev.blocks.android.api.generated.v06.model.DeleteIn
+import dev.blocks.android.api.generated.v06.model.LinkAck
+import dev.blocks.android.api.generated.v06.model.LinkCreateIn
+import dev.blocks.android.api.generated.v06.model.LinkEditIn
+import dev.blocks.android.api.generated.v06.model.LinkOut
+import dev.blocks.android.api.generated.v06.model.LegacyBlockIn
+import dev.blocks.android.api.generated.v06.model.LookupIn
+import dev.blocks.android.api.generated.v06.model.LookupOut
+import dev.blocks.android.api.generated.v06.model.NoteAck
+import dev.blocks.android.api.generated.v06.model.NoteCreateIn
+import dev.blocks.android.api.generated.v06.model.NoteEditIn
+import dev.blocks.android.api.generated.v06.model.NoteOut
+import dev.blocks.android.api.generated.v06.model.NotePinIn
+import dev.blocks.android.api.generated.v06.model.NotesIn
+import dev.blocks.android.api.generated.v06.model.NotesOut
+import dev.blocks.android.api.generated.v06.model.ProjectIn
+import dev.blocks.android.api.generated.v06.model.ProjectOut
+import dev.blocks.android.api.generated.v06.model.ProjectPageOut
+import dev.blocks.android.api.generated.v06.model.ProjectParkIn
+import dev.blocks.android.api.generated.v06.model.ProjectParkingOut
+import dev.blocks.android.api.generated.v06.model.ProjectRename
+import dev.blocks.android.api.generated.v06.model.RegisteredBlockOut
+import dev.blocks.android.api.generated.v06.model.ResolveKeyIn
+import dev.blocks.android.api.generated.v06.model.ResolveKeyOut
 import dev.blocks.android.mvp.ChangeEvent
 import dev.blocks.android.mvp.ChangePage
 import dev.blocks.android.mvp.ParkingDraft
@@ -26,15 +40,20 @@ import dev.blocks.android.project.BlockBinding
 import dev.blocks.android.project.BlockLookup
 import dev.blocks.android.project.PhysicalBlock
 import dev.blocks.android.project.ProjectLifecycle
+import dev.blocks.android.project.ProjectItemAcknowledgement
+import dev.blocks.android.project.ProjectItemMutation
+import dev.blocks.android.project.ProjectNoteItem
 import dev.blocks.android.project.ProjectNotes
 import dev.blocks.android.project.ProjectPage
 import dev.blocks.android.project.ProjectParking
+import dev.blocks.android.project.ProjectResourceLink
 import dev.blocks.android.project.ProjectService
 import dev.blocks.android.project.ProjectSummary
 import dev.blocks.android.project.RegisteredBlock
+import dev.blocks.android.tag.ProjectKey
 import java.util.UUID
 
-/** Maps generated API 0.4 transport models into Android-owned project-domain models. */
+/** Maps generated API 0.6 transport models into Android-owned project-domain models. */
 class ServiceProjectRepository(
     private val client: ProjectTransport,
     private val json: Gson = Gson(),
@@ -179,7 +198,7 @@ class ServiceProjectRepository(
                 client.registerBlock(
                     session.identityToken,
                     session.tenantId,
-                    json.toJson(BlockIn(label)),
+                    json.toJson(LegacyBlockIn(label)),
                     idempotencyKey,
                 ).successBody(),
                 RegisteredBlockOut::class.java,
@@ -249,6 +268,189 @@ class ServiceProjectRepository(
         }
     }
 
+    override fun createNote(session: Session, operation: ProjectItemMutation): ProjectItemAcknowledgement.Note =
+        decodeContract {
+            json.fromJson(
+                client.createNote(
+                    session.identityToken,
+                    session.tenantId,
+                    operation.projectId,
+                    json.toJson(
+                        NoteCreateIn(
+                            body = requireNotNull(operation.noteBody),
+                            id = UUID.fromString(operation.targetId),
+                            operationId = UUID.fromString(operation.operationId),
+                        ),
+                    ),
+                ).successBody(),
+                NoteAck::class.java,
+            ).toAcknowledgement(session, operation)
+        }
+
+    override fun editNote(session: Session, operation: ProjectItemMutation): ProjectItemAcknowledgement.Note =
+        noteMutation(session, operation) { body ->
+            client.editNote(
+                session.identityToken,
+                session.tenantId,
+                operation.projectId,
+                operation.targetId,
+                requireNotNull(operation.ifMatch),
+                body,
+            )
+        }
+
+    override fun pinNote(session: Session, operation: ProjectItemMutation): ProjectItemAcknowledgement.Note =
+        noteMutation(session, operation) { body ->
+            client.pinNote(
+                session.identityToken,
+                session.tenantId,
+                operation.projectId,
+                operation.targetId,
+                requireNotNull(operation.ifMatch),
+                body,
+            )
+        }
+
+    override fun deleteNote(session: Session, operation: ProjectItemMutation): ProjectItemAcknowledgement.Note =
+        noteMutation(session, operation) { body ->
+            client.deleteNote(
+                session.identityToken,
+                session.tenantId,
+                operation.projectId,
+                operation.targetId,
+                requireNotNull(operation.ifMatch),
+                body,
+            )
+        }
+
+    override fun readNote(session: Session, projectId: String, noteId: String): ProjectNoteItem = decodeContract {
+        json.fromJson(
+            client.readNote(session.identityToken, session.tenantId, projectId, noteId).successBody(),
+            NoteOut::class.java,
+        ).toNote(session, projectId, noteId)
+    }
+
+    override fun createLink(session: Session, operation: ProjectItemMutation): ProjectItemAcknowledgement.Link =
+        decodeContract {
+            json.fromJson(
+                client.createLink(
+                    session.identityToken,
+                    session.tenantId,
+                    operation.projectId,
+                    json.toJson(
+                        LinkCreateIn(
+                            id = UUID.fromString(operation.targetId),
+                            operationId = UUID.fromString(operation.operationId),
+                            title = requireNotNull(operation.linkTitle),
+                            uri = requireNotNull(operation.linkUri),
+                        ),
+                    ),
+                ).successBody(),
+                LinkAck::class.java,
+            ).toAcknowledgement(session, operation)
+        }
+
+    override fun editLink(session: Session, operation: ProjectItemMutation): ProjectItemAcknowledgement.Link =
+        linkMutation(session, operation) { body ->
+            client.editLink(
+                session.identityToken,
+                session.tenantId,
+                operation.projectId,
+                operation.targetId,
+                requireNotNull(operation.ifMatch),
+                body,
+            )
+        }
+
+    override fun deleteLink(session: Session, operation: ProjectItemMutation): ProjectItemAcknowledgement.Link =
+        linkMutation(session, operation) { body ->
+            client.deleteLink(
+                session.identityToken,
+                session.tenantId,
+                operation.projectId,
+                operation.targetId,
+                requireNotNull(operation.ifMatch),
+                body,
+            )
+        }
+
+    override fun readLink(session: Session, projectId: String, linkId: String): ProjectResourceLink = decodeContract {
+        json.fromJson(
+            client.readLink(session.identityToken, session.tenantId, projectId, linkId).successBody(),
+            LinkOut::class.java,
+        ).toLink(session, projectId, linkId)
+    }
+
+    override fun attachNavigationKey(session: Session, projectId: String, key: ProjectKey): ProjectKey =
+        decodeContract {
+            json.fromJson(
+                client.attachNavigationAlias(
+                    session.identityToken,
+                    session.tenantId,
+                    projectId,
+                    json.toJson(AliasIn(UUID.fromString(key.encoded))),
+                ).successBody(),
+                AliasOut::class.java,
+            ).let { alias ->
+                check(alias.projectId.toString() == projectId && alias.projectKey.toString() == key.encoded) {
+                    "Service returned an unexpected navigation alias"
+                }
+                key
+            }
+        }
+
+    override fun resolveNavigationKey(session: Session, key: ProjectKey): String? = decodeContract {
+        try {
+            json.fromJson(
+                client.resolveNavigationAlias(
+                    session.identityToken,
+                    session.tenantId,
+                    json.toJson(ResolveKeyIn(UUID.fromString(key.encoded))),
+                ).successBody(),
+                ResolveKeyOut::class.java,
+            ).projectId.toString()
+        } catch (error: ServiceException) {
+            if (error.status == 404) null else throw error
+        }
+    }
+
+    private fun noteMutation(
+        session: Session,
+        operation: ProjectItemMutation,
+        send: (String) -> ApiResponse,
+    ): ProjectItemAcknowledgement.Note = decodeContract {
+        val request = when (operation.type) {
+            dev.blocks.android.project.ProjectItemMutationType.EDIT_NOTE ->
+                NoteEditIn(requireNotNull(operation.noteBody), UUID.fromString(operation.operationId))
+            dev.blocks.android.project.ProjectItemMutationType.PIN_NOTE ->
+                NotePinIn(UUID.fromString(operation.operationId), requireNotNull(operation.pinned))
+            dev.blocks.android.project.ProjectItemMutationType.DELETE_NOTE ->
+                DeleteIn(UUID.fromString(operation.operationId))
+            else -> error("Unsupported note mutation ${operation.type}")
+        }
+        json.fromJson(send(json.toJson(request)).successBody(), NoteAck::class.java)
+            .toAcknowledgement(session, operation)
+    }
+
+    private fun linkMutation(
+        session: Session,
+        operation: ProjectItemMutation,
+        send: (String) -> ApiResponse,
+    ): ProjectItemAcknowledgement.Link = decodeContract {
+        val request = when (operation.type) {
+            dev.blocks.android.project.ProjectItemMutationType.EDIT_LINK -> LinkEditIn(
+                UUID.fromString(operation.operationId),
+                requireNotNull(operation.linkTitle),
+                requireNotNull(operation.linkUri),
+            )
+            dev.blocks.android.project.ProjectItemMutationType.DELETE_LINK ->
+                DeleteIn(UUID.fromString(operation.operationId))
+            else -> error("Unsupported link mutation ${operation.type}")
+        }
+        json.fromJson(send(json.toJson(request)).successBody(), LinkAck::class.java)
+            .toAcknowledgement(session, operation)
+    }
+
     private fun projectAction(
         session: Session,
         projectId: String,
@@ -289,6 +491,109 @@ class ServiceProjectRepository(
             updatedAt = updatedAt,
             archivedAt = archivedAt,
             clientId = clientId?.toString(),
+            navigationKey = navigationKey?.toString(),
+        )
+    }
+
+    private fun NoteOut.toNote(
+        session: Session,
+        expectedProjectId: String,
+        expectedItemId: String,
+    ): ProjectNoteItem {
+        check(tenantId.toString() == session.tenantId) { "Service returned a note from another tenant" }
+        check(projectId.toString() == expectedProjectId && id.toString() == expectedItemId) {
+            "Service returned an unexpected note identity"
+        }
+        return ProjectNoteItem(
+            id = id.toString(),
+            projectId = projectId.toString(),
+            body = body,
+            pinned = pinned,
+            authoredByUserId = authoredByUserId?.toString(),
+            createdAt = createdAt,
+            updatedAt = updatedAt,
+            rowVersion = rowVersion,
+            deletedAt = deletedAt,
+            lastOperationId = lastOperationId.toString(),
+        )
+    }
+
+    private fun NoteAck.toAcknowledgement(
+        session: Session,
+        expected: ProjectItemMutation,
+    ): ProjectItemAcknowledgement.Note {
+        check(tenantId.toString() == session.tenantId) { "Service acknowledged a note from another tenant" }
+        check(projectId.toString() == expected.projectId && id.toString() == expected.targetId) {
+            "Service acknowledged an unexpected note identity"
+        }
+        check(operationId.toString() == expected.operationId) {
+            "Service acknowledged a different note operation"
+        }
+        return ProjectItemAcknowledgement.Note(
+            operationId = operationId.toString(),
+            item = ProjectNoteItem(
+                id = id.toString(),
+                projectId = projectId.toString(),
+                body = body,
+                pinned = pinned,
+                authoredByUserId = authoredByUserId?.toString(),
+                createdAt = createdAt,
+                updatedAt = updatedAt,
+                rowVersion = rowVersion,
+                deletedAt = deletedAt,
+                lastOperationId = lastOperationId.toString(),
+            ),
+        )
+    }
+
+    private fun LinkOut.toLink(
+        session: Session,
+        expectedProjectId: String,
+        expectedItemId: String,
+    ): ProjectResourceLink {
+        check(tenantId.toString() == session.tenantId) { "Service returned a link from another tenant" }
+        check(projectId.toString() == expectedProjectId && id.toString() == expectedItemId) {
+            "Service returned an unexpected link identity"
+        }
+        return ProjectResourceLink(
+            id = id.toString(),
+            projectId = projectId.toString(),
+            title = title,
+            uri = uri,
+            createdAt = createdAt,
+            updatedAt = updatedAt,
+            rowVersion = rowVersion,
+            deletedAt = deletedAt,
+            lastOperationId = lastOperationId.toString(),
+            requiresReconciliation = !dev.blocks.android.project.ProjectResourceUri.canLaunch(uri),
+        )
+    }
+
+    private fun LinkAck.toAcknowledgement(
+        session: Session,
+        expected: ProjectItemMutation,
+    ): ProjectItemAcknowledgement.Link {
+        check(tenantId.toString() == session.tenantId) { "Service acknowledged a link from another tenant" }
+        check(projectId.toString() == expected.projectId && id.toString() == expected.targetId) {
+            "Service acknowledged an unexpected link identity"
+        }
+        check(operationId.toString() == expected.operationId) {
+            "Service acknowledged a different link operation"
+        }
+        return ProjectItemAcknowledgement.Link(
+            operationId = operationId.toString(),
+            item = ProjectResourceLink(
+                id = id.toString(),
+                projectId = projectId.toString(),
+                title = title,
+                uri = uri,
+                createdAt = createdAt,
+                updatedAt = updatedAt,
+                rowVersion = rowVersion,
+                deletedAt = deletedAt,
+                lastOperationId = lastOperationId.toString(),
+                requiresReconciliation = !dev.blocks.android.project.ProjectResourceUri.canLaunch(uri),
+            ),
         )
     }
 
