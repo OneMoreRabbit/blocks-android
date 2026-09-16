@@ -1254,10 +1254,42 @@ class MainActivityPresentationTest {
             first.onActivity { activity ->
                 activity.findViewById<EditText>(ProjectUiIds.PARKING_LOCATION).setText("Workbench")
                 activity.findViewById<EditText>(ProjectUiIds.PARKING_NEXT_ACTION).setText("Fit bracket")
-                activity.findViewById<EditText>(ProjectUiIds.PARKING_MUST_NOT_FORGET).setText("Bring screws")
-                activity.findViewById<Button>(ProjectUiIds.SAVE_PARKING).performClick()
+                val finalField = activity.findViewById<EditText>(ProjectUiIds.PARKING_MUST_NOT_FORGET)
+                finalField.setText("Bring screws")
+                finalField.requestFocus()
+                activity.getSystemService(InputMethodManager::class.java).showSoftInput(
+                    finalField,
+                    InputMethodManager.SHOW_IMPLICIT,
+                )
+            }
+            waitFor(first) { activity ->
+                ViewCompat.getRootWindowInsets(activity.findViewById(ProjectUiIds.PARKING_MUST_NOT_FORGET))
+                    ?.isVisible(WindowInsetsCompat.Type.ime()) == true
+            }
+            first.onActivity { activity ->
+                val field = activity.findViewById<EditText>(ProjectUiIds.PARKING_MUST_NOT_FORGET)
+                assertTrue(
+                    ViewCompat.getRootWindowInsets(field)
+                        ?.isVisible(WindowInsetsCompat.Type.ime()) == true,
+                )
+                val save = activity.findViewById<Button>(ProjectUiIds.SAVE_PARKING)
+                assertTrue(save.isShown && save.height > 0)
+                save.performClick()
             }
             waitUntil { presentationController.state.projectPage?.newestParking?.location == "Workbench" }
+            waitFor(first) { activity ->
+                activity.texts().toSet().containsAll(listOf("Workbench", "Fit bracket", "Bring screws"))
+            }
+            val persistedAfterPark = AndroidSyncStateStore(context).loadSyncState(TENANT_ID).projectCache
+            assertEquals(
+                1,
+                persistedAfterPark.commands.count { it.type == ProjectMutationType.ADD_PARKING },
+            )
+            assertEquals(
+                ParkingDraft("Workbench", "Fit bracket", "Bring screws"),
+                persistedAfterPark.commands.single { it.type == ProjectMutationType.ADD_PARKING }.parking,
+            )
+            assertEquals("Workbench", persistedAfterPark.parkingRecords.single().location)
             first.onActivity { activity ->
                 val projectId = requireNotNull(presentationController.state.projectPage).project.id
                 activity.importCover(projectId, Uri.parse("content://test/real-store-cover"))
@@ -1551,11 +1583,13 @@ class MainActivityPresentationTest {
     }
 
     @Test
-    fun parkUsesSharedBackAndKeyboardVisibleTopSave() {
+    fun parkBackWithKeyboardVisibleCreatesNoParkOrQueueMutation() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             scenario.onActivity { it.button("Active project").performClick() }
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            val commandsBefore = workspace.cache.commands.size
+            val parkingBefore = workspace.cache.parkingRecords.size
             scenario.onActivity { activity ->
                 assertEquals("Back", activity.findViewById<Button>(ProjectUiIds.MAIN).contentDescription)
                 activity.findViewById<Button>(ProjectUiIds.PARK).performClick()
@@ -1583,6 +1617,9 @@ class MainActivityPresentationTest {
                 activity.findViewById<Button>(ProjectUiIds.BACK).performClick()
             }
             waitFor(scenario) { it.findViewById<Button>(ProjectUiIds.PARK) != null }
+            assertEquals(commandsBefore, workspace.cache.commands.size)
+            assertEquals(parkingBefore, workspace.cache.parkingRecords.size)
+            assertTrue(workspace.mutations.isEmpty())
         }
     }
 
