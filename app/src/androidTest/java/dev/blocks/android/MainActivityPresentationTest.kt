@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.Context
 import android.content.res.Configuration
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
 import android.net.Uri
 import android.nfc.NfcAdapter
@@ -875,6 +876,81 @@ class MainActivityPresentationTest {
                     ),
                     (0 until items.count).map { items.getItem(it).toString() },
                 )
+            }
+        }
+    }
+
+    @Test
+    fun dashboardAndProjectRenderTheSameCentredCogWithFortyEightDpTouchTargets() {
+        var dashboardGlyph: IntArray? = null
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { activity ->
+                val settings = activity.findViewById<Button>(ProjectUiIds.SETTINGS)
+                val minimumTouch = (48 * activity.resources.displayMetrics.density).toInt()
+                assertTrue(settings.minimumWidth >= minimumTouch)
+                assertTrue(settings.minimumHeight >= minimumTouch)
+                dashboardGlyph = renderAlpha(settings.compoundDrawablesRelative[0])
+                assertCentredCog(requireNotNull(dashboardGlyph))
+                activity.button("Active project").performClick()
+            }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            scenario.onActivity { activity ->
+                val settings = activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS)
+                val minimumTouch = (48 * activity.resources.displayMetrics.density).toInt()
+                assertTrue(settings.minimumWidth >= minimumTouch)
+                assertTrue(settings.minimumHeight >= minimumTouch)
+                val projectGlyph = renderAlpha(settings.compoundDrawablesRelative[0])
+                assertCentredCog(projectGlyph)
+                assertTrue(requireNotNull(dashboardGlyph).contentEquals(projectGlyph))
+            }
+        }
+    }
+
+    @Test
+    fun ordinaryActivityUsesImmutableOccurrenceTimeAndStableIdentityInsteadOfEditTime() {
+        workspace.cache = workspace.cache.copy(
+            noteItems = listOf(
+                ProjectNoteItem(
+                    "10000000-0000-4000-8000-000000000001",
+                    PROJECT_ID,
+                    "Older note edited later",
+                    false,
+                    "local",
+                    "2026-09-16T09:00:00Z",
+                    "2026-09-16T15:00:00Z",
+                ),
+                ProjectNoteItem(
+                    "20000000-0000-4000-8000-000000000002",
+                    PROJECT_ID,
+                    "Newest note",
+                    false,
+                    "local",
+                    "2026-09-16T14:00:00Z",
+                    "2026-09-16T14:00:00Z",
+                ),
+            ),
+            parkingRecords = listOf(
+                ProjectParking(
+                    "30000000-0000-4000-8000-000000000003",
+                    PROJECT_ID,
+                    "Middle parking record",
+                    "Continue",
+                    "Remember",
+                    "local",
+                    "2026-09-16T12:00:00Z",
+                ),
+            ),
+        )
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { it.button("Active project").performClick() }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            scenario.onActivity { activity ->
+                val activityRows = activity.findViewById<LinearLayout>(ProjectUiIds.PROJECT_ACTIVITY)
+                assertTrue(descendantText(activityRows.getChildAt(0)).contains("Newest note"))
+                assertTrue(descendantText(activityRows.getChildAt(1)).contains("Middle parking record"))
+                assertTrue(descendantText(activityRows.getChildAt(2)).contains("Older note edited later"))
             }
         }
     }
@@ -2193,6 +2269,34 @@ class MainActivityPresentationTest {
         var met = false
         scenario.onActivity { met = condition(it) }
         met
+    }
+
+    private fun renderAlpha(drawable: android.graphics.drawable.Drawable): IntArray {
+        val size = 96
+        val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        drawable.setBounds(0, 0, size, size)
+        drawable.draw(Canvas(bitmap))
+        return IntArray(size * size).also { bitmap.getPixels(it, 0, size, 0, 0, size, size) }
+            .map { Color.alpha(it) }.toIntArray().also { bitmap.recycle() }
+    }
+
+    private fun assertCentredCog(alpha: IntArray) {
+        val size = 96
+        val occupied = alpha.indices.filter { alpha[it] > 0 }
+        assertTrue(occupied.isNotEmpty())
+        val minX = occupied.minOf { it % size }
+        val maxX = occupied.maxOf { it % size }
+        val minY = occupied.minOf { it / size }
+        val maxY = occupied.maxOf { it / size }
+        assertTrue(kotlin.math.abs((minX + maxX) - (size - 1)) <= 2)
+        assertTrue(kotlin.math.abs((minY + maxY) - (size - 1)) <= 2)
+        assertEquals(0, alpha[(size / 2) * size + size / 2])
+    }
+
+    private fun descendantText(view: View): String = when (view) {
+        is android.widget.TextView -> view.text.toString()
+        is ViewGroup -> (0 until view.childCount).joinToString(" ") { descendantText(view.getChildAt(it)) }
+        else -> ""
     }
 
     private fun waitUntil(condition: () -> Boolean) {

@@ -11,6 +11,7 @@ import dev.blocks.android.mvp.ChangeEvent
 import dev.blocks.android.mvp.ChangePage
 import dev.blocks.android.mvp.DraftStore
 import dev.blocks.android.mvp.FormDrafts
+import dev.blocks.android.mvp.NoteItemDraft
 import dev.blocks.android.mvp.MembershipRevokedException
 import dev.blocks.android.mvp.OfflineOperation
 import dev.blocks.android.mvp.OutcomeTier
@@ -32,11 +33,14 @@ import dev.blocks.android.project.PhysicalBlock
 import dev.blocks.android.project.ProjectCacheState
 import dev.blocks.android.project.ProjectCoverContent
 import dev.blocks.android.project.ProjectIdentityMapping
+import dev.blocks.android.project.ProjectItemAcknowledgement
+import dev.blocks.android.project.ProjectItemMutation
 import dev.blocks.android.project.ProjectItemMutationType
 import dev.blocks.android.project.ProjectLifecycle
 import dev.blocks.android.project.ProjectMutationType
 import dev.blocks.android.project.ProjectMutationStatus
 import dev.blocks.android.project.ProjectNotes
+import dev.blocks.android.project.ProjectNoteItem
 import dev.blocks.android.project.ProjectPage
 import dev.blocks.android.project.ProjectParking
 import dev.blocks.android.project.ProjectService
@@ -61,6 +65,212 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ProjectSyncRepositoryTest {
+    @Test
+    fun exactItemAcknowledgementsHandOffVersionsAcrossRestartWhileAmbiguityAndConflictStayClosed() {
+        val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
+        val noteId = "90000000-0000-4000-8000-000000000009"
+        var repository = repository(FakeProjectService(), MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+        repository.addNoteItem(SESSION_A, PROJECT_ID, "Created", "create-note", noteId)
+        repository.editNoteItem(SESSION_A, noteId, "Edited", "edit-note")
+        repository.setNoteItemPinned(SESSION_A, noteId, true, "pin-note")
+        repository.deleteNoteItem(SESSION_A, noteId, "delete-note")
+
+        repository.recordProjectItemDeliveryUncertain(SESSION_A, "create-note")
+        var pending = state.loadSyncState(TENANT_A).projectCache.itemOperations
+        assertTrue(pending.first().deliveryUncertain)
+        assertEquals("create-note", pending[1].dependsOnOperationId)
+        assertEquals(null, pending[1].ifMatch)
+
+        repository = repository(FakeProjectService(), MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+        repository.acknowledgeProjectItem(
+            SESSION_A,
+            ProjectItemAcknowledgement.Note(
+                "create-note",
+                ProjectNoteItem(
+                    noteId,
+                    PROJECT_ID,
+                    "Created",
+                    false,
+                    "00000000-0000-4000-8000-000000000111",
+                    "2026-09-16T10:00:00Z",
+                    "2026-09-16T10:00:00Z",
+                    rowVersion = 1,
+                ),
+            ),
+        )
+        pending = state.loadSyncState(TENANT_A).projectCache.itemOperations
+        assertEquals(listOf("edit-note", "pin-note", "delete-note"), pending.map { it.operationId })
+        assertEquals(1, pending[0].ifMatch)
+        assertEquals(null, pending[0].dependsOnOperationId)
+        assertTrue(state.loadSyncState(TENANT_A).projectCache.noteItems.single().deletedAt != null)
+
+        repository = repository(FakeProjectService(), MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+        repository.acknowledgeProjectItem(
+            SESSION_A,
+            ProjectItemAcknowledgement.Note(
+                "edit-note",
+                ProjectNoteItem(
+                    noteId,
+                    PROJECT_ID,
+                    "Edited",
+                    false,
+                    "00000000-0000-4000-8000-000000000111",
+                    "2026-09-16T10:00:00Z",
+                    "2026-09-16T10:01:00Z",
+                    rowVersion = 2,
+                ),
+            ),
+        )
+        pending = state.loadSyncState(TENANT_A).projectCache.itemOperations
+        assertEquals(2, pending[0].ifMatch)
+        assertEquals("pin-note", pending[0].operationId)
+
+        repository = repository(FakeProjectService(), MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+        repository.acknowledgeProjectItem(
+            SESSION_A,
+            ProjectItemAcknowledgement.Note(
+                "pin-note",
+                ProjectNoteItem(
+                    noteId,
+                    PROJECT_ID,
+                    "Edited",
+                    true,
+                    "00000000-0000-4000-8000-000000000111",
+                    "2026-09-16T10:00:00Z",
+                    "2026-09-16T10:02:00Z",
+                    rowVersion = 3,
+                ),
+            ),
+        )
+        pending = state.loadSyncState(TENANT_A).projectCache.itemOperations
+        assertEquals(3, pending.single().ifMatch)
+        assertEquals("delete-note", pending.single().operationId)
+
+        repository = repository(FakeProjectService(), MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+        repository.acknowledgeProjectItem(
+            SESSION_A,
+            ProjectItemAcknowledgement.Note(
+                "delete-note",
+                ProjectNoteItem(
+                    noteId,
+                    PROJECT_ID,
+                    "Edited",
+                    true,
+                    "00000000-0000-4000-8000-000000000111",
+                    "2026-09-16T10:00:00Z",
+                    "2026-09-16T10:03:00Z",
+                    rowVersion = 4,
+                    deletedAt = "2026-09-16T10:03:00Z",
+                ),
+            ),
+        )
+        val completed = state.loadSyncState(TENANT_A).projectCache
+        assertTrue(completed.itemOperations.isEmpty())
+        assertEquals(listOf("create-note", "edit-note", "pin-note", "delete-note"), completed.retiredItemOperationIds)
+
+        val linkId = "91000000-0000-4000-8000-000000000009"
+        repository.addResourceLink(SESSION_A, PROJECT_ID, "First", "https://example.com", "create-link", linkId)
+        repository.editResourceLink(SESSION_A, linkId, "Second", "https://example.com/2", "edit-link")
+        repository.recordProjectItemConflict(SESSION_A, "create-link")
+        assertTrue(
+            runCatching {
+                repository.acknowledgeProjectItem(
+                    SESSION_A,
+                    ProjectItemAcknowledgement.Link(
+                        "create-link",
+                        state.loadSyncState(TENANT_A).projectCache.resourceLinks.single().copy(rowVersion = 1),
+                    ),
+                )
+            }.isFailure,
+        )
+        pending = state.loadSyncState(TENANT_A).projectCache.itemOperations
+        assertEquals(ProjectMutationStatus.REQUIRES_RECONCILIATION, pending[0].status)
+        assertEquals("create-link", pending[1].dependsOnOperationId)
+        assertEquals(null, pending[1].ifMatch)
+    }
+
+    @Test
+    fun canonicalProjectAcknowledgementRemapsOnlyTheDeterministicLegacyNoteIdentityAndEveryReference() {
+        val state = MemoryState()
+        var repository = repository(FakeProjectService(), MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+        val provisionalId = "create-project"
+        repository.queueCreateProject(SESSION_A, "Offline project", provisionalId, provisionalId)
+        repository.queueSaveNotes(SESSION_A, provisionalId, 0, "Legacy singleton", "save-legacy")
+        val userNoteId = "92000000-0000-4000-8000-000000000009"
+        repository.addNoteItem(SESSION_A, provisionalId, "User note", "create-user-note", userNoteId)
+        val provisionalLegacyId = dev.blocks.android.project.legacyNoteItemIdentity(provisionalId)
+        repository.updateProjectDrafts(SESSION_A) {
+            it.copy(
+                projectNoteItems = mapOf(
+                    dev.blocks.android.project.noteItemDraftKey(provisionalId, provisionalLegacyId) to
+                        NoteItemDraft("Pending legacy edit"),
+                ),
+            )
+        }
+        val before = state.loadSyncState(TENANT_A)
+        state.saveSyncState(
+            TENANT_A,
+            before.copy(
+                projectCache = before.projectCache.copy(
+                    noteItems = before.projectCache.noteItems + ProjectNoteItem(
+                        provisionalLegacyId,
+                        provisionalId,
+                        "Legacy singleton",
+                        false,
+                        null,
+                        "2026-09-16T09:00:00Z",
+                        "2026-09-16T09:00:00Z",
+                        rowVersion = 0,
+                        legacySingleton = true,
+                    ),
+                    itemOperations = before.projectCache.itemOperations + ProjectItemMutation(
+                        operationId = "edit-legacy-note",
+                        type = ProjectItemMutationType.EDIT_NOTE,
+                        targetId = provisionalLegacyId,
+                        projectId = provisionalId,
+                        noteBody = "Pending legacy edit",
+                        dependsOnOperationId = provisionalId,
+                        createdAt = "2026-09-16T09:01:00Z",
+                    ),
+                ),
+            ),
+        )
+
+        repository = repository(FakeProjectService(), MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+        repository.backgroundSync(SESSION_A)
+        val canonicalLegacyId = dev.blocks.android.project.legacyNoteItemIdentity(PROJECT_ID)
+        val remapped = state.loadSyncState(TENANT_A)
+        assertEquals(setOf(canonicalLegacyId, userNoteId), remapped.projectCache.noteItems.map { it.id }.toSet())
+        assertTrue(remapped.projectCache.noteItems.none { it.id == provisionalLegacyId || it.projectId == provisionalId })
+        assertEquals(null, remapped.projectCache.noteItems.single { it.id == canonicalLegacyId }.authoredByUserId)
+        assertEquals(userNoteId, remapped.projectCache.noteItems.single { !it.legacySingleton }.id)
+        val operation = remapped.projectCache.itemOperations.single { it.operationId == "edit-legacy-note" }
+        assertEquals(canonicalLegacyId, operation.targetId)
+        assertEquals(PROJECT_ID, operation.projectId)
+        assertEquals(null, operation.dependsOnOperationId)
+        assertEquals(
+            NoteItemDraft("Pending legacy edit"),
+            remapped.projectDrafts.projectNoteItems[
+                dev.blocks.android.project.noteItemDraftKey(PROJECT_ID, canonicalLegacyId)
+            ],
+        )
+        assertTrue(
+            dev.blocks.android.project.noteItemDraftKey(provisionalId, provisionalLegacyId) !in
+                remapped.projectDrafts.projectNoteItems,
+        )
+
+        repository = repository(FakeProjectService(), MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+        assertEquals(setOf(canonicalLegacyId, userNoteId), repository.snapshot(SESSION_A).cache.noteItems.map { it.id }.toSet())
+    }
+
     @Test
     fun noteAndLinkActionsCommitOneLocalProjectionAndOneOrderedApi06IntentWithoutService() {
         val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }

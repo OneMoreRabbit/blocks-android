@@ -6,12 +6,15 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.blocks.android.mvp.FormDrafts
 import dev.blocks.android.mvp.NoteItemDraft
+import dev.blocks.android.mvp.NoOpDraftStore
 import dev.blocks.android.mvp.ParkingDraft
 import dev.blocks.android.mvp.ProjectResourceLinkDraft
+import dev.blocks.android.mvp.Session
 import dev.blocks.android.mvp.TenantSyncState
 import dev.blocks.android.project.ProjectCacheState
 import dev.blocks.android.project.ProjectCover
 import dev.blocks.android.project.ProjectIdentityMapping
+import dev.blocks.android.project.ProjectItemAcknowledgement
 import dev.blocks.android.project.ProjectItemMutation
 import dev.blocks.android.project.ProjectItemMutationType
 import dev.blocks.android.project.ProjectLifecycle
@@ -23,6 +26,10 @@ import dev.blocks.android.project.ProjectPage
 import dev.blocks.android.project.ProjectParking
 import dev.blocks.android.project.ProjectResourceLink
 import dev.blocks.android.project.ProjectSummary
+import dev.blocks.android.project.ProjectService
+import dev.blocks.android.cover.InMemoryProjectCoverMediaStore
+import dev.blocks.android.sync.NoOpLegacyQueueReplay
+import dev.blocks.android.sync.ProjectSyncRepository
 import dev.blocks.android.project.legacyNoteItemIdentity
 import dev.blocks.android.project.noteItemDraftKey
 import dev.blocks.android.project.resourceLinkDraftKey
@@ -160,6 +167,7 @@ class AndroidNormalizedSyncStateStoreTest {
         val note = migrated.projectCache.noteItems.single()
         assertEquals(legacyNoteItemIdentity(PROJECT), note.id)
         assertEquals("Pending singleton note", note.body)
+        assertEquals(null, note.authoredByUserId)
         assertEquals(
             NoteItemDraft("Unsubmitted pending edit"),
             migrated.projectDrafts.projectNoteItems[noteItemDraftKey(PROJECT, note.id)],
@@ -167,6 +175,66 @@ class AndroidNormalizedSyncStateStoreTest {
         assertTrue(migrated.projectDrafts.projectNotes.isEmpty())
         assertEquals(migrated, store.loadSyncState(TENANT))
         assertEquals(1, store.loadSyncState(TENANT).projectCache.noteItems.size)
+    }
+
+    @Test
+    fun realDatabaseKeepsDependentItemClosedThenAtomicallyHandsOffAcknowledgedVersionAcrossRestart() {
+        store.saveSyncState(TENANT, state(TENANT).withoutCommands())
+        val service = java.lang.reflect.Proxy.newProxyInstance(
+            ProjectService::class.java.classLoader,
+            arrayOf(ProjectService::class.java),
+        ) { _, method, _ -> error("Unexpected Service call: ${method.name}") } as ProjectService
+        val session = Session(TENANT, "test-token")
+        val noteId = "70000000-0000-4000-8000-000000000077"
+        var repository = ProjectSyncRepository(
+            service,
+            NoOpLegacyQueueReplay,
+            NoOpDraftStore,
+            store,
+            coverMediaStore = InMemoryProjectCoverMediaStore(),
+        )
+        repository.activate(session)
+        repository.addNoteItem(session, PROJECT, "Created", "create-item", noteId)
+        repository.editNoteItem(session, noteId, "Edited", "edit-item")
+        repository.recordProjectItemDeliveryUncertain(session, "create-item")
+
+        var persisted = store.loadSyncState(TENANT).projectCache
+        assertTrue(persisted.itemOperations.first().deliveryUncertain)
+        assertEquals("create-item", persisted.itemOperations.last().dependsOnOperationId)
+        assertEquals(null, persisted.itemOperations.last().ifMatch)
+
+        repository = ProjectSyncRepository(
+            service,
+            NoOpLegacyQueueReplay,
+            NoOpDraftStore,
+            store,
+            coverMediaStore = InMemoryProjectCoverMediaStore(),
+        )
+        repository.activate(session)
+        repository.acknowledgeProjectItem(
+            session,
+            ProjectItemAcknowledgement.Note(
+                "create-item",
+                ProjectNoteItem(
+                    noteId,
+                    PROJECT,
+                    "Created",
+                    false,
+                    "00000000-0000-4000-8000-000000000077",
+                    NOW,
+                    NOW,
+                    rowVersion = 7,
+                ),
+            ),
+        )
+
+        persisted = store.loadSyncState(TENANT).projectCache
+        assertEquals(listOf("create-item"), persisted.retiredItemOperationIds)
+        assertEquals("edit-item", persisted.itemOperations.single().operationId)
+        assertEquals(null, persisted.itemOperations.single().dependsOnOperationId)
+        assertEquals(7, persisted.itemOperations.single().ifMatch)
+        assertEquals("Edited", persisted.noteItems.single { it.id == noteId }.body)
+        assertEquals(7, persisted.noteItems.single { it.id == noteId }.rowVersion)
     }
 
     @Test

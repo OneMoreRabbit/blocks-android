@@ -247,7 +247,7 @@ internal class SyncStateRowCodec(
                             projectId = page.project.id,
                             body = body,
                             pinned = false,
-                            authoredByUserId = "legacy",
+                            authoredByUserId = null,
                             createdAt = page.notes.updatedAt,
                             updatedAt = page.notes.updatedAt,
                             rowVersion = page.notes.rowVersion,

@@ -946,6 +946,7 @@ class MainActivity : ComponentActivity() {
         }
 
         val pinned = controller.state.noteItems.filter { it.pinned }
+            .sortedWith(compareByDescending<ProjectNoteItem> { it.createdAt }.thenByDescending { it.id })
         if (pinned.isNotEmpty()) {
             content.addView(heading("Pinned notes", 20f).apply { setPadding(0, dp(6), 0, dp(8)) })
             content.addView(LinearLayout(this).apply {
@@ -956,19 +957,20 @@ class MainActivity : ComponentActivity() {
         }
 
         content.addView(heading("Activity", 20f).apply { setPadding(0, dp(12), 0, dp(8)) })
-        val activity = buildList<Pair<String, () -> View>> {
+        val activity = buildList<Triple<String, String, () -> View>> {
             controller.state.noteItems.filterNot { it.pinned }
-                .forEach { note -> add(note.updatedAt to { noteCard(note, archived) }) }
+                .forEach { note -> add(Triple(note.createdAt, note.id) { noteCard(note, archived) }) }
             controller.state.parkingHistory
-                .forEach { record -> add(record.occurredAt to { parkingRecordCard(record) }) }
-        }.sortedByDescending { it.first }
+                .forEach { record -> add(Triple(record.occurredAt, record.id) { parkingRecordCard(record) }) }
+        }.sortedWith(compareByDescending<Triple<String, String, () -> View>> { it.first }
+            .thenByDescending { it.second })
         content.addView(LinearLayout(this).apply {
             id = ProjectUiIds.PROJECT_ACTIVITY
             orientation = LinearLayout.VERTICAL
             if (activity.isEmpty()) {
                 addView(label("No notes or park messages yet.", 15f, brandColor(R.color.blocks_muted)))
             } else {
-                activity.take(visibleActivityItemCount).forEach { addView(it.second()) }
+                activity.take(visibleActivityItemCount).forEach { addView(it.third()) }
             }
         })
         if (activity.size > visibleActivityItemCount) {
