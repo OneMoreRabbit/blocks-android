@@ -20,6 +20,7 @@ import java.time.Instant
 import java.util.UUID
 import kotlin.math.ceil
 import kotlin.math.max
+import kotlin.math.roundToInt
 
 fun interface ProjectCoverImporter {
     fun importCover(projectId: String, uri: Uri): ProjectCoverContent
@@ -121,8 +122,19 @@ class AndroidProjectCoverImporter(
 }
 
 /** CPU-only transformation with hard compressed, decoded-pixel and intermediate-memory caps. */
+data class CoverCropSelection(
+    val centerX: Float = 0.5f,
+    val centerY: Float = 0.5f,
+    val zoom: Float = 1f,
+)
+
 class ProjectCoverImageProcessor {
-    fun process(projectId: String, source: File, importedAt: String): ProjectCoverContent {
+    fun process(
+        projectId: String,
+        source: File,
+        importedAt: String,
+        selection: CoverCropSelection = CoverCropSelection(),
+    ): ProjectCoverContent {
         require(projectId.isNotBlank()) { "A project is required for a cover" }
         require(source.isFile && source.length() in 1..MAX_COMPRESSED_BYTES) {
             "The selected image is empty or too large"
@@ -164,7 +176,7 @@ class ProjectCoverImageProcessor {
         }
         if (oriented !== decoded) decoded.recycle()
         return try {
-            val crop = centreCropRegion(oriented)
+            val crop = cropRegion(oriented, selection)
             try {
                 val display = Bitmap.createScaledBitmap(crop, DISPLAY_WIDTH, DISPLAY_HEIGHT, true)
                 try {
@@ -201,6 +213,47 @@ class ProjectCoverImageProcessor {
         }
     }
 
+    /** A bounded, orientation-correct preview; the full input remains in app-private storage. */
+    fun preview(source: File): Bitmap {
+        require(source.isFile && source.length() in 1..MAX_COMPRESSED_BYTES) {
+            "The selected image is empty or too large"
+        }
+        val orientation = readOrientation(source)
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        FileInputStream(source).use { BitmapFactory.decodeStream(it, null, bounds) }
+        require(bounds.outWidth in 1..MAX_SOURCE_DIMENSION && bounds.outHeight in 1..MAX_SOURCE_DIMENSION) {
+            "The selected file is not a supported image"
+        }
+        var sample = 1
+        while (
+            ceil(bounds.outWidth.toDouble() / sample).toLong() *
+                ceil(bounds.outHeight.toDouble() / sample).toLong() > MAX_PREVIEW_PIXELS
+        ) {
+            require(sample < MAX_SAMPLE_SIZE) { "The selected image cannot be previewed safely" }
+            sample *= 2
+        }
+        val decoded = FileInputStream(source).use { input ->
+            requireNotNull(
+                BitmapFactory.decodeStream(
+                    input,
+                    null,
+                    BitmapFactory.Options().apply {
+                        inSampleSize = sample
+                        inPreferredConfig = Bitmap.Config.ARGB_8888
+                    },
+                ),
+            ) { "The selected image could not be decoded" }
+        }
+        return try {
+            orient(decoded, orientation)
+        } catch (error: Throwable) {
+            decoded.recycle()
+            throw error
+        }.also { oriented ->
+            if (oriented !== decoded) decoded.recycle()
+        }
+    }
+
     internal fun sampleSize(width: Int, height: Int): Int {
         var sample = 1
         while (true) {
@@ -224,24 +277,32 @@ class ProjectCoverImageProcessor {
         }
     }
 
-    private fun centreCropRegion(source: Bitmap): Bitmap {
-        val sourceAspect = source.width.toDouble() / source.height
-        val cropWidth: Int
-        val cropHeight: Int
-        if (sourceAspect > TARGET_ASPECT) {
-            cropHeight = source.height
-            cropWidth = (cropHeight * TARGET_ASPECT).toInt().coerceIn(1, source.width)
-        } else {
-            cropWidth = source.width
-            cropHeight = (cropWidth / TARGET_ASPECT).toInt().coerceIn(1, source.height)
+    private fun cropRegion(source: Bitmap, selection: CoverCropSelection): Bitmap {
+        require(selection.centerX.isFinite() && selection.centerY.isFinite() && selection.zoom.isFinite()) {
+            "The cover crop is invalid"
         }
+        val sourceAspect = source.width.toDouble() / source.height
+        val baseWidth: Int
+        val baseHeight: Int
+        if (sourceAspect > TARGET_ASPECT) {
+            baseHeight = source.height
+            baseWidth = (baseHeight * TARGET_ASPECT).toInt().coerceIn(1, source.width)
+        } else {
+            baseWidth = source.width
+            baseHeight = (baseWidth / TARGET_ASPECT).toInt().coerceIn(1, source.height)
+        }
+        val zoom = selection.zoom.coerceIn(MIN_CROP_ZOOM, MAX_CROP_ZOOM)
+        val cropWidth = (baseWidth / zoom).roundToInt().coerceIn(1, source.width)
+        val cropHeight = (baseHeight / zoom).roundToInt().coerceIn(1, source.height)
         require(cropWidth.toLong() * cropHeight <= MAX_CROP_PIXELS) {
             "The selected image exceeds the crop-memory limit"
         }
+        val requestedLeft = (selection.centerX.coerceIn(0f, 1f) * source.width - cropWidth / 2f).roundToInt()
+        val requestedTop = (selection.centerY.coerceIn(0f, 1f) * source.height - cropHeight / 2f).roundToInt()
         return Bitmap.createBitmap(
             source,
-            (source.width - cropWidth) / 2,
-            (source.height - cropHeight) / 2,
+            requestedLeft.coerceIn(0, source.width - cropWidth),
+            requestedTop.coerceIn(0, source.height - cropHeight),
             cropWidth,
             cropHeight,
         )
@@ -323,6 +384,9 @@ class ProjectCoverImageProcessor {
         private const val MAX_THUMBNAIL_BYTES = 1024 * 1024
         private const val MAX_SOURCE_DIMENSION = 20_000
         private const val MAX_SAMPLE_SIZE = 32
+        private const val MAX_PREVIEW_PIXELS = 2_000_000L
+        private const val MIN_CROP_ZOOM = 1f
+        private const val MAX_CROP_ZOOM = 8f
         private const val DISPLAY_QUALITY = 88
         private const val THUMBNAIL_QUALITY = 82
         private const val TARGET_ASPECT = DISPLAY_WIDTH.toDouble() / DISPLAY_HEIGHT

@@ -12,6 +12,7 @@ import android.os.ParcelFileDescriptor
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.inputmethod.InputMethodManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.GridLayout
@@ -32,9 +33,13 @@ import dev.blocks.android.auth.AcceptedTenantContinuityStore
 import dev.blocks.android.auth.AndroidEncryptedAcceptedTenantContinuityStore
 import dev.blocks.android.auth.IdentityProvider
 import dev.blocks.android.cover.ProjectCoverImporter
+import dev.blocks.android.cover.CoverCropSelection
 import dev.blocks.android.cover.CoverCaptureFiles
 import dev.blocks.android.cover.AndroidEncryptedProjectCoverMediaStore
 import dev.blocks.android.cover.CoverImportFiles
+import dev.blocks.android.cover.PreparedProjectCoverCrop
+import dev.blocks.android.cover.ProjectCoverCropper
+import dev.blocks.android.cover.ProjectCoverCropView
 import dev.blocks.android.mvp.AccountIdentity
 import dev.blocks.android.mvp.ChangePage
 import dev.blocks.android.mvp.FormDrafts
@@ -116,6 +121,7 @@ class MainActivityPresentationTest {
     private lateinit var presentationController: ProjectPresentationController
     private lateinit var nfc: FakeNfcTagPlatform
     private lateinit var coverImporter: FakeCoverImporter
+    private lateinit var coverCropper: FakeCoverCropper
     private lateinit var coverSourceActions: FakeCoverSourceActions
     @Volatile
     private var sessionExchangeOffline = false
@@ -137,6 +143,7 @@ class MainActivityPresentationTest {
         sessionExchanges = AtomicInteger()
         nfc = FakeNfcTagPlatform()
         coverImporter = FakeCoverImporter(context)
+        coverCropper = FakeCoverCropper(coverImporter)
         coverSourceActions = FakeCoverSourceActions()
         MainActivity.dependencyFactory = { activity ->
             val drafts = AndroidEncryptedDraftStore(activity)
@@ -161,6 +168,7 @@ class MainActivityPresentationTest {
                 observeConnectivity = false,
                 nfcTagPlatform = nfc,
                 coverImporter = coverImporter,
+                coverCropper = coverCropper,
                 coverSourceActions = coverSourceActions,
             )
         }
@@ -886,7 +894,7 @@ class MainActivityPresentationTest {
                 activity.selectDialogItem("About")
                 val about = activity.dialogTexts().joinToString("\n")
                 assertTrue(about.contains("Blocks Android"))
-                assertTrue(about.contains("Version 0.7.1 (12)"))
+                assertTrue(about.contains("Version 0.7.2 (13)"))
                 assertTrue(about.contains("dev.blocks.android/debug"))
                 assertFalse(about.contains("tenant", ignoreCase = true))
                 assertFalse(about.contains("token", ignoreCase = true))
@@ -972,7 +980,7 @@ class MainActivityPresentationTest {
     }
 
     @Test
-    fun dashboardCreationIsContainedAndItsDraftSurvivesUntilExplicitDiscard() {
+    fun dashboardCreationHasOnlyCreateAndCancelAndCancelDiscardsMemoryDraft() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             scenario.onActivity { activity ->
@@ -980,6 +988,7 @@ class MainActivityPresentationTest {
                 activity.findViewById<Button>(ProjectUiIds.CREATE_PROJECT).performClick()
                 activity.activeDialog?.findViewById<EditText>(ProjectUiIds.PROJECT_NAME)
                     ?.setText("Dialog draft") ?: error("Create-project dialog input is missing")
+                assertEquals(setOf("Cancel", "Create"), activity.dialogActionLabels())
                 activity.dialogButton("Cancel").callOnClick()
             }
 
@@ -988,13 +997,10 @@ class MainActivityPresentationTest {
             scenario.onActivity { activity ->
                 assertTrue(activity.findViewById<EditText>(ProjectUiIds.PROJECT_NAME) == null)
                 activity.findViewById<Button>(ProjectUiIds.CREATE_PROJECT).performClick()
-                assertEquals(
-                    "Dialog draft",
-                    activity.activeDialog?.findViewById<EditText>(ProjectUiIds.PROJECT_NAME)?.text.toString(),
-                )
-                activity.dialogButton("Discard draft").callOnClick()
+                assertEquals("", activity.activeDialog?.findViewById<EditText>(ProjectUiIds.PROJECT_NAME)?.text.toString())
+                assertFalse(activity.dialogActionLabels().contains("Discard draft"))
             }
-            waitUntil { presentationController.state.drafts.projectName.isEmpty() }
+            assertTrue(presentationController.state.drafts.projectName.isEmpty())
             assertTrue(AndroidEncryptedDraftStore(context).load(TENANT_ID).projectName.isEmpty())
         }
     }
@@ -1248,10 +1254,42 @@ class MainActivityPresentationTest {
             first.onActivity { activity ->
                 activity.findViewById<EditText>(ProjectUiIds.PARKING_LOCATION).setText("Workbench")
                 activity.findViewById<EditText>(ProjectUiIds.PARKING_NEXT_ACTION).setText("Fit bracket")
-                activity.findViewById<EditText>(ProjectUiIds.PARKING_MUST_NOT_FORGET).setText("Bring screws")
-                activity.findViewById<Button>(ProjectUiIds.SAVE_PARKING).performClick()
+                val finalField = activity.findViewById<EditText>(ProjectUiIds.PARKING_MUST_NOT_FORGET)
+                finalField.setText("Bring screws")
+                finalField.requestFocus()
+                activity.getSystemService(InputMethodManager::class.java).showSoftInput(
+                    finalField,
+                    InputMethodManager.SHOW_IMPLICIT,
+                )
+            }
+            waitFor(first) { activity ->
+                ViewCompat.getRootWindowInsets(activity.findViewById(ProjectUiIds.PARKING_MUST_NOT_FORGET))
+                    ?.isVisible(WindowInsetsCompat.Type.ime()) == true
+            }
+            first.onActivity { activity ->
+                val field = activity.findViewById<EditText>(ProjectUiIds.PARKING_MUST_NOT_FORGET)
+                assertTrue(
+                    ViewCompat.getRootWindowInsets(field)
+                        ?.isVisible(WindowInsetsCompat.Type.ime()) == true,
+                )
+                val save = activity.findViewById<Button>(ProjectUiIds.SAVE_PARKING)
+                assertTrue(save.isShown && save.height > 0)
+                save.performClick()
             }
             waitUntil { presentationController.state.projectPage?.newestParking?.location == "Workbench" }
+            waitFor(first) { activity ->
+                activity.texts().toSet().containsAll(listOf("Workbench", "Fit bracket", "Bring screws"))
+            }
+            val persistedAfterPark = AndroidSyncStateStore(context).loadSyncState(TENANT_ID).projectCache
+            assertEquals(
+                1,
+                persistedAfterPark.commands.count { it.type == ProjectMutationType.ADD_PARKING },
+            )
+            assertEquals(
+                ParkingDraft("Workbench", "Fit bracket", "Bring screws"),
+                persistedAfterPark.commands.single { it.type == ProjectMutationType.ADD_PARKING }.parking,
+            )
+            assertEquals("Workbench", persistedAfterPark.parkingRecords.single().location)
             first.onActivity { activity ->
                 val projectId = requireNotNull(presentationController.state.projectPage).project.id
                 activity.importCover(projectId, Uri.parse("content://test/real-store-cover"))
@@ -1306,14 +1344,14 @@ class MainActivityPresentationTest {
             }
             restarted.onActivity { activity ->
                 activity.button("Renamed offline project").performClick()
-                activity.dialogButton("Reopen").callOnClick()
             }
+            waitFor(restarted) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            restarted.onActivity { it.button("Reopen").performClick() }
+            waitFor(restarted) { it.findViewById<Button>(ProjectUiIds.PARK) != null }
+            restarted.onActivity { it.findViewById<Button>(ProjectUiIds.MAIN).performClick() }
             waitFor(restarted) {
-                !it.hasButton("Renamed offline project") &&
-                    it.findViewById<Button>(ProjectUiIds.ARCHIVE_MAIN) != null
+                it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD && it.hasButton("Renamed offline project")
             }
-            restarted.onActivity { it.findViewById<Button>(ProjectUiIds.ARCHIVE_MAIN).performClick() }
-            waitFor(restarted) { it.hasButton("Renamed offline project") }
             assertTrue(presentationController.state.pendingChanges)
         }
 
@@ -1436,7 +1474,7 @@ class MainActivityPresentationTest {
                 val projectSettings = activity.activeDialog?.listView?.adapter
                     ?: error("Project Settings is missing")
                 assertEquals(
-                    listOf("Project cover", "Set Tag", "View QR", "Clear Tags", "Rename", "Archive"),
+                    listOf("Edit cover", "Set Tag", "View QR", "Clear Tags", "Rename", "Archive"),
                     (0 until projectSettings.count).map { projectSettings.getItem(it).toString() },
                 )
                 activity.dialogButton("Cancel").callOnClick()
@@ -1471,6 +1509,117 @@ class MainActivityPresentationTest {
 
             assertTrue(workspace.mutations.isEmpty())
             assertEquals(1, workspace.pageCalls)
+        }
+    }
+
+    @Test
+    fun archivedProjectIsLabelledReadableAndExposesOnlyQrAndReopen() {
+        val archived = project().copy(
+            name = "Archived project",
+            lifecycle = ProjectLifecycle.ARCHIVED,
+            archivedAt = NOW,
+        )
+        workspace.cache = workspace.cache.copy(
+            activeProjects = emptyList(),
+            archivedProjects = listOf(archived),
+            pages = listOf(page().copy(project = archived, notes = page().notes.copy(body = "Retained notes"))),
+        )
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { activity ->
+                assertEquals("Settings", activity.findViewById<Button>(ProjectUiIds.SETTINGS).contentDescription)
+                activity.button("Archive").performClick()
+            }
+            waitFor(scenario) { it.hasButton("Archived project") }
+            scenario.onActivity { it.button("Archived project").performClick() }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            scenario.onActivity { activity ->
+                assertTrue(activity.findViewById<View>(ProjectUiIds.ARCHIVED_LABEL).isShown)
+                assertEquals("Settings", activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS).contentDescription)
+                assertTrue(activity.findViewById<View>(ProjectUiIds.EDIT_COVER) == null)
+                assertTrue(activity.findViewById<View>(ProjectUiIds.PARK) == null)
+                assertTrue(activity.findViewById<View>(ProjectUiIds.SAVE_NOTES) == null)
+                assertFalse(activity.findViewById<View>(ProjectUiIds.NOTES) is EditText)
+                assertTrue(activity.texts().contains("Retained notes"))
+                activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS).performClick()
+                assertEquals(listOf("View QR", "Reopen"), activity.dialogItems())
+                activity.selectDialogItem("Reopen")
+                activity.dialogButton("Reopen").callOnClick()
+            }
+            waitFor(scenario) {
+                it.findViewById<View>(ProjectUiIds.ARCHIVED_LABEL) == null &&
+                    it.findViewById<Button>(ProjectUiIds.PARK) != null &&
+                    it.findViewById<EditText>(ProjectUiIds.NOTES) != null
+            }
+        }
+    }
+
+    @Test
+    fun longNotesRestoreAndOverLimitSaveCreatesNoMutation() {
+        val valid = "n".repeat(100_000)
+        workspace.cache = workspace.cache.copy(
+            pages = listOf(page().copy(notes = page().notes.copy(body = valid))),
+        )
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { it.button("Active project").performClick() }
+            waitFor(scenario) { it.findViewById<EditText>(ProjectUiIds.NOTES)?.text?.length == valid.length }
+            scenario.recreate()
+            waitFor(scenario) { it.findViewById<EditText>(ProjectUiIds.NOTES)?.text?.length == valid.length }
+            val before = workspace.cache.commands.size
+            scenario.onActivity { activity ->
+                val notes = activity.findViewById<EditText>(ProjectUiIds.NOTES)
+                notes.setText(valid + "x")
+                activity.findViewById<Button>(ProjectUiIds.SAVE_NOTES).performClick()
+            }
+            waitFor(scenario) {
+                it.findViewById<EditText>(ProjectUiIds.NOTES)?.error?.toString()?.contains("100,000") == true
+            }
+            scenario.onActivity { activity ->
+                assertEquals(100_001, activity.findViewById<EditText>(ProjectUiIds.NOTES).text.length)
+                assertEquals(before, workspace.cache.commands.size)
+            }
+        }
+    }
+
+    @Test
+    fun parkBackWithKeyboardVisibleCreatesNoParkOrQueueMutation() {
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { it.button("Active project").performClick() }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            val commandsBefore = workspace.cache.commands.size
+            val parkingBefore = workspace.cache.parkingRecords.size
+            scenario.onActivity { activity ->
+                assertEquals("Back", activity.findViewById<Button>(ProjectUiIds.MAIN).contentDescription)
+                activity.findViewById<Button>(ProjectUiIds.PARK).performClick()
+            }
+            waitFor(scenario) { it.findViewById<View>(ProjectUiIds.PARK_SHEET) != null }
+            scenario.onActivity { activity ->
+                val back = activity.findViewById<Button>(ProjectUiIds.BACK)
+                val save = activity.findViewById<Button>(ProjectUiIds.SAVE_PARKING)
+                assertEquals("Back", back.contentDescription)
+                assertEquals("Save", save.text.toString())
+                val field = activity.findViewById<EditText>(ProjectUiIds.PARKING_MUST_NOT_FORGET)
+                field.requestFocus()
+                activity.getSystemService(InputMethodManager::class.java).showSoftInput(
+                    field,
+                    InputMethodManager.SHOW_IMPLICIT,
+                )
+            }
+            waitFor(scenario) { activity ->
+                ViewCompat.getRootWindowInsets(activity.findViewById(ProjectUiIds.PARKING_MUST_NOT_FORGET))
+                    ?.isVisible(WindowInsetsCompat.Type.ime()) == true
+            }
+            scenario.onActivity { activity ->
+                val save = activity.findViewById<Button>(ProjectUiIds.SAVE_PARKING)
+                assertTrue(save.isShown && save.height > 0)
+                activity.findViewById<Button>(ProjectUiIds.BACK).performClick()
+            }
+            waitFor(scenario) { it.findViewById<Button>(ProjectUiIds.PARK) != null }
+            assertEquals(commandsBefore, workspace.cache.commands.size)
+            assertEquals(parkingBefore, workspace.cache.parkingRecords.size)
+            assertTrue(workspace.mutations.isEmpty())
         }
     }
 
@@ -1774,6 +1923,8 @@ class MainActivityPresentationTest {
                 activity.stagePendingCover(PROJECT_ID)
                 activity.handleCoverPickerResult(Uri.parse("content://test/cover"))
             }
+            waitFor(scenario) { it.activeDialog?.findViewById<View>(ProjectUiIds.CROP_SURFACE) != null }
+            scenario.onActivity { it.dialogButton("Confirm").callOnClick() }
             waitUntil { presentationController.state.projectCovers.isNotEmpty() }
             scenario.onActivity { it.findViewById<Button>(ProjectUiIds.EDIT_COVER).performClick() }
             waitFor(scenario) { it.visibleDialogItems().contains("Remove cover") }
@@ -1791,6 +1942,48 @@ class MainActivityPresentationTest {
     }
 
     @Test
+    fun galleryAndCameraUseSharedExplicitCropConfirmCancelPath() {
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { it.button("Active project").performClick() }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+
+            scenario.onActivity { activity ->
+                activity.stagePendingCover(PROJECT_ID)
+                activity.handleCoverPickerResult(Uri.parse("content://test/gallery"))
+            }
+            waitFor(scenario) { it.activeDialog?.findViewById<View>(ProjectUiIds.CROP_SURFACE) != null }
+            val discardedBefore = coverCropper.discarded
+            scenario.onActivity { activity ->
+                val crop = requireNotNull(activity.activeDialog)
+                    .findViewById<ProjectCoverCropView>(ProjectUiIds.CROP_SURFACE)
+                crop.setSelectionForTest(CoverCropSelection(0.7f, 0.4f, 2f))
+                activity.dialogButton("Cancel").callOnClick()
+            }
+            waitUntil { coverCropper.discarded > discardedBefore }
+            assertTrue(workspace.cache.projectCovers.isEmpty())
+
+            lateinit var capturePath: String
+            scenario.onActivity { activity ->
+                val capture = CoverCaptureFiles(activity).create()
+                java.io.File(capture.path).writeBytes(byteArrayOf(1))
+                capturePath = capture.path
+                activity.stagePendingCover(PROJECT_ID, capture)
+                activity.handleCoverCameraResult(true)
+            }
+            waitFor(scenario) { it.activeDialog?.findViewById<View>(ProjectUiIds.CROP_SURFACE) != null }
+            scenario.onActivity { activity ->
+                val crop = requireNotNull(activity.activeDialog)
+                    .findViewById<ProjectCoverCropView>(ProjectUiIds.CROP_SURFACE)
+                crop.setSelectionForTest(CoverCropSelection(0.6f, 0.5f, 1.5f))
+                activity.dialogButton("Confirm").callOnClick()
+            }
+            waitUntil { workspace.cache.projectCovers.isNotEmpty() && !java.io.File(capturePath).exists() }
+            assertEquals(CoverCropSelection(0.6f, 0.5f, 1.5f), coverCropper.confirmedSelections.single())
+        }
+    }
+
+    @Test
     fun coverImportFailureCancellationRestartAndExplicitRemovalPreserveAtomicUiState() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
@@ -1800,6 +1993,8 @@ class MainActivityPresentationTest {
                 activity.stagePendingCover(PROJECT_ID)
                 activity.handleCoverPickerResult(Uri.parse("content://test/first"))
             }
+            waitFor(scenario) { it.activeDialog?.findViewById<View>(ProjectUiIds.CROP_SURFACE) != null }
+            scenario.onActivity { it.dialogButton("Confirm").callOnClick() }
             waitUntil { workspace.cache.projectCovers.singleOrNull()?.contentDigest == coverImporter.importedDigest(1) }
             waitFor(scenario) { activity ->
                 activity.findViewById<ViewGroup>(ProjectUiIds.PROJECT_COVER)
@@ -1814,6 +2009,8 @@ class MainActivityPresentationTest {
                 activity.stagePendingCover(PROJECT_ID, capture)
                 activity.handleCoverCameraResult(true)
             }
+            waitFor(scenario) { it.activeDialog?.findViewById<View>(ProjectUiIds.CROP_SURFACE) != null }
+            scenario.onActivity { it.dialogButton("Confirm").callOnClick() }
             waitUntil {
                 workspace.cache.projectCovers.singleOrNull()?.contentDigest == coverImporter.importedDigest(2) &&
                     !java.io.File(successfulCapturePath).exists()
@@ -1828,6 +2025,13 @@ class MainActivityPresentationTest {
             scenario.onActivity { activity ->
                 activity.stagePendingCover(PROJECT_ID)
                 activity.handleCoverPickerResult(Uri.parse("content://test/denied"))
+            }
+            waitFor(scenario) { it.activeDialog?.findViewById<View>(ProjectUiIds.CROP_SURFACE) != null }
+            scenario.onActivity { activity ->
+                activity.dialogButton("Confirm").callOnClick()
+            }
+            waitFor(scenario) { it.texts().any { text -> text.contains("could not save", ignoreCase = true) } }
+            scenario.onActivity { activity ->
                 activity.stagePendingCover(PROJECT_ID)
                 activity.handleCoverPickerResult(null)
                 val capture = CoverCaptureFiles(activity).create()
@@ -1836,7 +2040,6 @@ class MainActivityPresentationTest {
                 activity.handleCoverCameraResult(false)
             }
             waitUntil { !java.io.File(cancelledCapturePath).exists() }
-            waitFor(scenario) { it.texts().any { text -> text.contains("could not save", ignoreCase = true) } }
             assertEquals(coverImporter.importedDigest(2), workspace.cache.projectCovers.single().contentDigest)
 
             coverImporter.failure = null
@@ -1876,6 +2079,9 @@ class MainActivityPresentationTest {
                 activity.stagePendingCover(PROJECT_ID, capture)
             }
             scenario.recreate()
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            assertTrue(java.io.File(recreatedPath).exists())
+            scenario.onActivity { it.handleCoverCameraResult(false) }
             waitUntil { !java.io.File(recreatedPath).exists() }
 
             lateinit var changedProjectPath: String
@@ -1898,6 +2104,8 @@ class MainActivityPresentationTest {
                 activity.stagePendingCover(PROJECT_ID, capture)
                 activity.handleCoverCameraResult(true)
             }
+            waitFor(scenario) { it.activeDialog?.findViewById<View>(ProjectUiIds.CROP_SURFACE) != null }
+            scenario.onActivity { it.dialogButton("Confirm").callOnClick() }
             waitUntil { !java.io.File(failedCommitPath).exists() }
             assertTrue(workspace.cache.projectCovers.isEmpty())
             workspace.failCoverSave = false
@@ -2080,6 +2288,13 @@ class MainActivityPresentationTest {
         .filterIsInstance<Button>()
         .single { it.text.toString() == text }
 
+    private fun MainActivity.dialogActionLabels(): Set<String> = requireNotNull(activeDialog)
+        .window?.decorView?.descendants().orEmpty()
+        .filterIsInstance<Button>()
+        .map { it.text.toString() }
+        .filter(String::isNotBlank)
+        .toSet()
+
     private fun MainActivity.selectDialogItem(index: Int) {
         val list = requireNotNull(activeDialog).listView
         list.performItemClick(list.getChildAt(index), index, list.adapter.getItemId(index))
@@ -2146,6 +2361,40 @@ class MainActivityPresentationTest {
         override fun chooseImage(projectId: String) {
             pickerProjects += projectId
         }
+    }
+
+    private class FakeCoverCropper(
+        private val importer: FakeCoverImporter,
+    ) : ProjectCoverCropper {
+        val confirmedSelections = mutableListOf<CoverCropSelection>()
+        var discarded = 0
+
+        override fun prepare(uri: Uri): PreparedProjectCoverCrop = PreparedProjectCoverCrop(
+            source = null,
+            preview = Bitmap.createBitmap(160, 90, Bitmap.Config.ARGB_8888).apply {
+                eraseColor(Color.rgb(23, 107, 99))
+            },
+        )
+
+        override fun confirm(
+            projectId: String,
+            prepared: PreparedProjectCoverCrop,
+            selection: CoverCropSelection,
+        ): ProjectCoverContent {
+            confirmedSelections += selection
+            return try {
+                importer.importCover(projectId, Uri.EMPTY)
+            } finally {
+                discard(prepared)
+            }
+        }
+
+        override fun discard(prepared: PreparedProjectCoverCrop) {
+            if (!prepared.preview.isRecycled) prepared.preview.recycle()
+            discarded += 1
+        }
+
+        override fun cleanupAbandonedSources(): Int = 0
     }
 
     private class FakeCoverImporter(context: Context) : ProjectCoverImporter {
@@ -2862,13 +3111,37 @@ class MainActivityPresentationTest {
             projectId: String,
             rowVersion: Int,
             operationId: String,
-        ) = result()
+        ): BackgroundSyncResult {
+            val summary = cache.pages.single { it.project.id == projectId }.project.copy(
+                lifecycle = ProjectLifecycle.ARCHIVED,
+                rowVersion = rowVersion + 1,
+                archivedAt = NOW,
+            )
+            cache = cache.copy(
+                activeProjects = cache.activeProjects.filterNot { it.id == projectId },
+                archivedProjects = cache.archivedProjects.filterNot { it.id == projectId } + summary,
+                pages = cache.pages.map { if (it.project.id == projectId) it.copy(project = summary) else it },
+            )
+            return result()
+        }
         override fun queueReopenProject(
             session: Session,
             projectId: String,
             rowVersion: Int,
             operationId: String,
-        ) = result()
+        ): BackgroundSyncResult {
+            val summary = cache.pages.single { it.project.id == projectId }.project.copy(
+                lifecycle = ProjectLifecycle.ACTIVE,
+                rowVersion = rowVersion + 1,
+                archivedAt = null,
+            )
+            cache = cache.copy(
+                archivedProjects = cache.archivedProjects.filterNot { it.id == projectId },
+                activeProjects = cache.activeProjects.filterNot { it.id == projectId } + summary,
+                pages = cache.pages.map { if (it.project.id == projectId) it.copy(project = summary) else it },
+            )
+            return result()
+        }
         override fun queueSaveNotes(
             session: Session,
             projectId: String,

@@ -115,6 +115,89 @@ class ProjectCoverImagesTest {
     }
 
     @Test
+    fun explicitCropSelectionControlsTheCommittedBannerDerivative() {
+        val source = File(context.cacheDir, "cover-crop-selection.jpg")
+        try {
+            val bitmap = Bitmap.createBitmap(1600, 900, Bitmap.Config.ARGB_8888)
+            try {
+                val canvas = android.graphics.Canvas(bitmap)
+                canvas.drawColor(Color.RED)
+                canvas.clipRect(800, 0, 1600, 900)
+                canvas.drawColor(Color.BLUE)
+                source.outputStream().use { assertTrue(bitmap.compress(Bitmap.CompressFormat.JPEG, 94, it)) }
+            } finally {
+                bitmap.recycle()
+            }
+            val processor = ProjectCoverImageProcessor()
+            val left = processor.process(
+                "project",
+                source,
+                "2026-09-16T09:00:00Z",
+                CoverCropSelection(centerX = 0.25f, centerY = 0.5f, zoom = 2f),
+            )
+            val right = processor.process(
+                "project",
+                source,
+                "2026-09-16T09:00:00Z",
+                CoverCropSelection(centerX = 0.75f, centerY = 0.5f, zoom = 2f),
+            )
+            try {
+                val leftBitmap = BitmapFactory.decodeByteArray(left.displayJpeg, 0, left.displayJpeg.size)
+                val rightBitmap = BitmapFactory.decodeByteArray(right.displayJpeg, 0, right.displayJpeg.size)
+                try {
+                    val leftPixel = leftBitmap.getPixel(leftBitmap.width / 2, leftBitmap.height / 2)
+                    val rightPixel = rightBitmap.getPixel(rightBitmap.width / 2, rightBitmap.height / 2)
+                    assertTrue(Color.red(leftPixel) > Color.blue(leftPixel))
+                    assertTrue(Color.blue(rightPixel) > Color.red(rightPixel))
+                } finally {
+                    leftBitmap.recycle()
+                    rightBitmap.recycle()
+                }
+            } finally {
+                left.clear()
+                right.clear()
+            }
+        } finally {
+            source.delete()
+        }
+    }
+
+    @Test
+    fun cropperRetainsOwnedSourceUntilConfirmOrCancelThenDeletesIt() {
+        val captures = CoverCaptureFiles(context)
+        val capture = captures.create()
+        try {
+            val bitmap = Bitmap.createBitmap(320, 180, Bitmap.Config.ARGB_8888).apply {
+                eraseColor(Color.rgb(30, 107, 99))
+            }
+            try {
+                FileOutputStream(capture.path).use { assertTrue(bitmap.compress(Bitmap.CompressFormat.JPEG, 90, it)) }
+            } finally {
+                bitmap.recycle()
+            }
+            val cropper = AndroidProjectCoverCropper(context, now = { "2026-09-16T09:00:00Z" })
+            val cancelled = cropper.prepare(capture.uri)
+            val cancelledSource = requireNotNull(cancelled.source)
+            assertTrue(cancelledSource.isFile)
+            cropper.discard(cancelled)
+            assertFalse(cancelledSource.exists())
+
+            val confirmed = cropper.prepare(capture.uri)
+            val confirmedSource = requireNotNull(confirmed.source)
+            val content = cropper.confirm("project", confirmed, CoverCropSelection(0.5f, 0.5f, 1.5f))
+            try {
+                assertFalse(confirmedSource.exists())
+                assertEquals(ProjectCoverImageProcessor.DISPLAY_WIDTH, content.displayWidth)
+                assertEquals(ProjectCoverImageProcessor.DISPLAY_HEIGHT, content.displayHeight)
+            } finally {
+                content.clear()
+            }
+        } finally {
+            captures.delete(capture)
+        }
+    }
+
+    @Test
     fun importerCleansPriorOrphanBeforeImportAndItsOwnSourceAfterSuccessOrRejection() {
         val imports = CoverImportFiles(context)
         val orphan = File(
