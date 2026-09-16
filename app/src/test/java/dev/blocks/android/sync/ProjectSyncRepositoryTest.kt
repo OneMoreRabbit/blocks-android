@@ -11,12 +11,12 @@ import dev.blocks.android.mvp.ChangeEvent
 import dev.blocks.android.mvp.ChangePage
 import dev.blocks.android.mvp.DraftStore
 import dev.blocks.android.mvp.FormDrafts
-import dev.blocks.android.mvp.NoteItemDraft
 import dev.blocks.android.mvp.MembershipRevokedException
 import dev.blocks.android.mvp.OfflineOperation
 import dev.blocks.android.mvp.OutcomeTier
 import dev.blocks.android.mvp.ParkingDraft
 import dev.blocks.android.mvp.ParkingRecord
+import dev.blocks.android.mvp.PendingMutation
 import dev.blocks.android.mvp.PickupRequest
 import dev.blocks.android.mvp.PickupResult
 import dev.blocks.android.mvp.Project
@@ -195,187 +195,43 @@ class ProjectSyncRepositoryTest {
     }
 
     @Test
-    fun releasedProvisionalNotesChainRemapsThenHandsEveryAuthoritativeVersionAcrossRestart() {
+    fun legacyDraftCutoverDiscardsSingletonNotesIntentButMigratesUnrelatedProjectDrafts() {
         val state = MemoryState()
-        val service = FakeProjectService().apply { notesFailureAfterSuccessfulSaves = 0 }
-        var repository = repository(service, MemoryDrafts(), state)
-        repository.activate(SESSION_A)
-        val provisionalId = "create-project"
-        repository.queueCreateProject(SESSION_A, "Offline project", provisionalId, provisionalId)
-        repository.queueSaveNotes(SESSION_A, provisionalId, 0, "Legacy singleton", "save-legacy")
-        val provisionalLegacyId = dev.blocks.android.project.legacyNoteItemIdentity(provisionalId)
-        repository.updateProjectDrafts(SESSION_A) {
-            it.copy(
-                projectNoteItems = mapOf(
-                    dev.blocks.android.project.noteItemDraftKey(provisionalId, provisionalLegacyId) to
-                        NoteItemDraft("Pending legacy edit"),
-                ),
-            )
-        }
-        val before = state.loadSyncState(TENANT_A)
-        state.saveSyncState(
-            TENANT_A,
-            before.copy(
-                projectCache = before.projectCache.copy(
-                    noteItems = before.projectCache.noteItems + ProjectNoteItem(
-                        provisionalLegacyId,
-                        provisionalId,
-                        "Legacy singleton",
-                        false,
-                        null,
-                        "2026-09-16T09:00:00Z",
-                        "2026-09-16T09:00:00Z",
-                        rowVersion = 0,
-                        legacySingleton = true,
-                    ),
-                ),
-            ),
-        )
-
-        repository = repository(service, MemoryDrafts(), state)
-        repository.activate(SESSION_A)
-        repository.editNoteItem(SESSION_A, provisionalLegacyId, "Pending legacy edit", "edit-legacy-note")
-        repository.setNoteItemPinned(SESSION_A, provisionalLegacyId, true, "pin-legacy-note")
-        repository.updateProjectDrafts(SESSION_A) {
-            it.copy(
-                projectNoteItems = mapOf(
-                    dev.blocks.android.project.noteItemDraftKey(provisionalId, provisionalLegacyId) to
-                        NoteItemDraft("Newer unsubmitted edit"),
-                ),
-            )
-        }
-        var pending = state.loadSyncState(TENANT_A).projectCache.itemOperations
-        assertEquals("save-legacy", pending[0].dependsOnOperationId)
-        assertEquals(null, pending[0].ifMatch)
-        assertEquals("edit-legacy-note", pending[1].dependsOnOperationId)
-
-        // CREATE_PROJECT can complete, but an unavailable legacy Notes endpoint must leave
-        // the item chain closed by that exact SAVE_NOTES operation after identity remap.
-        repository.backgroundSync(SESSION_A)
-        val canonicalLegacyId = dev.blocks.android.project.legacyNoteItemIdentity(PROJECT_ID)
-        var remapped = state.loadSyncState(TENANT_A)
-        assertEquals(listOf(canonicalLegacyId), remapped.projectCache.noteItems.map { it.id })
-        assertTrue(remapped.projectCache.noteItems.none { it.id == provisionalLegacyId || it.projectId == provisionalId })
-        assertEquals(null, remapped.projectCache.noteItems.single { it.id == canonicalLegacyId }.authoredByUserId)
-        pending = remapped.projectCache.itemOperations
-        assertEquals(canonicalLegacyId, pending[0].targetId)
-        assertEquals(PROJECT_ID, pending[0].projectId)
-        assertEquals("save-legacy", pending[0].dependsOnOperationId)
-        assertEquals(null, pending[0].ifMatch)
-        assertEquals("edit-legacy-note", pending[1].dependsOnOperationId)
-        assertEquals(
-            NoteItemDraft("Newer unsubmitted edit"),
-            remapped.projectDrafts.projectNoteItems[
-                dev.blocks.android.project.noteItemDraftKey(PROJECT_ID, canonicalLegacyId)
-            ],
-        )
-        assertTrue(
-            dev.blocks.android.project.noteItemDraftKey(provisionalId, provisionalLegacyId) !in
-            remapped.projectDrafts.projectNoteItems,
-        )
-
-        // A process restart and exact successful legacy acknowledgement establish the
-        // canonical singleton version and hand it to only the first item mutation.
-        service.notesFailureAfterSuccessfulSaves = null
-        repository = repository(service, MemoryDrafts(), state)
-        repository.activate(SESSION_A)
-        repository.backgroundSync(SESSION_A)
-        remapped = state.loadSyncState(TENANT_A)
-        assertTrue(remapped.projectCache.commands.isEmpty())
-        pending = remapped.projectCache.itemOperations
-        assertEquals("edit-legacy-note", pending[0].operationId)
-        val legacyAcknowledgedVersion = requireNotNull(pending[0].ifMatch)
-        assertTrue(legacyAcknowledgedVersion > 0)
-        assertEquals(service.serverNotesVersion, legacyAcknowledgedVersion)
-        assertEquals(null, pending[0].dependsOnOperationId)
-        assertEquals("edit-legacy-note", pending[1].dependsOnOperationId)
-        assertEquals("Pending legacy edit", remapped.projectCache.noteItems.single().body)
-        assertTrue(remapped.projectCache.noteItems.single().pinned)
-
-        repository.acknowledgeProjectItem(
-            SESSION_A,
-            ProjectItemAcknowledgement.Note(
-                "edit-legacy-note",
-                remapped.projectCache.noteItems.single().copy(
-                    rowVersion = legacyAcknowledgedVersion + 1,
-                    pinned = false,
-                ),
-            ),
-        )
-        pending = state.loadSyncState(TENANT_A).projectCache.itemOperations
-        assertEquals("pin-legacy-note", pending.single().operationId)
-        assertEquals(legacyAcknowledgedVersion + 1, pending.single().ifMatch)
-        assertEquals(null, pending.single().dependsOnOperationId)
-
-        repository.acknowledgeProjectItem(
-            SESSION_A,
-            ProjectItemAcknowledgement.Note(
-                "pin-legacy-note",
-                state.loadSyncState(TENANT_A).projectCache.noteItems.single().copy(
-                    rowVersion = legacyAcknowledgedVersion + 2,
-                    pinned = true,
-                ),
-            ),
-        )
-        val complete = state.loadSyncState(TENANT_A).projectCache
-        assertTrue(complete.itemOperations.isEmpty())
-        assertEquals("Pending legacy edit", complete.noteItems.single().body)
-        assertTrue(complete.noteItems.single().pinned)
-        assertEquals(legacyAcknowledgedVersion + 2, complete.noteItems.single().rowVersion)
-        assertEquals(1, complete.noteItems.count { it.id == canonicalLegacyId })
-    }
-
-    @Test
-    fun ambiguousOrConflictingLegacyNotesSaveNeverReleasesDependentItemWork() {
-        val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
-        val service = FakeProjectService().apply { notesAmbiguousAfterSuccess = true }
-        var repository = repository(service, MemoryDrafts(), state)
-        repository.activate(SESSION_A)
-        repository.queueSaveNotes(SESSION_A, PROJECT_ID, 2, "Accepted without response", "save-legacy")
-        val legacyId = dev.blocks.android.project.legacyNoteItemIdentity(PROJECT_ID)
-        val before = state.loadSyncState(TENANT_A)
-        state.saveSyncState(
-            TENANT_A,
-            before.copy(
-                projectCache = before.projectCache.copy(
-                    noteItems = listOf(
-                        ProjectNoteItem(
-                            legacyId,
+        val drafts = MemoryDrafts().apply {
+            save(
+                TENANT_A,
+                FormDrafts(
+                    projectNotes = mapOf(PROJECT_ID to "Discard this singleton draft"),
+                    projectRenames = mapOf(PROJECT_ID to "Retain this rename"),
+                    pendingMutations = mapOf(
+                        "project-notes:$PROJECT_ID" to PendingMutation(
+                            "SAVE_NOTES",
                             PROJECT_ID,
-                            "Accepted without response",
-                            false,
-                            null,
-                            NOW,
-                            NOW,
-                            rowVersion = 0,
-                            legacySingleton = true,
+                            "notes-digest",
+                            "notes-operation",
+                        ),
+                        "project-rename:$PROJECT_ID" to PendingMutation(
+                            "RENAME_PROJECT",
+                            PROJECT_ID,
+                            "rename-digest",
+                            "rename-operation",
                         ),
                     ),
                 ),
-            ),
-        )
-        repository = repository(service, MemoryDrafts(), state)
-        repository.activate(SESSION_A)
-        repository.editNoteItem(SESSION_A, legacyId, "Newer local edit", "edit-legacy")
-        repository.backgroundSync(SESSION_A)
+            )
+        }
 
-        var durable = state.loadSyncState(TENANT_A).projectCache
-        assertTrue(durable.commands.single { it.operationId == "save-legacy" }.deliveryUncertain)
-        assertEquals("save-legacy", durable.itemOperations.single().dependsOnOperationId)
-        assertEquals(null, durable.itemOperations.single().ifMatch)
+        repository(FakeProjectService(), drafts, state).activate(SESSION_A)
 
-        service.notesAmbiguousAfterSuccess = false
-        service.notesConflict = true
-        repository = repository(service, MemoryDrafts(), state)
-        repository.activate(SESSION_A)
-        repository.backgroundSync(SESSION_A)
-        durable = state.loadSyncState(TENANT_A).projectCache
+        val migrated = state.loadSyncState(TENANT_A)
+        assertTrue(migrated.projectDrafts.projectNotes.isEmpty())
+        assertEquals("Retain this rename", migrated.projectDrafts.projectRenames[PROJECT_ID])
         assertEquals(
-            ProjectMutationStatus.REQUIRES_RECONCILIATION,
-            durable.commands.single { it.operationId == "save-legacy" }.status,
+            setOf("project-rename:$PROJECT_ID"),
+            migrated.projectDrafts.pendingMutations.keys,
         )
-        assertEquals("save-legacy", durable.itemOperations.single().dependsOnOperationId)
-        assertEquals(null, durable.itemOperations.single().ifMatch)
+        assertTrue(drafts.load(TENANT_A).projectNotes.isEmpty())
+        assertTrue(drafts.load(TENANT_A).pendingMutations.isEmpty())
     }
 
     @Test
@@ -1734,8 +1590,8 @@ class ProjectSyncRepositoryTest {
         val state = MemoryState()
         state.saveSyncState(TENANT_A, loadedState())
         state.saveSyncState(TENANT_B, loadedState(TENANT_B))
-        drafts.save(TENANT_A, FormDrafts(projectNotes = mapOf(PROJECT_ID to "Tenant A")))
-        drafts.save(TENANT_B, FormDrafts(projectNotes = mapOf(PROJECT_ID to "Tenant B")))
+        drafts.save(TENANT_A, FormDrafts(projectRenames = mapOf(PROJECT_ID to "Tenant A")))
+        drafts.save(TENANT_B, FormDrafts(projectRenames = mapOf(PROJECT_ID to "Tenant B")))
         val service = FakeProjectService()
         val repository = repository(service, drafts, state)
 
@@ -1747,14 +1603,14 @@ class ProjectSyncRepositoryTest {
         assertFalse(tenantALink == tenantBLink)
         assertEquals(null, repository.resolveProjectLinkLocally(SESSION_B, tenantALink.key))
         assertFalse(state.loadSyncState(TENANT_A) == TenantSyncState())
-        assertEquals("Tenant A", state.loadSyncState(TENANT_A).projectDrafts.projectNotes[PROJECT_ID])
+        assertEquals("Tenant A", state.loadSyncState(TENANT_A).projectDrafts.projectRenames[PROJECT_ID])
         assertFalse(state.loadSyncState(TENANT_B) == TenantSyncState())
-        assertEquals("Tenant B", repository.projectDrafts(SESSION_B).projectNotes[PROJECT_ID])
+        assertEquals("Tenant B", repository.projectDrafts(SESSION_B).projectRenames[PROJECT_ID])
 
         repository.deactivate(SESSION_B)
         repository.activate(SESSION_A)
         assertEquals(PROJECT_ID, repository.resolveProjectLinkLocally(SESSION_A, tenantALink.key))
-        assertEquals("Tenant A", repository.projectDrafts(SESSION_A).projectNotes[PROJECT_ID])
+        assertEquals("Tenant A", repository.projectDrafts(SESSION_A).projectRenames[PROJECT_ID])
 
         service.membershipRevoked = true
         repository.activate(SESSION_B)
@@ -1764,7 +1620,7 @@ class ProjectSyncRepositoryTest {
         assertEquals(TenantSyncState(), state.loadSyncState(TENANT_B))
         assertEquals(FormDrafts(), drafts.load(TENANT_B))
         assertFalse(state.loadSyncState(TENANT_A) == TenantSyncState())
-        assertEquals("Tenant A", state.loadSyncState(TENANT_A).projectDrafts.projectNotes[PROJECT_ID])
+        assertEquals("Tenant A", state.loadSyncState(TENANT_A).projectDrafts.projectRenames[PROJECT_ID])
     }
 
     private fun repository(

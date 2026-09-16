@@ -67,7 +67,6 @@ data class ProjectNoteItem(
     val updatedAt: String,
     val rowVersion: Int = 0,
     val deletedAt: String? = null,
-    val legacySingleton: Boolean = false,
 )
 
 data class ProjectResourceLink(
@@ -557,10 +556,6 @@ interface ProjectWorkspace {
 }
 
 fun newOperationIdentity(): String = UUID.randomUUID().toString()
-
-fun legacyNoteItemIdentity(projectId: String): String = UUID.nameUUIDFromBytes(
-    "blocks-legacy-note-v1:$projectId".toByteArray(Charsets.UTF_8),
-).toString()
 
 fun noteItemDraftKey(projectId: String, noteId: String? = null): String =
     noteId?.let { "note:$it" } ?: "note:new:$projectId"

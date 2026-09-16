@@ -31,9 +31,7 @@ import dev.blocks.android.project.ProjectResourceLink
 import dev.blocks.android.project.ProjectResourceUri
 import dev.blocks.android.project.ProjectSummary
 import dev.blocks.android.project.ProjectUiPreferences
-import dev.blocks.android.project.legacyNoteItemIdentity
 import dev.blocks.android.project.noteItemDraftKey
-import dev.blocks.android.mvp.NoteItemDraft
 import dev.blocks.android.project.ensureProjectLinks
 import dev.blocks.android.tag.LocalBlockOperation
 import dev.blocks.android.tag.LocalBlockOperationType
@@ -239,22 +237,15 @@ internal class SyncStateRowCodec(
             ).ensureProjectLinks(projectKeyFactory)
         }
         if (rows.schemaVersion < PROJECT_ITEM_SCHEMA_VERSION) {
+            val discardedNotesOperations = projectCache.commands.filter {
+                it.type == ProjectMutationType.SAVE_NOTES
+            }.map { it.operationId }
             projectCache = projectCache.copy(
-                noteItems = projectCache.pages.mapNotNull { page ->
-                    page.notes.body.takeIf(String::isNotEmpty)?.let { body ->
-                        ProjectNoteItem(
-                            id = legacyNoteItemIdentity(page.project.id),
-                            projectId = page.project.id,
-                            body = body,
-                            pinned = false,
-                            authoredByUserId = null,
-                            createdAt = page.notes.updatedAt,
-                            updatedAt = page.notes.updatedAt,
-                            rowVersion = page.notes.rowVersion,
-                            legacySingleton = true,
-                        )
-                    }
-                },
+                commands = projectCache.commands.filterNot { it.type == ProjectMutationType.SAVE_NOTES },
+                retiredOperationIds = (
+                    projectCache.retiredOperationIds + discardedNotesOperations
+                    ).distinct(),
+                projectsAwaitingNotesBaseline = emptyList(),
             )
         }
         validateProjectCache(projectCache)
@@ -265,10 +256,10 @@ internal class SyncStateRowCodec(
         }
         val migratedDrafts = if (rows.schemaVersion < PROJECT_ITEM_SCHEMA_VERSION) {
             decodedDrafts.copy(
-                projectNoteItems = decodedDrafts.projectNoteItems + decodedDrafts.projectNotes.mapKeys { (projectId, _) ->
-                    noteItemDraftKey(projectId, legacyNoteItemIdentity(projectId))
-                }.mapValues { (_, body) -> NoteItemDraft(body) },
                 projectNotes = emptyMap(),
+                pendingMutations = decodedDrafts.pendingMutations.filterValues {
+                    it.operation != ProjectMutationType.SAVE_NOTES.name
+                },
             )
         } else {
             decodedDrafts
@@ -623,13 +614,7 @@ internal fun validateProjectItemOperations(cache: ProjectCacheState) {
                     it.type == ProjectMutationType.CREATE_PROJECT &&
                     (it.targetId == operation.projectId || it.projectId == operation.projectId)
             }
-            val validLegacyNotesSave = cache.commands.any {
-                it.operationId == dependency &&
-                    it.type == ProjectMutationType.SAVE_NOTES &&
-                    it.targetId == operation.projectId &&
-                    operation.targetId == legacyNoteItemIdentity(operation.projectId)
-            }
-            require(validPending || validLegacyProjectCreate || validLegacyNotesSave) {
+            require(validPending || validLegacyProjectCreate) {
                 "A project item operation dependency must precede the dependent operation"
             }
         }
@@ -639,16 +624,9 @@ internal fun validateProjectItemOperations(cache: ProjectCacheState) {
             val versionProducingItemDependency = pendingPosition != null &&
                 pendingPosition < index &&
                 cache.itemOperations[pendingPosition].targetId == operation.targetId
-            val versionProducingLegacyNotesDependency = cache.commands.any {
-                it.operationId == dependency &&
-                    it.type == ProjectMutationType.SAVE_NOTES &&
-                    it.targetId == operation.projectId &&
-                    operation.targetId == legacyNoteItemIdentity(operation.projectId)
-            }
             require(
                 operation.ifMatch?.let { it > 0 } == true ||
-                    versionProducingItemDependency ||
-                    versionProducingLegacyNotesDependency,
+                    versionProducingItemDependency,
             ) {
                 "A versioned project item operation needs If-Match or an earlier version-producing prerequisite"
             }

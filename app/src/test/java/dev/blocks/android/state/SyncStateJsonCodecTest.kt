@@ -21,8 +21,6 @@ import dev.blocks.android.project.ProjectParking
 import dev.blocks.android.project.ProjectSummary
 import dev.blocks.android.project.DashboardView
 import dev.blocks.android.project.ProjectUiPreferences
-import dev.blocks.android.project.legacyNoteItemIdentity
-import dev.blocks.android.project.noteItemDraftKey
 import dev.blocks.android.tag.LocalBlockOperation
 import dev.blocks.android.tag.LocalBlockOperationType
 import dev.blocks.android.tag.LocalBlockRecord
@@ -36,7 +34,7 @@ import org.junit.Test
 
 class SyncStateStorageCodecTest {
     @Test
-    fun schemaNineMigratesEachNonEmptySingletonNoteOnceAndPreservesItsPendingDraft() {
+    fun schemaNineDiscardsSingletonNotesAndDraftsWithoutCreatingDiscreteItems() {
         val first = ProjectSummary(
             id = "10000000-0000-4000-8000-000000000001",
             tenantId = "tenant-a",
@@ -48,6 +46,20 @@ class SyncStateStorageCodecTest {
         )
         val second = first.copy(id = "20000000-0000-4000-8000-000000000002", name = "Second")
         val body = "A".repeat(20_000)
+        val pendingNotes = ProjectMutation(
+            operationId = "discard-notes",
+            type = ProjectMutationType.SAVE_NOTES,
+            targetId = first.id,
+            ifMatch = 7,
+            notesBody = "Pending edit",
+        )
+        val pendingRename = ProjectMutation(
+            operationId = "keep-rename",
+            type = ProjectMutationType.RENAME_PROJECT,
+            targetId = first.id,
+            ifMatch = 1,
+            projectName = "Renamed",
+        )
         val state = TenantSyncState(
             projectCache = ProjectCacheState(
                 activeProjects = listOf(first, second),
@@ -55,6 +67,8 @@ class SyncStateStorageCodecTest {
                     ProjectPage(first, ProjectNotes(first.id, body, 7, first.updatedAt), null),
                     ProjectPage(second, ProjectNotes(second.id, "", 1, second.updatedAt), null),
                 ),
+                commands = listOf(pendingRename, pendingNotes),
+                projectsAwaitingNotesBaseline = listOf(first.id),
             ),
             projectDrafts = FormDrafts(projectNotes = mapOf(first.id to "Pending edit")),
             projectDraftsMigrated = true,
@@ -68,20 +82,17 @@ class SyncStateStorageCodecTest {
         )
 
         val migrated = SyncStateRowCodec().decode(oldRows)
-        val note = migrated.projectCache.noteItems.single()
-        assertEquals(legacyNoteItemIdentity(first.id), note.id)
-        assertEquals(body, note.body)
-        assertTrue(note.legacySingleton)
-        assertEquals(
-            "Pending edit",
-            migrated.projectDrafts.projectNoteItems[
-                noteItemDraftKey(first.id, legacyNoteItemIdentity(first.id))
-            ]?.body,
-        )
+        assertTrue(migrated.projectCache.noteItems.isEmpty())
+        assertTrue(migrated.projectCache.itemOperations.isEmpty())
+        assertEquals(listOf(pendingRename), migrated.projectCache.commands)
+        assertTrue("discard-notes" in migrated.projectCache.retiredOperationIds)
+        assertTrue(migrated.projectCache.projectsAwaitingNotesBaseline.isEmpty())
+        assertTrue(migrated.projectDrafts.projectNoteItems.isEmpty())
         assertTrue(migrated.projectDrafts.projectNotes.isEmpty())
 
         val restarted = SyncStateRowCodec().decode(SyncStateRowCodec().encode(migrated))
-        assertEquals(listOf(note), restarted.projectCache.noteItems)
+        assertTrue(restarted.projectCache.noteItems.isEmpty())
+        assertTrue(restarted.projectDrafts.projectNoteItems.isEmpty())
     }
 
     @Test
@@ -381,7 +392,7 @@ class SyncStateStorageCodecTest {
     }
 
     @Test
-    fun schemaTwoConflictMigratesFailClosedUntilAuthoritativeStateIsRefreshed() {
+    fun schemaTwoSingletonNotesConflictIsRetiredAtTheDiscreteItemsCutover() {
         val command = ProjectMutation(
             operationId = "old-conflict",
             type = ProjectMutationType.SAVE_NOTES,
@@ -403,7 +414,8 @@ class SyncStateStorageCodecTest {
 
         val migrated = SyncStateRowCodec().decode(schemaTwo)
 
-        assertTrue(!migrated.projectCache.commands.single().authoritativeStateConfirmed)
+        assertTrue(migrated.projectCache.commands.isEmpty())
+        assertTrue("old-conflict" in migrated.projectCache.retiredOperationIds)
     }
 
     @Test
