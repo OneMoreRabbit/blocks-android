@@ -34,6 +34,68 @@ import org.junit.Test
 
 class SyncStateStorageCodecTest {
     @Test
+    fun schemaNineDiscardsSingletonNotesAndDraftsWithoutCreatingDiscreteItems() {
+        val first = ProjectSummary(
+            id = "10000000-0000-4000-8000-000000000001",
+            tenantId = "tenant-a",
+            name = "First",
+            lifecycle = ProjectLifecycle.ACTIVE,
+            rowVersion = 1,
+            createdAt = "2026-09-16T09:00:00Z",
+            updatedAt = "2026-09-16T09:00:00Z",
+        )
+        val second = first.copy(id = "20000000-0000-4000-8000-000000000002", name = "Second")
+        val body = "A".repeat(20_000)
+        val pendingNotes = ProjectMutation(
+            operationId = "discard-notes",
+            type = ProjectMutationType.SAVE_NOTES,
+            targetId = first.id,
+            ifMatch = 7,
+            notesBody = "Pending edit",
+        )
+        val pendingRename = ProjectMutation(
+            operationId = "keep-rename",
+            type = ProjectMutationType.RENAME_PROJECT,
+            targetId = first.id,
+            ifMatch = 1,
+            projectName = "Renamed",
+        )
+        val state = TenantSyncState(
+            projectCache = ProjectCacheState(
+                activeProjects = listOf(first, second),
+                pages = listOf(
+                    ProjectPage(first, ProjectNotes(first.id, body, 7, first.updatedAt), null),
+                    ProjectPage(second, ProjectNotes(second.id, "", 1, second.updatedAt), null),
+                ),
+                commands = listOf(pendingRename, pendingNotes),
+                projectsAwaitingNotesBaseline = listOf(first.id),
+            ),
+            projectDrafts = FormDrafts(projectNotes = mapOf(first.id to "Pending edit")),
+            projectDraftsMigrated = true,
+        )
+        val oldRows = SyncStateRowCodec().encode(state).copy(
+            schemaVersion = 9,
+            projectNoteItems = emptyList(),
+            projectResourceLinks = emptyList(),
+            projectItemOperations = emptyList(),
+            retiredProjectItemOperations = emptyList(),
+        )
+
+        val migrated = SyncStateRowCodec().decode(oldRows)
+        assertTrue(migrated.projectCache.noteItems.isEmpty())
+        assertTrue(migrated.projectCache.itemOperations.isEmpty())
+        assertEquals(listOf(pendingRename), migrated.projectCache.commands)
+        assertTrue("discard-notes" in migrated.projectCache.retiredOperationIds)
+        assertTrue(migrated.projectCache.projectsAwaitingNotesBaseline.isEmpty())
+        assertTrue(migrated.projectDrafts.projectNoteItems.isEmpty())
+        assertTrue(migrated.projectDrafts.projectNotes.isEmpty())
+
+        val restarted = SyncStateRowCodec().decode(SyncStateRowCodec().encode(migrated))
+        assertTrue(restarted.projectCache.noteItems.isEmpty())
+        assertTrue(restarted.projectDrafts.projectNoteItems.isEmpty())
+    }
+
+    @Test
     fun roundTripsTheVersionedQueueCacheCursorAndRetiredKeys() {
         val state = TenantSyncState(
             projects = listOf(Project("project-1", "Project one")),
@@ -66,7 +128,7 @@ class SyncStateStorageCodecTest {
         val rows = SyncStateRowCodec().encode(state)
         val decoded = SyncStateRowCodec().decode(rows)
 
-        assertEquals(9, rows.schemaVersion)
+        assertEquals(10, rows.schemaVersion)
         assertEquals(1, rows.projects.size)
         assertEquals(1, rows.commands.size)
         assertEquals(1, rows.retiredIdempotencyKeys.size)
@@ -131,7 +193,7 @@ class SyncStateStorageCodecTest {
 
     @Test
     fun rejectsAnUnknownDatabaseRowSchemaWithoutDiscardingIt() {
-        val rows = SyncStateRowCodec().encode(TenantSyncState()).copy(schemaVersion = 10)
+        val rows = SyncStateRowCodec().encode(TenantSyncState()).copy(schemaVersion = 11)
 
         val error = runCatching { SyncStateRowCodec().decode(rows) }.exceptionOrNull()
 
@@ -318,7 +380,7 @@ class SyncStateStorageCodecTest {
         val rows = SyncStateRowCodec().encode(state)
         val decoded = SyncStateRowCodec().decode(rows)
 
-        assertEquals(9, rows.schemaVersion)
+        assertEquals(10, rows.schemaVersion)
         assertEquals(
             state,
             decoded.copy(projectCache = decoded.projectCache.copy(projectLinks = emptyList())),
@@ -330,7 +392,7 @@ class SyncStateStorageCodecTest {
     }
 
     @Test
-    fun schemaTwoConflictMigratesFailClosedUntilAuthoritativeStateIsRefreshed() {
+    fun schemaTwoSingletonNotesConflictIsRetiredAtTheDiscreteItemsCutover() {
         val command = ProjectMutation(
             operationId = "old-conflict",
             type = ProjectMutationType.SAVE_NOTES,
@@ -352,7 +414,8 @@ class SyncStateStorageCodecTest {
 
         val migrated = SyncStateRowCodec().decode(schemaTwo)
 
-        assertTrue(!migrated.projectCache.commands.single().authoritativeStateConfirmed)
+        assertTrue(migrated.projectCache.commands.isEmpty())
+        assertTrue("old-conflict" in migrated.projectCache.retiredOperationIds)
     }
 
     @Test

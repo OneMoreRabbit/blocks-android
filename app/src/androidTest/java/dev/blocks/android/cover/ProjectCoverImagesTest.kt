@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.media.ExifInterface
+import android.net.Uri
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import java.io.File
@@ -164,25 +165,24 @@ class ProjectCoverImagesTest {
 
     @Test
     fun cropperRetainsOwnedSourceUntilConfirmOrCancelThenDeletesIt() {
-        val captures = CoverCaptureFiles(context)
-        val capture = captures.create()
+        val capture = File(context.cacheDir, "cropper-input.jpg")
         try {
             val bitmap = Bitmap.createBitmap(320, 180, Bitmap.Config.ARGB_8888).apply {
                 eraseColor(Color.rgb(30, 107, 99))
             }
             try {
-                FileOutputStream(capture.path).use { assertTrue(bitmap.compress(Bitmap.CompressFormat.JPEG, 90, it)) }
+                FileOutputStream(capture).use { assertTrue(bitmap.compress(Bitmap.CompressFormat.JPEG, 90, it)) }
             } finally {
                 bitmap.recycle()
             }
             val cropper = AndroidProjectCoverCropper(context, now = { "2026-09-16T09:00:00Z" })
-            val cancelled = cropper.prepare(capture.uri)
+            val cancelled = cropper.prepare(Uri.fromFile(capture))
             val cancelledSource = requireNotNull(cancelled.source)
             assertTrue(cancelledSource.isFile)
             cropper.discard(cancelled)
             assertFalse(cancelledSource.exists())
 
-            val confirmed = cropper.prepare(capture.uri)
+            val confirmed = cropper.prepare(Uri.fromFile(capture))
             val confirmedSource = requireNotNull(confirmed.source)
             val content = cropper.confirm("project", confirmed, CoverCropSelection(0.5f, 0.5f, 1.5f))
             try {
@@ -193,7 +193,7 @@ class ProjectCoverImagesTest {
                 content.clear()
             }
         } finally {
-            captures.delete(capture)
+            capture.delete()
         }
     }
 
@@ -204,52 +204,34 @@ class ProjectCoverImagesTest {
             imports.directoryForTest().apply { mkdirs() },
             "123e4567-e89b-42d3-a456-426614174998.source",
         ).apply { writeBytes(byteArrayOf(1, 2, 3)) }
-        val captures = CoverCaptureFiles(context)
-        val validCapture = captures.create()
-        val invalidCapture = captures.create()
+        val validCapture = File(context.cacheDir, "valid-cover-input.jpg")
+        val invalidCapture = File(context.cacheDir, "invalid-cover-input.jpg")
         try {
             val bitmap = Bitmap.createBitmap(64, 64, Bitmap.Config.ARGB_8888).apply {
                 eraseColor(Color.rgb(30, 107, 99))
             }
             try {
-                FileOutputStream(validCapture.path).use { output ->
+                FileOutputStream(validCapture).use { output ->
                     assertTrue(bitmap.compress(Bitmap.CompressFormat.JPEG, 85, output))
                 }
             } finally {
                 bitmap.recycle()
             }
-            File(invalidCapture.path).writeBytes(byteArrayOf(4, 5, 6))
+            invalidCapture.writeBytes(byteArrayOf(4, 5, 6))
             val importer = AndroidProjectCoverImporter(context, now = { "2026-09-15T15:00:00Z" })
 
-            val imported = importer.importCover("project", validCapture.uri)
+            val imported = importer.importCover("project", Uri.fromFile(validCapture))
             imported.clear()
             assertFalse(orphan.exists())
             assertTrue(imports.directoryForTest().listFiles().orEmpty().none { it.name.endsWith(".source") })
 
-            assertTrue(runCatching { importer.importCover("project", invalidCapture.uri) }.isFailure)
+            assertTrue(runCatching { importer.importCover("project", Uri.fromFile(invalidCapture)) }.isFailure)
             assertTrue(imports.directoryForTest().listFiles().orEmpty().none { it.name.endsWith(".source") })
         } finally {
-            captures.delete(validCapture)
-            captures.delete(invalidCapture)
+            validCapture.delete()
+            invalidCapture.delete()
             orphan.delete()
         }
     }
 
-    @Test
-    fun cameraCaptureFilesRestoreOnlyOwnedFilesAndCleanTerminalOrphans() {
-        val files = CoverCaptureFiles(context)
-        val retained = files.create()
-        val orphan = files.create()
-        File(retained.path).writeBytes(byteArrayOf(1, 2, 3))
-        File(orphan.path).writeBytes(byteArrayOf(4, 5, 6))
-
-        assertEquals(retained.path, files.restore(retained.path)?.path)
-        assertNull(files.restore(File(context.filesDir, "not-owned.jpg").path))
-
-        files.cleanupOrphans(retained.path)
-        assertTrue(File(retained.path).isFile)
-        assertFalse(File(orphan.path).exists())
-        files.delete(retained)
-        assertFalse(File(retained.path).exists())
-    }
 }

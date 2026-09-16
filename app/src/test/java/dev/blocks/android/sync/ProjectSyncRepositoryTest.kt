@@ -16,6 +16,7 @@ import dev.blocks.android.mvp.OfflineOperation
 import dev.blocks.android.mvp.OutcomeTier
 import dev.blocks.android.mvp.ParkingDraft
 import dev.blocks.android.mvp.ParkingRecord
+import dev.blocks.android.mvp.PendingMutation
 import dev.blocks.android.mvp.PickupRequest
 import dev.blocks.android.mvp.PickupResult
 import dev.blocks.android.mvp.Project
@@ -32,10 +33,14 @@ import dev.blocks.android.project.PhysicalBlock
 import dev.blocks.android.project.ProjectCacheState
 import dev.blocks.android.project.ProjectCoverContent
 import dev.blocks.android.project.ProjectIdentityMapping
+import dev.blocks.android.project.ProjectItemAcknowledgement
+import dev.blocks.android.project.ProjectItemMutation
+import dev.blocks.android.project.ProjectItemMutationType
 import dev.blocks.android.project.ProjectLifecycle
 import dev.blocks.android.project.ProjectMutationType
 import dev.blocks.android.project.ProjectMutationStatus
 import dev.blocks.android.project.ProjectNotes
+import dev.blocks.android.project.ProjectNoteItem
 import dev.blocks.android.project.ProjectPage
 import dev.blocks.android.project.ProjectParking
 import dev.blocks.android.project.ProjectService
@@ -60,6 +65,271 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ProjectSyncRepositoryTest {
+    @Test
+    fun exactItemAcknowledgementsHandOffVersionsAcrossRestartWhileAmbiguityAndConflictStayClosed() {
+        val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
+        val noteId = "90000000-0000-4000-8000-000000000009"
+        var repository = repository(FakeProjectService(), MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+        repository.addNoteItem(SESSION_A, PROJECT_ID, "Created", "create-note", noteId)
+        repository.editNoteItem(SESSION_A, noteId, "Edited", "edit-note")
+        repository.setNoteItemPinned(SESSION_A, noteId, true, "pin-note")
+        repository.deleteNoteItem(SESSION_A, noteId, "delete-note")
+
+        repository.recordProjectItemDeliveryUncertain(SESSION_A, "create-note")
+        var pending = state.loadSyncState(TENANT_A).projectCache.itemOperations
+        assertTrue(pending.first().deliveryUncertain)
+        assertEquals("create-note", pending[1].dependsOnOperationId)
+        assertEquals(null, pending[1].ifMatch)
+
+        repository = repository(FakeProjectService(), MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+        repository.acknowledgeProjectItem(
+            SESSION_A,
+            ProjectItemAcknowledgement.Note(
+                "create-note",
+                ProjectNoteItem(
+                    noteId,
+                    PROJECT_ID,
+                    "Created",
+                    false,
+                    "00000000-0000-4000-8000-000000000111",
+                    "2026-09-16T10:00:00Z",
+                    "2026-09-16T10:00:00Z",
+                    rowVersion = 1,
+                ),
+            ),
+        )
+        pending = state.loadSyncState(TENANT_A).projectCache.itemOperations
+        assertEquals(listOf("edit-note", "pin-note", "delete-note"), pending.map { it.operationId })
+        assertEquals(1, pending[0].ifMatch)
+        assertEquals(null, pending[0].dependsOnOperationId)
+        assertTrue(state.loadSyncState(TENANT_A).projectCache.noteItems.single().deletedAt != null)
+
+        repository = repository(FakeProjectService(), MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+        repository.acknowledgeProjectItem(
+            SESSION_A,
+            ProjectItemAcknowledgement.Note(
+                "edit-note",
+                ProjectNoteItem(
+                    noteId,
+                    PROJECT_ID,
+                    "Edited",
+                    false,
+                    "00000000-0000-4000-8000-000000000111",
+                    "2026-09-16T10:00:00Z",
+                    "2026-09-16T10:01:00Z",
+                    rowVersion = 2,
+                ),
+            ),
+        )
+        pending = state.loadSyncState(TENANT_A).projectCache.itemOperations
+        assertEquals(2, pending[0].ifMatch)
+        assertEquals("pin-note", pending[0].operationId)
+
+        repository = repository(FakeProjectService(), MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+        repository.acknowledgeProjectItem(
+            SESSION_A,
+            ProjectItemAcknowledgement.Note(
+                "pin-note",
+                ProjectNoteItem(
+                    noteId,
+                    PROJECT_ID,
+                    "Edited",
+                    true,
+                    "00000000-0000-4000-8000-000000000111",
+                    "2026-09-16T10:00:00Z",
+                    "2026-09-16T10:02:00Z",
+                    rowVersion = 3,
+                ),
+            ),
+        )
+        pending = state.loadSyncState(TENANT_A).projectCache.itemOperations
+        assertEquals(3, pending.single().ifMatch)
+        assertEquals("delete-note", pending.single().operationId)
+
+        repository = repository(FakeProjectService(), MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+        repository.acknowledgeProjectItem(
+            SESSION_A,
+            ProjectItemAcknowledgement.Note(
+                "delete-note",
+                ProjectNoteItem(
+                    noteId,
+                    PROJECT_ID,
+                    "Edited",
+                    true,
+                    "00000000-0000-4000-8000-000000000111",
+                    "2026-09-16T10:00:00Z",
+                    "2026-09-16T10:03:00Z",
+                    rowVersion = 4,
+                    deletedAt = "2026-09-16T10:03:00Z",
+                ),
+            ),
+        )
+        val completed = state.loadSyncState(TENANT_A).projectCache
+        assertTrue(completed.itemOperations.isEmpty())
+        assertEquals(listOf("create-note", "edit-note", "pin-note", "delete-note"), completed.retiredItemOperationIds)
+
+        val linkId = "91000000-0000-4000-8000-000000000009"
+        repository.addResourceLink(SESSION_A, PROJECT_ID, "First", "https://example.com", "create-link", linkId)
+        repository.editResourceLink(SESSION_A, linkId, "Second", "https://example.com/2", "edit-link")
+        repository.recordProjectItemConflict(SESSION_A, "create-link")
+        assertTrue(
+            runCatching {
+                repository.acknowledgeProjectItem(
+                    SESSION_A,
+                    ProjectItemAcknowledgement.Link(
+                        "create-link",
+                        state.loadSyncState(TENANT_A).projectCache.resourceLinks.single().copy(rowVersion = 1),
+                    ),
+                )
+            }.isFailure,
+        )
+        pending = state.loadSyncState(TENANT_A).projectCache.itemOperations
+        assertEquals(ProjectMutationStatus.REQUIRES_RECONCILIATION, pending[0].status)
+        assertEquals("create-link", pending[1].dependsOnOperationId)
+        assertEquals(null, pending[1].ifMatch)
+    }
+
+    @Test
+    fun legacyDraftCutoverDiscardsSingletonNotesIntentButMigratesUnrelatedProjectDrafts() {
+        val state = MemoryState()
+        val drafts = MemoryDrafts().apply {
+            save(
+                TENANT_A,
+                FormDrafts(
+                    projectNotes = mapOf(PROJECT_ID to "Discard this singleton draft"),
+                    projectRenames = mapOf(PROJECT_ID to "Retain this rename"),
+                    pendingMutations = mapOf(
+                        "project-notes:$PROJECT_ID" to PendingMutation(
+                            "SAVE_NOTES",
+                            PROJECT_ID,
+                            "notes-digest",
+                            "notes-operation",
+                        ),
+                        "project-rename:$PROJECT_ID" to PendingMutation(
+                            "RENAME_PROJECT",
+                            PROJECT_ID,
+                            "rename-digest",
+                            "rename-operation",
+                        ),
+                    ),
+                ),
+            )
+        }
+
+        repository(FakeProjectService(), drafts, state).activate(SESSION_A)
+
+        val migrated = state.loadSyncState(TENANT_A)
+        assertTrue(migrated.projectDrafts.projectNotes.isEmpty())
+        assertEquals("Retain this rename", migrated.projectDrafts.projectRenames[PROJECT_ID])
+        assertEquals(
+            setOf("project-rename:$PROJECT_ID"),
+            migrated.projectDrafts.pendingMutations.keys,
+        )
+        assertTrue(drafts.load(TENANT_A).projectNotes.isEmpty())
+        assertTrue(drafts.load(TENANT_A).pendingMutations.isEmpty())
+    }
+
+    @Test
+    fun noteAndLinkActionsCommitOneLocalProjectionAndOneOrderedApi06IntentWithoutService() {
+        val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
+        val service = FakeProjectService().apply { offline = true }
+        val repository = repository(service, MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+        val noteId = "10000000-0000-4000-8000-000000000001"
+        val linkId = "20000000-0000-4000-8000-000000000002"
+
+        repository.addNoteItem(SESSION_A, PROJECT_ID, "First note", "note-create", noteId)
+        repository.editNoteItem(SESSION_A, noteId, "Edited note", "note-edit")
+        repository.setNoteItemPinned(SESSION_A, noteId, true, "note-pin")
+        repository.addResourceLink(
+            SESSION_A,
+            PROJECT_ID,
+            "Reference",
+            "https://example.com/reference",
+            "link-create",
+            linkId,
+        )
+        repository.editResourceLink(
+            SESSION_A,
+            linkId,
+            "Vault",
+            "obsidian://open?vault=Blocks&file=Project",
+            "link-edit",
+        )
+
+        val saved = state.loadSyncState(TENANT_A).projectCache
+        assertEquals("Edited note", saved.noteItems.single { it.id == noteId }.body)
+        assertTrue(saved.noteItems.single { it.id == noteId }.pinned)
+        assertEquals("obsidian://open?vault=Blocks&file=Project", saved.resourceLinks.single().uri)
+        assertEquals(
+            listOf(
+                ProjectItemMutationType.CREATE_NOTE,
+                ProjectItemMutationType.EDIT_NOTE,
+                ProjectItemMutationType.PIN_NOTE,
+                ProjectItemMutationType.CREATE_LINK,
+                ProjectItemMutationType.EDIT_LINK,
+            ),
+            saved.itemOperations.map { it.type },
+        )
+        assertEquals("note-create", saved.itemOperations[1].dependsOnOperationId)
+        assertEquals("note-edit", saved.itemOperations[2].dependsOnOperationId)
+        assertEquals("link-create", saved.itemOperations[4].dependsOnOperationId)
+    }
+
+    @Test
+    fun itemDeletesPersistTombstonesAndUnsafeLinksWriteNothing() {
+        val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
+        val repository = repository(FakeProjectService(), MemoryDrafts(), state)
+        repository.activate(SESSION_A)
+        val noteId = "30000000-0000-4000-8000-000000000003"
+        val linkId = "40000000-0000-4000-8000-000000000004"
+        repository.addNoteItem(SESSION_A, PROJECT_ID, "Delete me", "note-create", noteId)
+        repository.addResourceLink(
+            SESSION_A,
+            PROJECT_ID,
+            "Safe",
+            "https://example.com",
+            "link-create",
+            linkId,
+        )
+        val savesBeforeUnsafe = state.saved.size
+
+        listOf(
+            "intent://open/#Intent;scheme=https;end",
+            "file:///tmp/private",
+            "content://provider/item",
+            "https://user:secret@example.com/path",
+            "not a URI",
+        ).forEachIndexed { index, unsafe ->
+            assertTrue(
+                runCatching {
+                    repository.addResourceLink(
+                        SESSION_A,
+                        PROJECT_ID,
+                        "Unsafe",
+                        unsafe,
+                        "unsafe-$index",
+                        "50000000-0000-4000-8000-00000000000$index",
+                    )
+                }.isFailure,
+            )
+        }
+        assertEquals(savesBeforeUnsafe, state.saved.size)
+
+        repository.deleteNoteItem(SESSION_A, noteId, "note-delete")
+        repository.deleteResourceLink(SESSION_A, linkId, "link-delete")
+        val saved = state.loadSyncState(TENANT_A).projectCache
+        assertNotNull(saved.noteItems.single().deletedAt)
+        assertNotNull(saved.resourceLinks.single().deletedAt)
+        assertEquals(ProjectItemMutationType.DELETE_NOTE, saved.itemOperations[saved.itemOperations.lastIndex - 1].type)
+        assertEquals(ProjectItemMutationType.DELETE_LINK, saved.itemOperations.last().type)
+    }
+
     @Test
     fun legacyProjectGetsOneStableCollisionCheckedKeyWithoutCreatingWireOperations() {
         val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
@@ -578,6 +848,21 @@ class ProjectSyncRepositoryTest {
             body = "Saved while create waits",
             operationId = "notes-concurrent",
         )
+        repository.addNoteItem(
+            SESSION_A,
+            "client-concurrent",
+            "Item saved while create waits",
+            operationId = "item-concurrent",
+            clientId = "70000000-0000-4000-8000-000000000007",
+        )
+        repository.addResourceLink(
+            SESSION_A,
+            "client-concurrent",
+            "Concurrent reference",
+            "https://example.com/concurrent",
+            operationId = "link-concurrent",
+            clientId = "80000000-0000-4000-8000-000000000008",
+        )
         service.allowCreate.countDown()
         background.join(2_000)
 
@@ -590,6 +875,10 @@ class ProjectSyncRepositoryTest {
         assertTrue(durable.parkingRecords.none { it.projectId == "client-concurrent" })
         assertEquals("Saved while create waits", durable.pages.single { it.project.id == PROJECT_ID }.notes.body)
         assertEquals(listOf("Saved while create waits"), service.savedNotesBodies)
+        assertEquals(setOf(PROJECT_ID), durable.noteItems.map { it.projectId }.toSet())
+        assertEquals(setOf(PROJECT_ID), durable.resourceLinks.map { it.projectId }.toSet())
+        assertEquals(2, durable.itemOperations.size)
+        assertTrue(durable.itemOperations.all { it.projectId == PROJECT_ID && it.dependsOnOperationId == null })
     }
 
     @Test
@@ -1301,8 +1590,8 @@ class ProjectSyncRepositoryTest {
         val state = MemoryState()
         state.saveSyncState(TENANT_A, loadedState())
         state.saveSyncState(TENANT_B, loadedState(TENANT_B))
-        drafts.save(TENANT_A, FormDrafts(projectNotes = mapOf(PROJECT_ID to "Tenant A")))
-        drafts.save(TENANT_B, FormDrafts(projectNotes = mapOf(PROJECT_ID to "Tenant B")))
+        drafts.save(TENANT_A, FormDrafts(projectRenames = mapOf(PROJECT_ID to "Tenant A")))
+        drafts.save(TENANT_B, FormDrafts(projectRenames = mapOf(PROJECT_ID to "Tenant B")))
         val service = FakeProjectService()
         val repository = repository(service, drafts, state)
 
@@ -1314,14 +1603,14 @@ class ProjectSyncRepositoryTest {
         assertFalse(tenantALink == tenantBLink)
         assertEquals(null, repository.resolveProjectLinkLocally(SESSION_B, tenantALink.key))
         assertFalse(state.loadSyncState(TENANT_A) == TenantSyncState())
-        assertEquals("Tenant A", state.loadSyncState(TENANT_A).projectDrafts.projectNotes[PROJECT_ID])
+        assertEquals("Tenant A", state.loadSyncState(TENANT_A).projectDrafts.projectRenames[PROJECT_ID])
         assertFalse(state.loadSyncState(TENANT_B) == TenantSyncState())
-        assertEquals("Tenant B", repository.projectDrafts(SESSION_B).projectNotes[PROJECT_ID])
+        assertEquals("Tenant B", repository.projectDrafts(SESSION_B).projectRenames[PROJECT_ID])
 
         repository.deactivate(SESSION_B)
         repository.activate(SESSION_A)
         assertEquals(PROJECT_ID, repository.resolveProjectLinkLocally(SESSION_A, tenantALink.key))
-        assertEquals("Tenant A", repository.projectDrafts(SESSION_A).projectNotes[PROJECT_ID])
+        assertEquals("Tenant A", repository.projectDrafts(SESSION_A).projectRenames[PROJECT_ID])
 
         service.membershipRevoked = true
         repository.activate(SESSION_B)
@@ -1331,7 +1620,7 @@ class ProjectSyncRepositoryTest {
         assertEquals(TenantSyncState(), state.loadSyncState(TENANT_B))
         assertEquals(FormDrafts(), drafts.load(TENANT_B))
         assertFalse(state.loadSyncState(TENANT_A) == TenantSyncState())
-        assertEquals("Tenant A", state.loadSyncState(TENANT_A).projectDrafts.projectNotes[PROJECT_ID])
+        assertEquals("Tenant A", state.loadSyncState(TENANT_A).projectDrafts.projectRenames[PROJECT_ID])
     }
 
     private fun repository(

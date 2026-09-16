@@ -56,6 +56,30 @@ data class ProjectParking(
     val supersedesId: String? = null,
 )
 
+data class ProjectNoteItem(
+    val id: String,
+    val projectId: String,
+    val body: String,
+    val pinned: Boolean,
+    /** Service identity after acknowledgement; local-only sentinels never cross the wire. */
+    val authoredByUserId: String?,
+    val createdAt: String,
+    val updatedAt: String,
+    val rowVersion: Int = 0,
+    val deletedAt: String? = null,
+)
+
+data class ProjectResourceLink(
+    val id: String,
+    val projectId: String,
+    val title: String,
+    val uri: String,
+    val createdAt: String,
+    val updatedAt: String,
+    val rowVersion: Int = 0,
+    val deletedAt: String? = null,
+)
+
 data class ProjectPage(
     val project: ProjectSummary,
     val notes: ProjectNotes,
@@ -147,6 +171,58 @@ enum class ProjectMutationType {
 
 enum class ProjectMutationStatus { PENDING, REQUIRES_RECONCILIATION }
 
+enum class ProjectItemMutationType {
+    CREATE_NOTE,
+    EDIT_NOTE,
+    PIN_NOTE,
+    DELETE_NOTE,
+    CREATE_LINK,
+    EDIT_LINK,
+    DELETE_LINK,
+}
+
+/** Durable API-0.6-shaped intent. It remains local until reviewed API 0.6 artifacts exist. */
+data class ProjectItemMutation(
+    val operationId: String,
+    val type: ProjectItemMutationType,
+    val targetId: String,
+    val projectId: String,
+    val clientResourceId: String? = null,
+    val ifMatch: Int? = null,
+    val noteBody: String? = null,
+    val pinned: Boolean? = null,
+    val linkTitle: String? = null,
+    val linkUri: String? = null,
+    val dependsOnOperationId: String? = null,
+    val createdAt: String,
+    val status: ProjectMutationStatus = ProjectMutationStatus.PENDING,
+    val deliveryUncertain: Boolean = false,
+    val contractVersion: String = "0.6",
+)
+
+/** Exact API-0.6-shaped acknowledgement applied by the future transport adapter. */
+sealed interface ProjectItemAcknowledgement {
+    val operationId: String
+    val projectId: String
+    val itemId: String
+
+    data class Note(
+        override val operationId: String,
+        val item: ProjectNoteItem,
+    ) : ProjectItemAcknowledgement {
+        override val projectId: String get() = item.projectId
+        override val itemId: String get() = item.id
+    }
+
+    data class Link(
+        override val operationId: String,
+        val item: ProjectResourceLink,
+    ) : ProjectItemAcknowledgement {
+        override val projectId: String get() = item.projectId
+        override val itemId: String get() = item.id
+    }
+}
+
 enum class DashboardView { LIST, TILES }
 
 data class ProjectUiPreferences(
@@ -197,6 +273,10 @@ data class ProjectCacheState(
     val localBlockOperations: List<LocalBlockOperation> = emptyList(),
     val projectLinks: List<ProjectLinkIdentity> = emptyList(),
     val projectCovers: List<ProjectCover> = emptyList(),
+    val noteItems: List<ProjectNoteItem> = emptyList(),
+    val resourceLinks: List<ProjectResourceLink> = emptyList(),
+    val itemOperations: List<ProjectItemMutation> = emptyList(),
+    val retiredItemOperationIds: List<String> = emptyList(),
     val commands: List<ProjectMutation> = emptyList(),
     val retiredOperationIds: List<String> = emptyList(),
     val provisionalProjectIds: List<String> = emptyList(),
@@ -212,6 +292,7 @@ data class BackgroundSyncResult(
     val reconciliationRequired: Boolean,
     val conflict: ProjectConflict? = null,
     val pendingBlockOperations: Int = 0,
+    val pendingItemOperations: Int = 0,
 )
 
 data class ProjectConflict(
@@ -408,6 +489,62 @@ interface ProjectWorkspace {
         operationId: String = newOperationIdentity(),
         clientId: String = operationId,
     ): BackgroundSyncResult
+    fun addNoteItem(
+        session: Session,
+        projectId: String,
+        body: String,
+        operationId: String = newOperationIdentity(),
+        clientId: String = newOperationIdentity(),
+    ): BackgroundSyncResult = throw UnsupportedOperationException("Project note items are unavailable")
+    fun editNoteItem(
+        session: Session,
+        noteId: String,
+        body: String,
+        operationId: String = newOperationIdentity(),
+    ): BackgroundSyncResult = throw UnsupportedOperationException("Project note items are unavailable")
+    fun setNoteItemPinned(
+        session: Session,
+        noteId: String,
+        pinned: Boolean,
+        operationId: String = newOperationIdentity(),
+    ): BackgroundSyncResult = throw UnsupportedOperationException("Project note items are unavailable")
+    fun deleteNoteItem(
+        session: Session,
+        noteId: String,
+        operationId: String = newOperationIdentity(),
+    ): BackgroundSyncResult = throw UnsupportedOperationException("Project note items are unavailable")
+    fun addResourceLink(
+        session: Session,
+        projectId: String,
+        title: String,
+        uri: String,
+        operationId: String = newOperationIdentity(),
+        clientId: String = newOperationIdentity(),
+    ): BackgroundSyncResult = throw UnsupportedOperationException("Project resource links are unavailable")
+    fun editResourceLink(
+        session: Session,
+        linkId: String,
+        title: String,
+        uri: String,
+        operationId: String = newOperationIdentity(),
+    ): BackgroundSyncResult = throw UnsupportedOperationException("Project resource links are unavailable")
+    fun deleteResourceLink(
+        session: Session,
+        linkId: String,
+        operationId: String = newOperationIdentity(),
+    ): BackgroundSyncResult = throw UnsupportedOperationException("Project resource links are unavailable")
+    fun acknowledgeProjectItem(
+        session: Session,
+        acknowledgement: ProjectItemAcknowledgement,
+    ): BackgroundSyncResult = throw UnsupportedOperationException("Project item synchronization is unavailable")
+    fun recordProjectItemDeliveryUncertain(
+        session: Session,
+        operationId: String,
+    ): BackgroundSyncResult = throw UnsupportedOperationException("Project item synchronization is unavailable")
+    fun recordProjectItemConflict(
+        session: Session,
+        operationId: String,
+    ): BackgroundSyncResult = throw UnsupportedOperationException("Project item synchronization is unavailable")
     fun discardConflict(session: Session, operationId: String): BackgroundSyncResult
     fun retryConflict(
         session: Session,
@@ -419,6 +556,12 @@ interface ProjectWorkspace {
 }
 
 fun newOperationIdentity(): String = UUID.randomUUID().toString()
+
+fun noteItemDraftKey(projectId: String, noteId: String? = null): String =
+    noteId?.let { "note:$it" } ?: "note:new:$projectId"
+
+fun resourceLinkDraftKey(projectId: String, linkId: String? = null): String =
+    linkId?.let { "link:$it" } ?: "link:new:$projectId"
 
 internal fun ProjectCacheState.ensureProjectLinks(
     keyFactory: ProjectKeyFactory,

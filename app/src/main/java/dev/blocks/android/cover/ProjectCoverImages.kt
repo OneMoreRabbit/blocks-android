@@ -8,7 +8,6 @@ import android.graphics.Color
 import android.graphics.Matrix
 import android.media.ExifInterface
 import android.net.Uri
-import androidx.core.content.FileProvider
 import dev.blocks.android.project.ProjectCoverContent
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -391,56 +390,6 @@ class ProjectCoverImageProcessor {
         private const val THUMBNAIL_QUALITY = 82
         private const val TARGET_ASPECT = DISPLAY_WIDTH.toDouble() / DISPLAY_HEIGHT
         private val PAPER = Color.rgb(246, 245, 240)
-    }
-}
-
-data class PendingCameraCover(val uri: Uri, val path: String)
-
-/** Owns plaintext camera destinations and removes them best-effort after terminal results. */
-class CoverCaptureFiles(private val context: Context) {
-    private val directory = File(context.cacheDir, DIRECTORY)
-
-    fun create(): PendingCameraCover {
-        check(directory.mkdirs() || directory.isDirectory) { "Could not create the cover capture directory" }
-        val file = File(directory, "${UUID.randomUUID()}.jpg")
-        check(file.createNewFile()) { "Could not create a cover capture destination" }
-        return PendingCameraCover(
-            FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file),
-            file.absolutePath,
-        )
-    }
-
-    fun restore(path: String?): PendingCameraCover? {
-        if (path.isNullOrBlank()) return null
-        val file = File(path)
-        if (!isOwned(file) || !file.isFile) return null
-        return PendingCameraCover(
-            FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file),
-            file.absolutePath,
-        )
-    }
-
-    fun delete(capture: PendingCameraCover?): Boolean {
-        capture ?: return true
-        val file = File(capture.path)
-        return !file.exists() || isOwned(file) && bestEffortPrivateDelete(file)
-    }
-
-    fun cleanupOrphans(exceptPath: String? = null): Int {
-        var removed = 0
-        directory.listFiles().orEmpty().forEach { file ->
-            if (file.absolutePath != exceptPath && isOwned(file) && bestEffortPrivateDelete(file)) removed += 1
-        }
-        return removed
-    }
-
-    private fun isOwned(file: File): Boolean = runCatching {
-        file.canonicalFile.parentFile == directory.canonicalFile && file.name.matches(FILE_NAME)
-    }.getOrDefault(false)
-
-    private companion object {
-        const val DIRECTORY = "cover-capture"
-        val FILE_NAME = Regex("[0-9a-f-]{36}\\.jpg")
     }
 }
 

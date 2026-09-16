@@ -14,10 +14,14 @@ import dev.blocks.android.mvp.TenantSyncState
 import dev.blocks.android.project.PhysicalBlock
 import dev.blocks.android.project.ProjectCover
 import dev.blocks.android.project.ProjectIdentityMapping
+import dev.blocks.android.project.ProjectItemMutation
+import dev.blocks.android.project.ProjectItemMutationType
 import dev.blocks.android.project.ProjectMutation
 import dev.blocks.android.project.ProjectMutationType
+import dev.blocks.android.project.ProjectNoteItem
 import dev.blocks.android.project.ProjectPage
 import dev.blocks.android.project.ProjectParking
+import dev.blocks.android.project.ProjectResourceLink
 import dev.blocks.android.project.ProjectSummary
 import dev.blocks.android.tag.LocalBlockOperation
 import dev.blocks.android.tag.LocalBlockRecord
@@ -45,6 +49,7 @@ class AndroidSyncStateStore internal constructor(
     },
     private val migrationCheckpoint: (MigrationCheckpoint) -> Unit = {},
     private val beforeMutationCommit: (ProjectMutationType) -> Unit = {},
+    private val beforeItemMutationCommit: (ProjectItemMutationType) -> Unit = {},
 ) : SyncStateStore {
     private val applicationContext = context.applicationContext
     private val rowCodec = SyncStateRowCodec()
@@ -60,10 +65,14 @@ class AndroidSyncStateStore internal constructor(
             discardNormalizedReplacement(tenantId)
             return migrateReleasedStore(tenantId)
         }
-        val state = open(tenantId).use { helper ->
-            rowCodec.decode(readRows(helper.readableDatabase, tenantId))
+        val (rows, state) = open(tenantId).use { helper ->
+            val encoded = readRows(helper.readableDatabase, tenantId)
+            encoded to rowCodec.decode(encoded)
         }
         validateTenant(tenantId, state)
+        if (rows.schemaVersion < SyncStateRowCodec.CURRENT_SCHEMA_VERSION) {
+            persist(tenantId, previous = null, state = state)
+        }
         retireReleasedStoreIfPresent(tenantId)
         return state
     }
@@ -100,6 +109,82 @@ class AndroidSyncStateStore internal constructor(
             } finally {
                 database.endTransaction()
             }
+        }
+    }
+
+    @Synchronized
+    override fun saveProjectItemMutation(
+        tenantId: String,
+        previous: TenantSyncState,
+        state: TenantSyncState,
+        type: ProjectItemMutationType,
+    ) {
+        if (!databaseFile(tenantId).exists()) {
+            persist(tenantId, previous = null, state = state)
+            return
+        }
+        validateTenant(tenantId, state)
+        open(tenantId).use { helper ->
+            val database = helper.writableDatabase
+            database.beginTransaction()
+            try {
+                persistItemMutationRows(database, previous, state, type)
+                beforeItemMutationCommit(type)
+                database.setTransactionSuccessful()
+            } finally {
+                database.endTransaction()
+            }
+        }
+    }
+
+    private fun persistItemMutationRows(
+        database: SQLiteDatabase,
+        previous: TenantSyncState,
+        state: TenantSyncState,
+        type: ProjectItemMutationType,
+    ) {
+        val operation = state.projectCache.itemOperations.last()
+        require(operation.type == type && previous.projectCache.itemOperations.none {
+            it.operationId == operation.operationId
+        })
+        upsertRecord(
+            database,
+            TABLE_PROJECT_ITEM_OPERATIONS,
+            operation.operationId,
+            state.projectCache.itemOperations.lastIndex,
+            gson.toJson(operation),
+        )
+        when (type) {
+            ProjectItemMutationType.CREATE_NOTE,
+            ProjectItemMutationType.EDIT_NOTE,
+            ProjectItemMutationType.PIN_NOTE,
+            ProjectItemMutationType.DELETE_NOTE,
+            -> {
+                val note = state.projectCache.noteItems.single { it.id == operation.targetId }
+                upsertRecord(
+                    database,
+                    TABLE_PROJECT_NOTE_ITEMS,
+                    note.id,
+                    state.projectCache.noteItems.indexOf(note),
+                    gson.toJson(note),
+                )
+            }
+            ProjectItemMutationType.CREATE_LINK,
+            ProjectItemMutationType.EDIT_LINK,
+            ProjectItemMutationType.DELETE_LINK,
+            -> {
+                val link = state.projectCache.resourceLinks.single { it.id == operation.targetId }
+                upsertRecord(
+                    database,
+                    TABLE_PROJECT_RESOURCE_LINKS,
+                    link.id,
+                    state.projectCache.resourceLinks.indexOf(link),
+                    gson.toJson(link),
+                )
+            }
+        }
+        if (previous.projectDrafts != state.projectDrafts) {
+            upsertRecord(database, TABLE_PROJECT_DRAFTS, SINGLETON_ID, 0, gson.toJson(state.projectDrafts))
         }
     }
 
@@ -353,6 +438,7 @@ class AndroidSyncStateStore internal constructor(
         require(state.projectCache.projectCovers.all { it.tenantId == tenantId }) {
             "Project cover state crosses a tenant boundary"
         }
+        validateProjectItemOperations(state.projectCache)
     }
 
     private fun readRows(database: SQLiteDatabase, tenantId: String): EncodedSyncRows {
@@ -418,6 +504,10 @@ class AndroidSyncStateStore internal constructor(
             localBlockOperations = rows(TABLE_LOCAL_BLOCK_OPERATIONS),
             projectLinks = rows(TABLE_PROJECT_LINKS),
             projectCovers = rows(TABLE_PROJECT_COVERS),
+            projectNoteItems = rows(TABLE_PROJECT_NOTE_ITEMS),
+            projectResourceLinks = rows(TABLE_PROJECT_RESOURCE_LINKS),
+            projectItemOperations = rows(TABLE_PROJECT_ITEM_OPERATIONS),
+            retiredProjectItemOperations = rows(TABLE_RETIRED_PROJECT_ITEM_OPERATIONS),
             projectCommands = rows(TABLE_PROJECT_COMMANDS),
             retiredOperationIds = rows(TABLE_RETIRED_OPERATIONS),
             provisionalProjectIds = rows(TABLE_PROVISIONAL_PROJECTS),
@@ -493,6 +583,10 @@ class AndroidSyncStateStore internal constructor(
             TABLE_LOCAL_BLOCK_OPERATIONS to rows.localBlockOperations,
             TABLE_PROJECT_LINKS to rows.projectLinks,
             TABLE_PROJECT_COVERS to rows.projectCovers,
+            TABLE_PROJECT_NOTE_ITEMS to rows.projectNoteItems,
+            TABLE_PROJECT_RESOURCE_LINKS to rows.projectResourceLinks,
+            TABLE_PROJECT_ITEM_OPERATIONS to rows.projectItemOperations,
+            TABLE_RETIRED_PROJECT_ITEM_OPERATIONS to rows.retiredProjectItemOperations,
             TABLE_PROJECT_COMMANDS to rows.projectCommands,
             TABLE_RETIRED_OPERATIONS to rows.retiredOperationIds,
             TABLE_PROVISIONAL_PROJECTS to rows.provisionalProjectIds,
@@ -598,6 +692,9 @@ class AndroidSyncStateStore internal constructor(
         TABLE_LOCAL_BLOCK_OPERATIONS -> gson.fromJson(value, LocalBlockOperation::class.java).operationId
         TABLE_PROJECT_LINKS -> gson.fromJson(value, dev.blocks.android.tag.ProjectLinkIdentity::class.java).projectId
         TABLE_PROJECT_COVERS -> gson.fromJson(value, ProjectCover::class.java).projectId
+        TABLE_PROJECT_NOTE_ITEMS -> gson.fromJson(value, ProjectNoteItem::class.java).id
+        TABLE_PROJECT_RESOURCE_LINKS -> gson.fromJson(value, ProjectResourceLink::class.java).id
+        TABLE_PROJECT_ITEM_OPERATIONS -> gson.fromJson(value, ProjectItemMutation::class.java).operationId
         TABLE_PROJECT_COMMANDS -> gson.fromJson(value, ProjectMutation::class.java).operationId
         TABLE_PROJECT_ID_MAPPINGS -> gson.fromJson(value, ProjectIdentityMapping::class.java).provisionalId
         TABLE_PROJECT_DRAFTS, TABLE_PROJECT_UI_PREFERENCES -> SINGLETON_ID
@@ -681,7 +778,17 @@ class AndroidSyncStateStore internal constructor(
         }
 
         override fun onUpgrade(database: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-            error("No normalized local-state migration from $oldVersion to $newVersion")
+            require(oldVersion == 1 && newVersion == 2) {
+                "No normalized local-state migration from $oldVersion to $newVersion"
+            }
+            PROJECT_ITEM_TABLES.forEach { table ->
+                database.execSQL(
+                    "CREATE TABLE $table (" +
+                        "$COLUMN_ID TEXT PRIMARY KEY NOT NULL, " +
+                        "$COLUMN_POSITION INTEGER NOT NULL, " +
+                        "$COLUMN_PAYLOAD BLOB NOT NULL)",
+                )
+            }
         }
 
         override fun onDowngrade(database: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -692,7 +799,7 @@ class AndroidSyncStateStore internal constructor(
     private data class StoredRow(val position: Int, val value: String)
 
     internal companion object {
-        const val DATABASE_VERSION = 1
+        const val DATABASE_VERSION = 2
         const val DATABASE_PREFIX = "blocks_local_v10_"
         const val SECRET_KEY_PREFIX = "blocks-local-secrets-v1-"
         const val TRANSFORMATION = "AES/GCM/NoPadding"
@@ -713,6 +820,10 @@ class AndroidSyncStateStore internal constructor(
         const val TABLE_LOCAL_BLOCK_OPERATIONS = "protected_block_operations"
         const val TABLE_PROJECT_LINKS = "project_links"
         const val TABLE_PROJECT_COVERS = "project_covers"
+        const val TABLE_PROJECT_NOTE_ITEMS = "project_note_items"
+        const val TABLE_PROJECT_RESOURCE_LINKS = "project_resource_links"
+        const val TABLE_PROJECT_ITEM_OPERATIONS = "project_item_operations"
+        const val TABLE_RETIRED_PROJECT_ITEM_OPERATIONS = "retired_project_item_operations"
         const val TABLE_PROJECT_COMMANDS = "sync_operations"
         const val TABLE_RETIRED_OPERATIONS = "retired_operations"
         const val TABLE_PROVISIONAL_PROJECTS = "provisional_projects"
@@ -736,6 +847,12 @@ class AndroidSyncStateStore internal constructor(
         const val META_PROJECT_DRAFTS_MIGRATED = "project_drafts_migrated"
         const val META_AUTHORITATIVE = "authoritative_cutover"
         val SECRET_TABLES = setOf(TABLE_LOCAL_BLOCKS, TABLE_LOCAL_BLOCK_OPERATIONS)
+        val PROJECT_ITEM_TABLES = listOf(
+            TABLE_PROJECT_NOTE_ITEMS,
+            TABLE_PROJECT_RESOURCE_LINKS,
+            TABLE_PROJECT_ITEM_OPERATIONS,
+            TABLE_RETIRED_PROJECT_ITEM_OPERATIONS,
+        )
         val STATE_TABLES = listOf(
             TABLE_PROJECTS,
             TABLE_REENTRY,
@@ -753,6 +870,10 @@ class AndroidSyncStateStore internal constructor(
             TABLE_LOCAL_BLOCK_OPERATIONS,
             TABLE_PROJECT_LINKS,
             TABLE_PROJECT_COVERS,
+            TABLE_PROJECT_NOTE_ITEMS,
+            TABLE_PROJECT_RESOURCE_LINKS,
+            TABLE_PROJECT_ITEM_OPERATIONS,
+            TABLE_RETIRED_PROJECT_ITEM_OPERATIONS,
             TABLE_PROJECT_COMMANDS,
             TABLE_RETIRED_OPERATIONS,
             TABLE_PROVISIONAL_PROJECTS,

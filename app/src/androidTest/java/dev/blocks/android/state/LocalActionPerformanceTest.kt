@@ -134,12 +134,51 @@ class LocalActionPerformanceTest {
                 )
             }
 
+            val noteTimings = (1..25).map { index ->
+                val body = "Measured note $index"
+                scenario.onActivity { activity -> activity.findViewById<Button>(ProjectUiIds.ADD_NOTE).performClick() }
+                waitFor(scenario) { it.findViewById<View>(ProjectUiIds.NOTE_SHEET) != null }
+                scenario.onActivity { activity ->
+                    activity.findViewById<EditText>(ProjectUiIds.NOTE_BODY).setText(body)
+                }
+                measureUntilVisible(
+                    scenario,
+                    activate = { activity -> activity.findViewById<Button>(ProjectUiIds.SAVE_NOTE).performClick() },
+                    visible = { activity ->
+                        activity.findViewById<View>(ProjectUiIds.ADD_NOTE) != null && activity.hasVisibleText(body)
+                    },
+                )
+            }
+
+            val linkTimings = (1..25).map { index ->
+                val title = "Measured link $index"
+                scenario.onActivity { activity -> activity.findViewById<Button>(ProjectUiIds.ADD_LINK).performClick() }
+                waitFor(scenario) { it.findViewById<View>(ProjectUiIds.LINK_SHEET) != null }
+                scenario.onActivity { activity ->
+                    activity.findViewById<EditText>(ProjectUiIds.LINK_TITLE).setText(title)
+                    activity.findViewById<EditText>(ProjectUiIds.LINK_URI).setText("https://example.com/$index")
+                }
+                measureUntilVisible(
+                    scenario,
+                    activate = { activity -> activity.findViewById<Button>(ProjectUiIds.SAVE_LINK).performClick() },
+                    visible = { activity ->
+                        activity.findViewById<View>(ProjectUiIds.ADD_LINK) != null && activity.hasVisibleText(title)
+                    },
+                )
+            }
+
             val create = createTimings.statistics()
             val park = parkTimings.statistics()
+            val note = noteTimings.statistics()
+            val link = linkTimings.statistics()
             Log.i(TAG, "activity_create median=${create.median}ms p95=${create.p95}ms slowest=${create.slowest}ms samples=25")
             Log.i(TAG, "activity_park median=${park.median}ms p95=${park.p95}ms slowest=${park.slowest}ms samples=25")
+            Log.i(TAG, "activity_add_note median=${note.median}ms p95=${note.p95}ms slowest=${note.slowest}ms samples=25")
+            Log.i(TAG, "activity_add_link median=${link.median}ms p95=${link.p95}ms slowest=${link.slowest}ms samples=25")
             assertTrue("Activity Create p95 was ${create.p95}ms", create.p95 < 100.0)
             assertTrue("Activity Park p95 was ${park.p95}ms", park.p95 < 100.0)
+            assertTrue("Activity Add Note p95 was ${note.p95}ms", note.p95 < 100.0)
+            assertTrue("Activity Add Link p95 was ${link.p95}ms", link.p95 < 100.0)
         }
     }
 

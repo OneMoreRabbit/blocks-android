@@ -90,7 +90,7 @@ class LegacyEncryptedSyncStateStoreTest {
 
         val migrated = store.loadSyncState(SIGNED_061_TENANT)
 
-        assertEquals(8, databaseVersion(SIGNED_061_TENANT))
+        assertEquals(9, databaseVersion(SIGNED_061_TENANT))
         assertEquals(clientId, migrated.projectCache.projectLinks.single().key.encoded)
         assertEquals("server-project-061", migrated.projectCache.projectLinks.single().projectId)
         assertFalse(databaseFile(SIGNED_061_TENANT).readBytes().containsBytes(clientId.toByteArray()))
@@ -111,7 +111,7 @@ class LegacyEncryptedSyncStateStoreTest {
 
         val migrated = store.loadSyncState(CURRENT_PILOT_TENANT)
 
-        assertEquals(8, databaseVersion(CURRENT_PILOT_TENANT))
+        assertEquals(9, databaseVersion(CURRENT_PILOT_TENANT))
         assertEquals("current-pilot-operation", migrated.projectCache.commands.single().operationId)
         assertEquals("0.3", migrated.projectCache.commands.single().contractVersion)
         assertNull(migrated.projectCache.commands.single().clientResourceId)
@@ -141,7 +141,7 @@ class LegacyEncryptedSyncStateStoreTest {
 
         val migrated = store.loadSyncState(SIGNED_062_TENANT)
 
-        assertEquals(8, databaseVersion(SIGNED_062_TENANT))
+        assertEquals(9, databaseVersion(SIGNED_062_TENANT))
         assertEquals(listOf(project), migrated.projectCache.activeProjects)
         assertEquals(listOf(link), migrated.projectCache.projectLinks)
         assertEquals(ProjectUiPreferences(DashboardView.LIST), migrated.projectUiPreferences)
@@ -440,7 +440,7 @@ class LegacyEncryptedSyncStateStoreTest {
         assertEquals("29", migrated.changeCursor)
         assertEquals(listOf(Project("pilot-project", "Pilot project")), migrated.projects)
         assertEquals(ProjectCacheState(), migrated.projectCache)
-        assertEquals(8, databaseVersion(PILOT_DATABASE_TENANT))
+        assertEquals(9, databaseVersion(PILOT_DATABASE_TENANT))
         assertFalse(databaseFile(PILOT_DATABASE_TENANT).readBytes().containsBytes("Pilot outcome".toByteArray()))
 
         val api03Command = ProjectMutation(
