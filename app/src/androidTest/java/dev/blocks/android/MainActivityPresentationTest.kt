@@ -106,6 +106,7 @@ import java.io.ByteArrayOutputStream
 import java.security.MessageDigest
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.TimeZone
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -998,11 +999,18 @@ class MainActivityPresentationTest {
             ),
         )
 
-        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
-            scenario.onActivity { it.button("Active project").performClick() }
-            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
-            scenario.onActivity { activity ->
+        val originalTimeZone = TimeZone.getDefault()
+        TimeZone.setDefault(TimeZone.getTimeZone("UTC"))
+        try {
+            ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+                scenario.onActivity { it.button("Active project").performClick() }
+                waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+                waitFor(scenario) {
+                    it.findViewById<View>(ProjectUiIds.PROJECT_SETTINGS).width > 0 &&
+                        it.findViewById<View>(ProjectUiIds.CONTENT).width > 0
+                }
+                scenario.onActivity { activity ->
                 val content = activity.findViewById<LinearLayout>(ProjectUiIds.CONTENT)
                 val hierarchy = listOf(
                     ProjectUiIds.PROJECT_TITLE,
@@ -1018,13 +1026,29 @@ class MainActivityPresentationTest {
                 val pinned = activity.findViewById<ViewGroup>(ProjectUiIds.PINNED_NOTES)
                 val history = activity.findViewById<ViewGroup>(ProjectUiIds.PROJECT_ACTIVITY)
                 assertTrue(newest.background == null)
+                assertFalse(descendantText(newest).contains("Where you left off"))
                 assertTrue(descendantText(newest).contains("Newest park"))
+                assertTrue(descendantText(newest).contains("17/09/26 16:00"))
                 assertTrue(descendantText(pinned).contains("Pinned context"))
+                assertTrue(descendantText(pinned).contains("17/09/26 17:00"))
                 assertFalse(descendantText(history).contains("Newest park"))
                 assertFalse(descendantText(history).contains("Pinned context"))
                 assertTrue(descendantText(history.getChildAt(0)).contains("Later edited note"))
+                assertTrue(descendantText(history.getChildAt(0)).contains("17/09/26 15:00"))
                 assertTrue(descendantText(history.getChildAt(1)).contains("Older park"))
+                assertTrue(descendantText(history.getChildAt(1)).contains("Park · 17/09/26 14:00"))
                 assertTrue(descendantText(history.getChildAt(2)).contains("Earlier note"))
+                assertFalse(descendantText(content).contains("2026-09-17T"))
+
+                val newestDate = newest.descendants().filterIsInstance<android.widget.TextView>()
+                    .single { it.text.toString() == "17/09/26 16:00" }
+                val pinnedDate = pinned.descendants().filterIsInstance<android.widget.TextView>()
+                    .single { it.text.toString() == "17/09/26 17:00" }
+                val compactDatePadding = (4 * activity.resources.displayMetrics.density).toInt()
+                assertEquals(0, newestDate.paddingTop)
+                assertTrue(newestDate.paddingBottom <= compactDatePadding)
+                assertEquals(0, pinnedDate.paddingTop)
+                assertTrue(pinnedDate.paddingBottom <= compactDatePadding)
 
                 val linkRow = activity.findViewById<ViewGroup>(ProjectUiIds.PROJECT_LINKS).getChildAt(0) as ViewGroup
                 assertTrue(linkRow.background == null)
@@ -1037,6 +1061,17 @@ class MainActivityPresentationTest {
                 assertTrue(linkRow.getChildAt(2).minimumHeight >= minimumTouch)
                 assertTrue(linkRow.getChildAt(3).minimumHeight >= minimumTouch)
 
+                val settings = activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS)
+                val topBar = settings.parent as LinearLayout
+                assertEquals(topBar.childCount - 1, topBar.indexOfChild(settings))
+                val spacer = topBar.getChildAt(topBar.childCount - 2)
+                assertTrue((spacer.layoutParams as LinearLayout.LayoutParams).weight > 0f)
+                val settingsLocation = IntArray(2).also(settings::getLocationOnScreen)
+                val contentLocation = IntArray(2).also(content::getLocationOnScreen)
+                val contentRightEdge = contentLocation[0] + content.width - content.paddingRight
+                assertEquals(contentRightEdge, settingsLocation[0] + settings.width)
+                assertEquals((48 * activity.resources.displayMetrics.density).toInt(), settings.width)
+
                 (linkRow.getChildAt(2) as Button).performClick()
                 assertTrue(launchedResourceLinks.isEmpty())
                 activity.findViewById<Button>(ProjectUiIds.BACK).performClick()
@@ -1047,26 +1082,23 @@ class MainActivityPresentationTest {
                 activity.dialogButton("Cancel").performClick()
                 (restoredRow.getChildAt(1) as Button).performClick()
                 assertEquals(listOf("https://example.com/private-path"), launchedResourceLinks)
+                }
 
-                val settings = activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS)
-                val topBar = settings.parent as LinearLayout
-                assertEquals(topBar.childCount - 1, topBar.indexOfChild(settings))
-                val spacer = topBar.getChildAt(topBar.childCount - 2)
-                assertTrue((spacer.layoutParams as LinearLayout.LayoutParams).weight > 0f)
+                scenario.recreate()
+                waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+                scenario.onActivity { activity ->
+                    assertTrue(descendantText(activity.findViewById(ProjectUiIds.NEWEST_PARKING)).contains("Newest park"))
+                    assertFalse(descendantText(activity.findViewById(ProjectUiIds.PROJECT_ACTIVITY)).contains("Newest park"))
+                    assertTrue(descendantText(activity.findViewById(ProjectUiIds.PINNED_NOTES)).contains("Pinned context"))
+                }
             }
-
-            scenario.recreate()
-            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
-            scenario.onActivity { activity ->
-                assertTrue(descendantText(activity.findViewById(ProjectUiIds.NEWEST_PARKING)).contains("Newest park"))
-                assertFalse(descendantText(activity.findViewById(ProjectUiIds.PROJECT_ACTIVITY)).contains("Newest park"))
-                assertTrue(descendantText(activity.findViewById(ProjectUiIds.PINNED_NOTES)).contains("Pinned context"))
-            }
+        } finally {
+            TimeZone.setDefault(originalTimeZone)
         }
     }
 
     @Test
-    fun compactProjectPageKeepsEmptySectionsInTheRequiredOrder() {
+    fun compactProjectPageOmitsEmptyLinksAndPinnedSectionsWithoutReplacementSpacing() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             scenario.onActivity { it.button("Active project").performClick() }
@@ -1074,11 +1106,22 @@ class MainActivityPresentationTest {
             scenario.onActivity { activity ->
                 assertTrue(descendantText(activity.findViewById(ProjectUiIds.NEWEST_PARKING))
                     .contains("No park message yet."))
-                assertTrue(descendantText(activity.findViewById(ProjectUiIds.PROJECT_LINKS)).contains("No links yet."))
-                assertTrue(descendantText(activity.findViewById(ProjectUiIds.PINNED_NOTES))
-                    .contains("No pinned notes."))
+                assertFalse(descendantText(activity.findViewById(ProjectUiIds.NEWEST_PARKING))
+                    .contains("Where you left off"))
+                assertTrue(activity.findViewById<View>(ProjectUiIds.LINKS_SECTION) == null)
+                assertTrue(activity.findViewById<View>(ProjectUiIds.PROJECT_LINKS) == null)
+                assertTrue(activity.findViewById<View>(ProjectUiIds.PINNED_SECTION) == null)
+                assertTrue(activity.findViewById<View>(ProjectUiIds.PINNED_NOTES) == null)
                 assertTrue(descendantText(activity.findViewById(ProjectUiIds.PROJECT_ACTIVITY))
                     .contains("No older notes or park messages."))
+                val content = activity.findViewById<LinearLayout>(ProjectUiIds.CONTENT)
+                val visibleHierarchy = listOf(
+                    ProjectUiIds.PROJECT_TITLE,
+                    ProjectUiIds.PROJECT_COVER,
+                    ProjectUiIds.NEWEST_PARKING,
+                    ProjectUiIds.HISTORY_SECTION,
+                ).map { id -> content.indexOfChild(activity.findViewById(id)) }
+                assertEquals((0..3).toList(), visibleHierarchy)
             }
         }
     }
@@ -1104,7 +1147,7 @@ class MainActivityPresentationTest {
                 activity.selectDialogItem("About")
                 val about = activity.dialogTexts().joinToString("\n")
                 assertTrue(about.contains("Blocks Android"))
-                assertTrue(about.contains("Version 0.8.1 (15)"))
+                assertTrue(about.contains("Version 0.8.2 (16)"))
                 assertTrue(about.contains("dev.blocks.android/debug"))
                 assertFalse(about.contains("tenant", ignoreCase = true))
                 assertFalse(about.contains("token", ignoreCase = true))
@@ -1827,7 +1870,13 @@ class MainActivityPresentationTest {
                 activity.findViewById<EditText>(ProjectUiIds.NOTE_BODY).setText("Pinned workshop context")
                 activity.findViewById<Button>(ProjectUiIds.SAVE_NOTE).performClick()
             }
-            waitFor(scenario) { it.texts().contains("Pinned workshop context") }
+            waitFor(scenario) {
+                it.findViewById<View>(ProjectUiIds.NOTE_BODY) == null &&
+                    it.texts().contains("Pinned workshop context") &&
+                    it.findViewById<ViewGroup>(android.R.id.content).descendants()
+                        .filterIsInstance<Button>()
+                        .any { button -> button.contentDescription == "Pin note" }
+            }
             scenario.onActivity { it.buttonWithDescription("Pin note").performClick() }
             waitUntil { workspace.cache.noteItems.single().pinned }
             scenario.onActivity { activity ->
