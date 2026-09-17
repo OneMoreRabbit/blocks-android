@@ -63,6 +63,7 @@ import dev.blocks.android.project.DashboardView
 import dev.blocks.android.project.DirectTagAttemptScope
 import dev.blocks.android.project.ProjectCover
 import dev.blocks.android.project.ProjectNoteItem
+import dev.blocks.android.project.ProjectParking
 import dev.blocks.android.project.ProjectResourceLink
 import dev.blocks.android.project.ProjectResourceUri
 import dev.blocks.android.project.ProjectMutationType
@@ -211,6 +212,11 @@ internal object ProjectUiIds {
     const val PROJECT_ACTIVITY = 1090
     const val PROJECT_LINKS = 1091
     const val LOAD_MORE_LINKS = 1092
+    const val PROJECT_TITLE = 1093
+    const val NEWEST_PARKING = 1094
+    const val LINKS_SECTION = 1095
+    const val PINNED_SECTION = 1096
+    const val HISTORY_SECTION = 1097
 }
 
 class MainActivity : ComponentActivity() {
@@ -876,19 +882,10 @@ class MainActivity : ComponentActivity() {
             visibleResourceLinkCount = PROJECT_ITEM_PAGE_SIZE
         }
         val archived = page.project.lifecycle == dev.blocks.android.project.ProjectLifecycle.ARCHIVED
-        content.addView(heading(page.project.name, 30f).apply {
+        content.addView(heading(page.project.name, 28f).apply {
+            id = ProjectUiIds.PROJECT_TITLE
             setPadding(0, dp(6), 0, dp(8))
         })
-        if (archived) {
-            content.addView(label("Archived", 14f, brandColor(R.color.blocks_muted)).apply {
-                id = ProjectUiIds.ARCHIVED_LABEL
-                contentDescription = "Archived project"
-                setPadding(dp(10), dp(4), dp(10), dp(4))
-                background = roundedBackground(brandColor(R.color.blocks_soft), brandColor(R.color.blocks_line), 8f)
-            }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                bottomMargin = dp(10)
-            })
-        }
 
         val coverFrame = FrameLayout(this).apply {
             id = ProjectUiIds.PROJECT_COVER
@@ -911,12 +908,28 @@ class MainActivity : ComponentActivity() {
                 setMargins(0, 0, dp(8), dp(8))
             },
         )
+        if (archived) coverFrame.addView(
+            label("Archived", 14f, brandColor(R.color.blocks_ink)).apply {
+                id = ProjectUiIds.ARCHIVED_LABEL
+                contentDescription = "Archived project"
+                setPadding(dp(10), dp(6), dp(10), dp(6))
+                background = roundedBackground(brandColor(R.color.blocks_soft), brandColor(R.color.blocks_line), 8f)
+            },
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP or Gravity.START,
+            ).apply { setMargins(dp(8), dp(8), 0, 0) },
+        )
         content.addView(
             coverFrame,
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(112)).apply {
                 bottomMargin = dp(12)
             },
         )
+
+        val newestParking = page.newestParking
+        content.addView(newestParkingBlock(newestParking))
 
         if (archived) {
             bottomActions.addView(primaryButton("Reopen", R.drawable.ic_archive) { source ->
@@ -945,139 +958,210 @@ class MainActivity : ComponentActivity() {
             }.apply { id = ProjectUiIds.ADD_LINK }, projectActionLayoutParams(end = true))
         }
 
+        content.addView(LinearLayout(this).apply {
+            id = ProjectUiIds.LINKS_SECTION
+            orientation = LinearLayout.VERTICAL
+            addView(heading("Links", 20f).apply { setPadding(0, dp(8), 0, dp(4)) })
+            addView(LinearLayout(this@MainActivity).apply {
+                id = ProjectUiIds.PROJECT_LINKS
+                orientation = LinearLayout.VERTICAL
+                if (controller.state.resourceLinks.isEmpty()) {
+                    addView(label("No links yet.", 14f, brandColor(R.color.blocks_muted)))
+                } else {
+                    controller.state.resourceLinks.take(visibleResourceLinkCount)
+                        .forEach { addView(resourceLinkRow(it, archived)) }
+                }
+            })
+            if (controller.state.resourceLinks.size > visibleResourceLinkCount) {
+                addView(button("Show more links") {
+                    visibleResourceLinkCount += PROJECT_ITEM_PAGE_SIZE
+                    render()
+                }.apply { id = ProjectUiIds.LOAD_MORE_LINKS })
+            }
+        })
+
         val pinned = controller.state.noteItems.filter { it.pinned }
-            .sortedWith(compareByDescending<ProjectNoteItem> { it.createdAt }.thenByDescending { it.id })
-        if (pinned.isNotEmpty()) {
-            content.addView(heading("Pinned notes", 20f).apply { setPadding(0, dp(6), 0, dp(8)) })
-            content.addView(LinearLayout(this).apply {
+            .sortedWith(compareByDescending<ProjectNoteItem> { it.updatedAt }.thenByDescending { it.id })
+        content.addView(LinearLayout(this).apply {
+            id = ProjectUiIds.PINNED_SECTION
+            orientation = LinearLayout.VERTICAL
+            addView(heading("Pinned notes", 20f).apply { setPadding(0, dp(12), 0, dp(4)) })
+            addView(LinearLayout(this@MainActivity).apply {
                 id = ProjectUiIds.PINNED_NOTES
                 orientation = LinearLayout.VERTICAL
-                pinned.forEach { addView(noteCard(it, archived)) }
+                if (pinned.isEmpty()) {
+                    addView(label("No pinned notes.", 14f, brandColor(R.color.blocks_muted)))
+                } else {
+                    pinned.forEach { addView(noteTimelineRow(it, archived)) }
+                }
             })
-        }
+        })
 
-        content.addView(heading("Activity", 20f).apply { setPadding(0, dp(12), 0, dp(8)) })
         val activity = buildList<Triple<String, String, () -> View>> {
             controller.state.noteItems.filterNot { it.pinned }
-                .forEach { note -> add(Triple(note.createdAt, note.id) { noteCard(note, archived) }) }
+                .forEach { note -> add(Triple(note.updatedAt, "note:${note.id}") { noteTimelineRow(note, archived) }) }
             controller.state.parkingHistory
-                .forEach { record -> add(Triple(record.occurredAt, record.id) { parkingRecordCard(record) }) }
+                .filterNot { record -> newestParking?.let { record.sameIdentityAs(it) } == true }
+                .forEach { record ->
+                    add(Triple(record.createdAt.ifBlank { record.occurredAt }, "park:${record.id}") {
+                        parkingHistoryRow(record)
+                    })
+                }
         }.sortedWith(compareByDescending<Triple<String, String, () -> View>> { it.first }
             .thenByDescending { it.second })
         content.addView(LinearLayout(this).apply {
-            id = ProjectUiIds.PROJECT_ACTIVITY
+            id = ProjectUiIds.HISTORY_SECTION
             orientation = LinearLayout.VERTICAL
-            if (activity.isEmpty()) {
-                addView(label("No notes or park messages yet.", 15f, brandColor(R.color.blocks_muted)))
-            } else {
-                activity.take(visibleActivityItemCount).forEach { addView(it.third()) }
+            addView(heading("History", 20f).apply { setPadding(0, dp(12), 0, dp(4)) })
+            addView(LinearLayout(this@MainActivity).apply {
+                id = ProjectUiIds.PROJECT_ACTIVITY
+                orientation = LinearLayout.VERTICAL
+                if (activity.isEmpty()) {
+                    addView(label("No older notes or park messages.", 14f, brandColor(R.color.blocks_muted)))
+                } else {
+                    activity.take(visibleActivityItemCount).forEach { addView(it.third()) }
+                }
+            })
+            if (activity.size > visibleActivityItemCount) {
+                addView(button("Show older activity") {
+                    visibleActivityItemCount += PROJECT_ITEM_PAGE_SIZE
+                    render()
+                }.apply { id = ProjectUiIds.LOAD_OLDER_PARKING })
+            } else if (controller.state.parkingHistoryHasMore) {
+                addView(button("Show older park messages") { source ->
+                    visibleActivityItemCount += PROJECT_ITEM_PAGE_SIZE
+                    runRepositoryAction(source = source) { controller.loadOlderParking() }
+                }.apply { id = ProjectUiIds.LOAD_OLDER_PARKING })
             }
         })
-        if (activity.size > visibleActivityItemCount) {
-            content.addView(button("Show older activity") {
-                visibleActivityItemCount += PROJECT_ITEM_PAGE_SIZE
-                render()
-            }.apply { id = ProjectUiIds.LOAD_OLDER_PARKING })
-        } else if (controller.state.parkingHistoryHasMore) {
-            content.addView(button("Show older park messages") { source ->
-                visibleActivityItemCount += PROJECT_ITEM_PAGE_SIZE
-                runRepositoryAction(source = source) { controller.loadOlderParking() }
-            }.apply { id = ProjectUiIds.LOAD_OLDER_PARKING })
-        }
-
-        content.addView(heading("Links", 20f).apply { setPadding(0, dp(14), 0, dp(8)) })
-        content.addView(LinearLayout(this).apply {
-            id = ProjectUiIds.PROJECT_LINKS
-            orientation = LinearLayout.VERTICAL
-            if (controller.state.resourceLinks.isEmpty()) {
-                addView(label("No links yet.", 15f, brandColor(R.color.blocks_muted)))
-            } else {
-                controller.state.resourceLinks.take(visibleResourceLinkCount)
-                    .forEach { addView(resourceLinkCard(it, archived)) }
-            }
-        })
-        if (controller.state.resourceLinks.size > visibleResourceLinkCount) {
-            content.addView(button("Show more links") {
-                visibleResourceLinkCount += PROJECT_ITEM_PAGE_SIZE
-                render()
-            }.apply { id = ProjectUiIds.LOAD_MORE_LINKS })
-        }
     }
 
     private fun projectActionLayoutParams(end: Boolean = false) = LinearLayout.LayoutParams(0, dp(48), 1f).apply {
         if (!end) marginEnd = dp(6)
     }
 
-    private fun noteCard(note: ProjectNoteItem, archived: Boolean) = LinearLayout(this).apply {
+    private fun newestParkingBlock(record: ProjectParking?) = LinearLayout(this).apply {
+        id = ProjectUiIds.NEWEST_PARKING
         orientation = LinearLayout.VERTICAL
-        setPadding(dp(14), dp(12), dp(14), dp(10))
-        background = roundedBackground(brandColor(R.color.blocks_white), brandColor(R.color.blocks_line), 10f)
-        addView(label(note.body, 16f, brandColor(R.color.blocks_ink)).apply { setTextIsSelectable(true) })
-        addView(label(note.updatedAt, 12f, brandColor(R.color.blocks_muted)))
-        if (!archived) addView(LinearLayout(this@MainActivity).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.END
-            addView(iconOnlyButton(R.drawable.ic_edit, "Edit note") {
-                controller.showEditNoteForm(note.id)
-                render()
-            }, LinearLayout.LayoutParams(dp(48), dp(48)))
-            addView(iconOnlyButton(R.drawable.ic_pin, if (note.pinned) "Unpin note" else "Pin note") { source ->
-                runRepositoryAction(source = source) { controller.setNotePinned(note.id, !note.pinned) }
-            }, LinearLayout.LayoutParams(dp(48), dp(48)))
-            addView(iconOnlyButton(R.drawable.ic_delete, "Delete note") { confirmDeleteNote(note) },
-                LinearLayout.LayoutParams(dp(48), dp(48)))
+        setPadding(0, dp(4), 0, dp(4))
+        addView(heading("Where you left off", 20f).apply { setPadding(0, 0, 0, dp(4)) })
+        if (record == null) {
+            addView(label("No park message yet.", 14f, brandColor(R.color.blocks_muted)))
+        } else {
+            addView(fieldValue("Where I am", record.location))
+            addView(fieldValue("Next physical action", record.nextAction))
+            addView(fieldValue("Must not forget", record.mustNotForget))
+            addView(label(record.occurredAt, 12f, brandColor(R.color.blocks_muted)).apply {
+                setPadding(0, 0, 0, dp(4))
+            })
+        }
+    }
+
+    private fun noteTimelineRow(note: ProjectNoteItem, archived: Boolean) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(0, dp(6), 0, 0)
+        addView(label(note.body, 16f, brandColor(R.color.blocks_ink)).apply {
+            setTextIsSelectable(true)
+            setPadding(0, 0, 0, dp(2))
         })
+        addView(LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(label(note.updatedAt, 12f, brandColor(R.color.blocks_muted)).apply {
+                setPadding(0, 0, 0, 0)
+            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            if (!archived) {
+                addView(iconOnlyButton(R.drawable.ic_edit, "Edit note") {
+                    controller.showEditNoteForm(note.id)
+                    render()
+                }, LinearLayout.LayoutParams(dp(48), dp(48)))
+                addView(iconOnlyButton(R.drawable.ic_pin, if (note.pinned) "Unpin note" else "Pin note") { source ->
+                    runRepositoryAction(source = source) { controller.setNotePinned(note.id, !note.pinned) }
+                }, LinearLayout.LayoutParams(dp(48), dp(48)))
+                addView(iconOnlyButton(R.drawable.ic_delete, "Delete note") { confirmDeleteNote(note) },
+                    LinearLayout.LayoutParams(dp(48), dp(48)))
+            }
+        })
+        addView(compactDivider())
     }.also {
         it.layoutParams = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT,
-        ).apply { bottomMargin = dp(8) }
+        )
     }
 
-    private fun parkingRecordCard(record: dev.blocks.android.project.ProjectParking) = LinearLayout(this).apply {
+    private fun noteCard(note: ProjectNoteItem, archived: Boolean) = noteTimelineRow(note, archived)
+
+    private fun parkingHistoryRow(record: ProjectParking) = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
-        setPadding(dp(14), dp(12), dp(14), dp(12))
-        background = roundedBackground(brandColor(R.color.blocks_white), brandColor(R.color.blocks_line), 10f)
+        setPadding(0, dp(6), 0, 0)
         addView(label("Park · ${record.occurredAt}", 12f, brandColor(R.color.blocks_muted)))
         addView(fieldValue("Where I was", record.location))
         addView(fieldValue("Next physical action", record.nextAction))
         addView(fieldValue("Must not forget", record.mustNotForget))
+        addView(compactDivider())
     }.also {
         it.layoutParams = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT,
-        ).apply { bottomMargin = dp(8) }
+        )
     }
 
-    private fun resourceLinkCard(link: ProjectResourceLink, archived: Boolean) = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL
-        setPadding(dp(14), dp(10), dp(10), dp(8))
-        background = roundedBackground(brandColor(R.color.blocks_white), brandColor(R.color.blocks_line), 10f)
-        addView(label(link.title, 17f, brandColor(R.color.blocks_ink)).apply { typeface = manropeTypeface })
-        addView(label(link.uri, 13f, brandColor(R.color.blocks_muted)).apply { setTextIsSelectable(true) })
-        if (link.requiresReconciliation) {
-            addView(label("Update this link before it can sync.", 12f, brandColor(R.color.blocks_ink)))
-        }
-        addView(LinearLayout(this@MainActivity).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.END
-            addView(iconOnlyButton(R.drawable.ic_link, "Open ${link.title}") { launchProjectLink(link) },
+    private fun resourceLinkRow(link: ProjectResourceLink, archived: Boolean) = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        minimumHeight = dp(48)
+        addView(ImageView(this@MainActivity).apply {
+            setImageResource(R.drawable.ic_link)
+            imageTintList = ColorStateList.valueOf(brandColor(R.color.blocks_teal))
+            contentDescription = null
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+        }, LinearLayout.LayoutParams(dp(48), dp(48)))
+        addView(Button(this@MainActivity).apply {
+            text = if (link.requiresReconciliation) "${link.title} · Update required" else link.title
+            contentDescription = "Open ${link.title}"
+            isAllCaps = false
+            gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            minimumHeight = dp(48)
+            typeface = interTypeface
+            textSize = 16f
+            setTextColor(
+                if (link.requiresReconciliation) brandColor(R.color.blocks_error)
+                else brandColor(R.color.blocks_teal),
+            )
+            background = roundedBackground(Color.TRANSPARENT, Color.TRANSPARENT, 0f)
+            setPadding(0, 0, dp(4), 0)
+            setOnClickListener { launchProjectLink(link) }
+        }, LinearLayout.LayoutParams(0, dp(48), 1f))
+        if (!archived) {
+            addView(iconOnlyButton(R.drawable.ic_edit, "Edit link") {
+                controller.showEditLinkForm(link.id)
+                render()
+            }, LinearLayout.LayoutParams(dp(48), dp(48)))
+            addView(iconOnlyButton(R.drawable.ic_delete, "Delete link") { confirmDeleteResourceLink(link) },
                 LinearLayout.LayoutParams(dp(48), dp(48)))
-            if (!archived) {
-                addView(iconOnlyButton(R.drawable.ic_edit, "Edit link") {
-                    controller.showEditLinkForm(link.id)
-                    render()
-                }, LinearLayout.LayoutParams(dp(48), dp(48)))
-                addView(iconOnlyButton(R.drawable.ic_delete, "Delete link") { confirmDeleteResourceLink(link) },
-                    LinearLayout.LayoutParams(dp(48), dp(48)))
-            }
-        })
+        }
     }.also {
         it.layoutParams = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-        ).apply { bottomMargin = dp(8) }
+            dp(48),
+        )
     }
+
+    private fun resourceLinkCard(link: ProjectResourceLink, archived: Boolean) = resourceLinkRow(link, archived)
+
+    private fun compactDivider() = View(this).apply {
+        setBackgroundColor(brandColor(R.color.blocks_line))
+        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1)).apply {
+            topMargin = dp(2)
+            bottomMargin = dp(2)
+        }
+        importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+    }
+
+    private fun ProjectParking.sameIdentityAs(other: ProjectParking): Boolean =
+        id == other.id || clientId != null && clientId == other.clientId
 
     private fun confirmDeleteNote(note: ProjectNoteItem) {
         showManagedDialog(

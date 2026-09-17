@@ -7,6 +7,7 @@
     <color name="blocks_line">#D5DDDA</color>
     <color name="blocks_input">#7C8D87</color>
     <color name="blocks_soft">#E7EFEB</color>
-    <color name="blocks_amber">#F2B84B</color>
+    <color name="blocks_amber">#F5A623</color>
+    <color name="blocks_error">#B33A32</color>
     <color name="blocks_icon_background">#F6F5F0</color>
 </resources>
