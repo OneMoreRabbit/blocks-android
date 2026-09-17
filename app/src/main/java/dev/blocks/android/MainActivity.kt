@@ -93,6 +93,10 @@ import com.google.zxing.BarcodeFormat
 import com.journeyapps.barcodescanner.BarcodeEncoder
 import com.google.gson.Gson
 import java.net.URI
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.util.Locale
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -505,7 +509,7 @@ class MainActivity : ComponentActivity() {
             bar.addView(View(this), LinearLayout.LayoutParams(0, 0, 1f))
             bar.addView(iconOnlyButton(R.drawable.ic_settings, "Settings") { showProjectSettings() }.apply {
                 id = ProjectUiIds.PROJECT_SETTINGS
-            })
+            }, LinearLayout.LayoutParams(dp(48), dp(48)))
         }
         topNavigation.addView(bar)
     }
@@ -958,44 +962,40 @@ class MainActivity : ComponentActivity() {
             }.apply { id = ProjectUiIds.ADD_LINK }, projectActionLayoutParams(end = true))
         }
 
-        content.addView(LinearLayout(this).apply {
-            id = ProjectUiIds.LINKS_SECTION
-            orientation = LinearLayout.VERTICAL
-            addView(heading("Links", 20f).apply { setPadding(0, dp(8), 0, dp(4)) })
-            addView(LinearLayout(this@MainActivity).apply {
-                id = ProjectUiIds.PROJECT_LINKS
+        if (controller.state.resourceLinks.isNotEmpty()) {
+            content.addView(LinearLayout(this).apply {
+                id = ProjectUiIds.LINKS_SECTION
                 orientation = LinearLayout.VERTICAL
-                if (controller.state.resourceLinks.isEmpty()) {
-                    addView(label("No links yet.", 14f, brandColor(R.color.blocks_muted)))
-                } else {
+                addView(heading("Links", 20f).apply { setPadding(0, dp(8), 0, dp(4)) })
+                addView(LinearLayout(this@MainActivity).apply {
+                    id = ProjectUiIds.PROJECT_LINKS
+                    orientation = LinearLayout.VERTICAL
                     controller.state.resourceLinks.take(visibleResourceLinkCount)
                         .forEach { addView(resourceLinkRow(it, archived)) }
+                })
+                if (controller.state.resourceLinks.size > visibleResourceLinkCount) {
+                    addView(button("Show more links") {
+                        visibleResourceLinkCount += PROJECT_ITEM_PAGE_SIZE
+                        render()
+                    }.apply { id = ProjectUiIds.LOAD_MORE_LINKS })
                 }
             })
-            if (controller.state.resourceLinks.size > visibleResourceLinkCount) {
-                addView(button("Show more links") {
-                    visibleResourceLinkCount += PROJECT_ITEM_PAGE_SIZE
-                    render()
-                }.apply { id = ProjectUiIds.LOAD_MORE_LINKS })
-            }
-        })
+        }
 
         val pinned = controller.state.noteItems.filter { it.pinned }
             .sortedWith(compareByDescending<ProjectNoteItem> { it.updatedAt }.thenByDescending { it.id })
-        content.addView(LinearLayout(this).apply {
-            id = ProjectUiIds.PINNED_SECTION
-            orientation = LinearLayout.VERTICAL
-            addView(heading("Pinned notes", 20f).apply { setPadding(0, dp(12), 0, dp(4)) })
-            addView(LinearLayout(this@MainActivity).apply {
-                id = ProjectUiIds.PINNED_NOTES
+        if (pinned.isNotEmpty()) {
+            content.addView(LinearLayout(this).apply {
+                id = ProjectUiIds.PINNED_SECTION
                 orientation = LinearLayout.VERTICAL
-                if (pinned.isEmpty()) {
-                    addView(label("No pinned notes.", 14f, brandColor(R.color.blocks_muted)))
-                } else {
+                addView(heading("Pinned notes", 20f).apply { setPadding(0, dp(12), 0, dp(4)) })
+                addView(LinearLayout(this@MainActivity).apply {
+                    id = ProjectUiIds.PINNED_NOTES
+                    orientation = LinearLayout.VERTICAL
                     pinned.forEach { addView(noteTimelineRow(it, archived)) }
-                }
+                })
             })
-        })
+        }
 
         val activity = buildList<Triple<String, String, () -> View>> {
             controller.state.noteItems.filterNot { it.pinned }
@@ -1044,14 +1044,13 @@ class MainActivity : ComponentActivity() {
         id = ProjectUiIds.NEWEST_PARKING
         orientation = LinearLayout.VERTICAL
         setPadding(0, dp(4), 0, dp(4))
-        addView(heading("Where you left off", 20f).apply { setPadding(0, 0, 0, dp(4)) })
         if (record == null) {
             addView(label("No park message yet.", 14f, brandColor(R.color.blocks_muted)))
         } else {
             addView(fieldValue("Where I am", record.location))
             addView(fieldValue("Next physical action", record.nextAction))
             addView(fieldValue("Must not forget", record.mustNotForget))
-            addView(label(record.occurredAt, 12f, brandColor(R.color.blocks_muted)).apply {
+            addView(label(formatProjectTimestamp(record.occurredAt), 12f, brandColor(R.color.blocks_muted)).apply {
                 setPadding(0, 0, 0, dp(4))
             })
         }
@@ -1067,7 +1066,7 @@ class MainActivity : ComponentActivity() {
         addView(LinearLayout(this@MainActivity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            addView(label(note.updatedAt, 12f, brandColor(R.color.blocks_muted)).apply {
+            addView(label(formatProjectTimestamp(note.updatedAt), 12f, brandColor(R.color.blocks_muted)).apply {
                 setPadding(0, 0, 0, 0)
             }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
             if (!archived) {
@@ -1095,7 +1094,8 @@ class MainActivity : ComponentActivity() {
     private fun parkingHistoryRow(record: ProjectParking) = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
         setPadding(0, dp(6), 0, 0)
-        addView(label("Park · ${record.occurredAt}", 12f, brandColor(R.color.blocks_muted)))
+        addView(label("Park · ${formatProjectTimestamp(record.occurredAt)}", 12f,
+            brandColor(R.color.blocks_muted)).apply { setPadding(0, 0, 0, dp(3)) })
         addView(fieldValue("Where I was", record.location))
         addView(fieldValue("Next physical action", record.nextAction))
         addView(fieldValue("Must not forget", record.mustNotForget))
@@ -1162,6 +1162,10 @@ class MainActivity : ComponentActivity() {
 
     private fun ProjectParking.sameIdentityAs(other: ProjectParking): Boolean =
         id == other.id || clientId != null && clientId == other.clientId
+
+    private fun formatProjectTimestamp(value: String): String = runCatching {
+        PROJECT_TIMESTAMP_FORMATTER.withZone(ZoneId.systemDefault()).format(Instant.parse(value))
+    }.getOrDefault(value)
 
     private fun confirmDeleteNote(note: ProjectNoteItem) {
         showManagedDialog(
@@ -1272,8 +1276,10 @@ class MainActivity : ComponentActivity() {
                     renderCommitted = {
                         val added = controller.state.resourceLinks.singleOrNull { it.id !in priorIds }
                         added != null && restoreProjectView {
-                            val links = findViewById<LinearLayout>(ProjectUiIds.PROJECT_LINKS)
-                            if (links.childCount == 1 && links.getChildAt(0) is TextView) links.removeAllViews()
+                            val links = findViewById<LinearLayout>(ProjectUiIds.PROJECT_LINKS) ?: run {
+                                render()
+                                return@restoreProjectView
+                            }
                             links.addView(resourceLinkCard(added, archived = false), 0)
                         }
                     },
@@ -2727,6 +2733,7 @@ class MainActivity : ComponentActivity() {
         private const val STATE_EDITING_LINK_ID = "editing_link_id"
         private const val DASHBOARD_COLLECTION_TAG = "dashboard_collection"
         private const val PROJECT_ITEM_PAGE_SIZE = 10
+        private val PROJECT_TIMESTAMP_FORMATTER = DateTimeFormatter.ofPattern("dd/MM/yy HH:mm", Locale.getDefault())
 
         @Volatile
         var dependencyFactory: ((MainActivity) -> ProjectAppDependencies)? = null
