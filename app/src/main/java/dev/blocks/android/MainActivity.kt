@@ -3,6 +3,7 @@ package dev.blocks.android
 import android.app.AlertDialog
 import android.content.res.ColorStateList
 import android.content.Intent
+import android.content.ClipData
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
@@ -18,6 +19,7 @@ import android.text.InputType
 import android.text.TextWatcher
 import android.util.LruCache
 import android.view.Gravity
+import android.view.DragEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -59,6 +61,7 @@ import dev.blocks.android.mvp.FormDrafts
 import dev.blocks.android.mvp.ParkingDraft
 import dev.blocks.android.mvp.Session
 import dev.blocks.android.project.ProjectFormField
+import dev.blocks.android.project.DashboardOrderMode
 import dev.blocks.android.project.DashboardView
 import dev.blocks.android.project.DirectTagAttemptScope
 import dev.blocks.android.project.ProjectCover
@@ -221,6 +224,7 @@ internal object ProjectUiIds {
     const val LINKS_SECTION = 1095
     const val PINNED_SECTION = 1096
     const val HISTORY_SECTION = 1097
+    const val DASHBOARD_ORDER = 1098
 }
 
 class MainActivity : ComponentActivity() {
@@ -531,6 +535,17 @@ class MainActivity : ComponentActivity() {
             gravity = Gravity.CENTER
         }
         if (archiveMode) body.addView(heading("Archive", 24f).apply { setPadding(0, dp(16), 0, dp(8)) })
+        if (!archiveMode) {
+            body.addView(
+                secondaryButton(
+                    "Order: ${dashboardOrderLabel(controller.state.dashboardOrderMode)}",
+                    R.drawable.ic_list,
+                ) { showDashboardOrderMode() }.apply { id = ProjectUiIds.DASHBOARD_ORDER },
+                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)).apply {
+                    bottomMargin = dp(6)
+                },
+            )
+        }
 
         val collection = FrameLayout(this).apply {
             setBackgroundColor(Color.TRANSPARENT)
@@ -775,6 +790,50 @@ class MainActivity : ComponentActivity() {
                 controller.openProject(project.id)
             }
         }
+        if (!archiveMode && controller.state.dashboardOrderMode == DashboardOrderMode.CUSTOM) {
+            contentDescription = "Open ${project.name}. Long press to move in Custom order."
+            setOnLongClickListener {
+                startDragAndDrop(
+                    ClipData.newPlainText("Blocks Project", project.id),
+                    View.DragShadowBuilder(this),
+                    project.id,
+                    0,
+                )
+                true
+            }
+            setOnDragListener { _, event ->
+                when (event.action) {
+                    DragEvent.ACTION_DRAG_STARTED -> event.localState is String
+                    DragEvent.ACTION_DROP -> {
+                        val draggedId = event.localState as? String ?: return@setOnDragListener false
+                        runRepositoryAction { controller.moveActiveProject(draggedId, project.id) }
+                        true
+                    }
+                    else -> true
+                }
+            }
+        }
+    }
+
+    private fun showDashboardOrderMode() {
+        val modes = DashboardOrderMode.entries.toTypedArray()
+        val labels = modes.map(::dashboardOrderLabel).toTypedArray()
+        showManagedDialog(
+            AlertDialog.Builder(this)
+                .setTitle("Project order")
+                .setSingleChoiceItems(labels, modes.indexOf(controller.state.dashboardOrderMode)) { dialog, which ->
+                    runRepositoryAction { controller.setDashboardOrderMode(modes[which]) }
+                    dialog.dismiss()
+                }
+                .setNegativeButton("Cancel", null)
+                .create(),
+        )
+    }
+
+    private fun dashboardOrderLabel(mode: DashboardOrderMode): String = when (mode) {
+        DashboardOrderMode.CUSTOM -> "Custom"
+        DashboardOrderMode.NAME -> "Name"
+        DashboardOrderMode.LAST_ACTIVITY -> "Last activity"
     }
 
     private fun projectImage(project: ProjectSummary, thumbnail: Boolean) = ImageView(this).apply {
@@ -888,7 +947,7 @@ class MainActivity : ComponentActivity() {
         val archived = page.project.lifecycle == dev.blocks.android.project.ProjectLifecycle.ARCHIVED
         content.addView(heading(page.project.name, 28f).apply {
             id = ProjectUiIds.PROJECT_TITLE
-            setPadding(0, dp(6), 0, dp(8))
+            setPadding(0, dp(2), 0, dp(6))
         })
 
         val coverFrame = FrameLayout(this).apply {
@@ -927,13 +986,13 @@ class MainActivity : ComponentActivity() {
         )
         content.addView(
             coverFrame,
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(112)).apply {
-                bottomMargin = dp(12)
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(96)).apply {
+                bottomMargin = dp(10)
             },
         )
 
         val newestParking = page.newestParking
-        content.addView(newestParkingBlock(newestParking))
+        content.addView(newestParkingBlock(newestParking, archived))
 
         if (archived) {
             bottomActions.addView(primaryButton("Reopen", R.drawable.ic_archive) { source ->
@@ -997,19 +1056,12 @@ class MainActivity : ComponentActivity() {
             })
         }
 
-        val activity = buildList<Triple<String, String, () -> View>> {
-            controller.state.noteItems.filterNot { it.pinned }
-                .forEach { note -> add(Triple(note.updatedAt, "note:${note.id}") { noteTimelineRow(note, archived) }) }
-            controller.state.parkingHistory
-                .filterNot { record -> newestParking?.let { record.sameIdentityAs(it) } == true }
-                .forEach { record ->
-                    add(Triple(record.createdAt.ifBlank { record.occurredAt }, "park:${record.id}") {
-                        parkingHistoryRow(record)
-                    })
-                }
-        }.sortedWith(compareByDescending<Triple<String, String, () -> View>> { it.first }
-            .thenByDescending { it.second })
-        content.addView(LinearLayout(this).apply {
+        content.addView(projectHistorySection(archived))
+    }
+
+    private fun projectHistorySection(archived: Boolean): View {
+        val activity = projectActivityEntries(archived)
+        return LinearLayout(this).apply {
             id = ProjectUiIds.HISTORY_SECTION
             orientation = LinearLayout.VERTICAL
             addView(heading("History", 20f).apply { setPadding(0, dp(12), 0, dp(4)) })
@@ -1033,14 +1085,84 @@ class MainActivity : ComponentActivity() {
                     runRepositoryAction(source = source) { controller.loadOlderParking() }
                 }.apply { id = ProjectUiIds.LOAD_OLDER_PARKING })
             }
-        })
+        }
+    }
+
+    private fun projectActivityEntries(archived: Boolean): List<Triple<String, String, () -> View>> {
+        val newestParking = controller.state.projectPage?.newestParking
+        return buildList {
+            controller.state.noteItems.filterNot { it.pinned }
+                .forEach { note -> add(Triple(note.updatedAt, "note:${note.id}") { noteTimelineRow(note, archived) }) }
+            controller.state.parkingHistory
+                .filterNot { record -> newestParking?.let { record.sameIdentityAs(it) } == true }
+                .forEach { record ->
+                    add(Triple(record.createdAt.ifBlank { record.occurredAt }, "park:${record.id}") {
+                        parkingHistoryRow(record, archived)
+                    })
+                }
+        }.sortedWith(compareByDescending<Triple<String, String, () -> View>> { it.first }
+            .thenByDescending { it.second })
+    }
+
+    /** Reuses the existing Link rows and only changes their order and boundary controls. */
+    private fun renderResourceLinkOrder(): Boolean {
+        if (controller.state.screen != ProjectScreen.PROJECT) return false
+        val container = content.findViewById<LinearLayout>(ProjectUiIds.PROJECT_LINKS) ?: return false
+        val desired = controller.state.resourceLinks.take(visibleResourceLinkCount)
+        val existing = (0 until container.childCount).map(container::getChildAt).associateBy { it.tag as? String }
+        if (desired.map { it.id }.toSet() != existing.keys.filterNotNull().toSet()) return false
+        container.removeAllViews()
+        desired.forEachIndexed { index, link ->
+            val row = existing.getValue(link.id)
+            (0 until (row as ViewGroup).childCount).map(row::getChildAt).forEach { child ->
+                when (child.contentDescription?.toString()) {
+                    "Move link up" -> {
+                        child.isEnabled = index > 0
+                        child.alpha = if (child.isEnabled) 1f else 0.35f
+                    }
+                    "Move link down" -> {
+                        child.isEnabled = index < desired.lastIndex
+                        child.alpha = if (child.isEnabled) 1f else 0.35f
+                    }
+                }
+            }
+            container.addView(row)
+        }
+        return true
+    }
+
+    /** Reuses History rows and replaces only Park-derived projections after the atomic tombstone commit. */
+    private fun renderParkingProjection(): Boolean {
+        if (controller.state.screen != ProjectScreen.PROJECT) return false
+        val page = controller.state.projectPage ?: return false
+        val archived = page.project.lifecycle == dev.blocks.android.project.ProjectLifecycle.ARCHIVED
+        val newest = content.findViewById<View>(ProjectUiIds.NEWEST_PARKING) ?: return false
+        val history = content.findViewById<ViewGroup>(ProjectUiIds.HISTORY_SECTION) ?: return false
+        val activity = history.findViewById<LinearLayout>(ProjectUiIds.PROJECT_ACTIVITY) ?: return false
+        val newestIndex = content.indexOfChild(newest)
+        if (newestIndex < 0) return false
+        val allEntries = projectActivityEntries(archived)
+        val desired = allEntries.take(visibleActivityItemCount)
+        val desiredHasMore = allEntries.size > visibleActivityItemCount || controller.state.parkingHistoryHasMore
+        val existingHasMore = history.findViewById<View>(ProjectUiIds.LOAD_OLDER_PARKING) != null
+        if (desiredHasMore != existingHasMore) return false
+        val existing = (0 until activity.childCount).map(activity::getChildAt).associateBy { it.tag as? String }
+        activity.removeAllViews()
+        if (desired.isEmpty()) {
+            activity.addView(label("No older notes or park messages.", 14f, brandColor(R.color.blocks_muted)))
+        } else {
+            desired.forEach { entry -> activity.addView(existing[entry.second] ?: entry.third()) }
+        }
+        content.removeViewAt(newestIndex)
+        content.addView(newestParkingBlock(page.newestParking, archived), newestIndex)
+        return true
     }
 
     private fun projectActionLayoutParams(end: Boolean = false) = LinearLayout.LayoutParams(0, dp(48), 1f).apply {
         if (!end) marginEnd = dp(6)
     }
 
-    private fun newestParkingBlock(record: ProjectParking?) = LinearLayout(this).apply {
+    private fun newestParkingBlock(record: ProjectParking?, archived: Boolean) = LinearLayout(this).apply {
         id = ProjectUiIds.NEWEST_PARKING
         orientation = LinearLayout.VERTICAL
         setPadding(0, dp(4), 0, dp(4))
@@ -1053,10 +1175,14 @@ class MainActivity : ComponentActivity() {
             addView(label(formatProjectTimestamp(record.occurredAt), 12f, brandColor(R.color.blocks_muted)).apply {
                 setPadding(0, 0, 0, dp(4))
             })
+            if (!archived) addView(secondaryButton("Delete park message", R.drawable.ic_delete) {
+                confirmDeleteParking(record)
+            }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)))
         }
     }
 
     private fun noteTimelineRow(note: ProjectNoteItem, archived: Boolean) = LinearLayout(this).apply {
+        tag = "note:${note.id}"
         orientation = LinearLayout.VERTICAL
         setPadding(0, dp(6), 0, 0)
         addView(label(note.body, 16f, brandColor(R.color.blocks_ink)).apply {
@@ -1091,7 +1217,8 @@ class MainActivity : ComponentActivity() {
 
     private fun noteCard(note: ProjectNoteItem, archived: Boolean) = noteTimelineRow(note, archived)
 
-    private fun parkingHistoryRow(record: ProjectParking) = LinearLayout(this).apply {
+    private fun parkingHistoryRow(record: ProjectParking, archived: Boolean) = LinearLayout(this).apply {
+        tag = "park:${record.id}"
         orientation = LinearLayout.VERTICAL
         setPadding(0, dp(6), 0, 0)
         addView(label("Park · ${formatProjectTimestamp(record.occurredAt)}", 12f,
@@ -1099,6 +1226,9 @@ class MainActivity : ComponentActivity() {
         addView(fieldValue("Where I was", record.location))
         addView(fieldValue("Next physical action", record.nextAction))
         addView(fieldValue("Must not forget", record.mustNotForget))
+        if (!archived) addView(iconOnlyButton(R.drawable.ic_delete, "Delete park message") {
+            confirmDeleteParking(record)
+        }, LinearLayout.LayoutParams(dp(48), dp(48)).apply { gravity = Gravity.END })
         addView(compactDivider())
     }.also {
         it.layoutParams = LinearLayout.LayoutParams(
@@ -1135,6 +1265,27 @@ class MainActivity : ComponentActivity() {
             setOnClickListener { launchProjectLink(link) }
         }, LinearLayout.LayoutParams(0, dp(48), 1f))
         if (!archived) {
+            val position = controller.state.resourceLinks.indexOfFirst { it.id == link.id }
+            addView(iconOnlyButton(R.drawable.ic_arrow, "Move link up") { source ->
+                runRepositoryAction(
+                    source = source,
+                    renderCommitted = { renderResourceLinkOrder() },
+                ) { controller.moveResourceLink(link.id, -1) }
+            }.apply {
+                rotation = -90f
+                isEnabled = position > 0
+                alpha = if (isEnabled) 1f else 0.35f
+            }, LinearLayout.LayoutParams(dp(48), dp(48)))
+            addView(iconOnlyButton(R.drawable.ic_arrow, "Move link down") { source ->
+                runRepositoryAction(
+                    source = source,
+                    renderCommitted = { renderResourceLinkOrder() },
+                ) { controller.moveResourceLink(link.id, 1) }
+            }.apply {
+                rotation = 90f
+                isEnabled = position >= 0 && position < controller.state.resourceLinks.lastIndex
+                alpha = if (isEnabled) 1f else 0.35f
+            }, LinearLayout.LayoutParams(dp(48), dp(48)))
             addView(iconOnlyButton(R.drawable.ic_edit, "Edit link") {
                 controller.showEditLinkForm(link.id)
                 render()
@@ -1143,6 +1294,7 @@ class MainActivity : ComponentActivity() {
                 LinearLayout.LayoutParams(dp(48), dp(48)))
         }
     }.also {
+        it.tag = link.id
         it.layoutParams = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             dp(48),
@@ -1184,6 +1336,21 @@ class MainActivity : ComponentActivity() {
                 .setTitle("Delete link?")
                 .setMessage("${link.title} will be removed from this project.")
                 .setPositiveButton("Delete") { _, _ -> runRepositoryAction { controller.deleteResourceLink(link.id) } }
+                .setNegativeButton("Cancel", null)
+                .create(),
+        )
+    }
+
+    private fun confirmDeleteParking(record: ProjectParking) {
+        showManagedDialog(
+            AlertDialog.Builder(this)
+                .setTitle("Delete park message?")
+                .setMessage("This removes the message from the visible Project history. Its authored text is not changed.")
+                .setPositiveButton("Delete") { _, _ ->
+                    runRepositoryAction(
+                        renderCommitted = { renderParkingProjection() },
+                    ) { controller.deleteParking(record.id) }
+                }
                 .setNegativeButton("Cancel", null)
                 .create(),
         )
@@ -1257,7 +1424,7 @@ class MainActivity : ComponentActivity() {
             id = ProjectUiIds.LINK_TITLE
             markInvalid(ProjectFormField.LINK_TITLE)
         }
-        val uri = input("https:// or obsidian://", uriValue) { uriValue = it; persist() }.apply {
+        val uri = input("https://, obsidian:// or onenote:https://", uriValue) { uriValue = it; persist() }.apply {
             id = ProjectUiIds.LINK_URI
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
             markInvalid(ProjectFormField.LINK_URI)

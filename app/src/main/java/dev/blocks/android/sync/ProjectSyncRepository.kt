@@ -14,6 +14,7 @@ import dev.blocks.android.mvp.Session
 import dev.blocks.android.mvp.SyncStateStore
 import dev.blocks.android.mvp.TenantSyncState
 import dev.blocks.android.project.BackgroundSyncResult
+import dev.blocks.android.project.DashboardOrderMode
 import dev.blocks.android.project.BlockBinding
 import dev.blocks.android.project.PhysicalBlock
 import dev.blocks.android.project.ProjectCacheState
@@ -21,6 +22,10 @@ import dev.blocks.android.project.ProjectConflict
 import dev.blocks.android.project.ProjectCover
 import dev.blocks.android.project.ProjectCoverContent
 import dev.blocks.android.project.ProjectIdentityMapping
+import dev.blocks.android.project.InteractionMutation
+import dev.blocks.android.project.InteractionMutationType
+import dev.blocks.android.project.LinkOrderState
+import dev.blocks.android.project.ParkingTombstone
 import dev.blocks.android.project.ProjectItemAcknowledgement
 import dev.blocks.android.project.ProjectItemMutation
 import dev.blocks.android.project.ProjectItemMutationType
@@ -40,6 +45,8 @@ import dev.blocks.android.project.ProjectResourceUri
 import dev.blocks.android.project.ProjectUiPreferences
 import dev.blocks.android.project.ProjectWorkspace
 import dev.blocks.android.project.ensureProjectLinks
+import dev.blocks.android.project.ensureInteractionState
+import dev.blocks.android.project.visibleParking
 import dev.blocks.android.project.newOperationIdentity
 import dev.blocks.android.project.noteItemDraftKey
 import dev.blocks.android.project.resourceLinkDraftKey
@@ -147,7 +154,7 @@ class ProjectSyncRepository(
         val state = activeState(session)
         val resolvedId = state.projectCache.projectIdMappings
             .firstOrNull { it.provisionalId == projectId }?.serverId ?: projectId
-        return state.projectCache.pages.firstOrNull { it.project.id == resolvedId }
+        return state.projectCache.ensureInteractionState().pages.firstOrNull { it.project.id == resolvedId }
             ?: throw IllegalStateException("This project is not available in saved local data.")
     }
 
@@ -237,7 +244,7 @@ class ProjectSyncRepository(
         val state = activeState(session)
         val resolvedId = state.projectCache.projectIdMappings
             .firstOrNull { it.provisionalId == projectId }?.serverId ?: projectId
-        val records = state.projectCache.parkingRecords.newestFirstFor(resolvedId)
+        val records = state.projectCache.visibleParking(resolvedId).newestFirstFor(resolvedId)
         val visible = records.drop(offset).take(limit)
         return ParkingHistoryPage(visible, offset + visible.size < records.size)
     }
@@ -1067,7 +1074,7 @@ class ProjectSyncRepository(
             dependsOnOperationId = state.projectCache.latestItemDependency(projectId, clientId),
             createdAt = timestamp,
         )
-        return commitItemLocal(session, operation) { current ->
+        return commitLinkMutationLocal(session, operation) { current ->
             current.copy(
                 projectCache = current.projectCache.copy(resourceLinks = current.projectCache.resourceLinks + link),
                 projectDrafts = current.projectDrafts.copy(
@@ -1245,8 +1252,118 @@ class ProjectSyncRepository(
             dependsOnOperationId = state.projectCache.latestItemDependency(existing.projectId, linkId),
             createdAt = timestamp,
         )
-        return commitItemLocal(session, operation) { current ->
+        return commitLinkMutationLocal(session, operation) { current ->
             current.updateResourceLink(linkId) { it.copy(updatedAt = timestamp, deletedAt = timestamp) }
+        }
+    }
+
+    @Synchronized
+    override fun moveResourceLink(
+        session: Session,
+        linkId: String,
+        delta: Int,
+        operationId: String,
+    ): BackgroundSyncResult {
+        require(delta == -1 || delta == 1) { "A Link can move only one place at a time" }
+        val state = activeState(session).withProjectLinks()
+        val link = state.projectCache.resourceLinks.single { it.id == linkId && it.deletedAt == null }
+        require(state.projectCache.pages.single { it.project.id == link.projectId }.project.lifecycle == ProjectLifecycle.ACTIVE)
+        val aggregate = state.projectCache.linkOrders.single { it.projectId == link.projectId }
+        val from = aggregate.orderedLinkIds.indexOf(linkId)
+        val to = from + delta
+        if (from < 0 || to !in aggregate.orderedLinkIds.indices) return state.toResult()
+        val ordered = aggregate.orderedLinkIds.toMutableList().apply {
+            add(to, removeAt(from))
+        }
+        return commitLinkOrder(session, state, link.projectId, ordered, operationId)
+    }
+
+    @Synchronized
+    override fun reorderActiveProjects(
+        session: Session,
+        orderedProjectIds: List<String>,
+        operationId: String,
+    ): BackgroundSyncResult {
+        val state = activeState(session).withProjectLinks()
+        val activeIds = state.projectCache.activeProjects.map { it.id }
+        require(orderedProjectIds.size == orderedProjectIds.distinct().size &&
+            orderedProjectIds.toSet() == activeIds.toSet()) {
+            "Custom order must contain every active Project exactly once"
+        }
+        if (orderedProjectIds == state.projectCache.projectOrder.orderedProjectIds) return state.toResult()
+        val aggregate = state.projectCache.projectOrder
+        val dependencies = buildList {
+            addAll(state.projectCache.commands.filter {
+                it.type in PROJECT_ORDER_DEPENDENCY_TYPES
+            }.map { it.operationId })
+            state.projectCache.interactionOperations.lastOrNull {
+                it.type == InteractionMutationType.REORDER_PROJECTS
+            }?.operationId?.let(::add)
+        }.distinct()
+        val timestamp = now()
+        val operation = InteractionMutation(
+            operationId = operationId,
+            type = InteractionMutationType.REORDER_PROJECTS,
+            aggregateId = ACTIVE_PROJECT_ORDER_AGGREGATE,
+            orderedClientIds = orderedProjectIds,
+            baseVersion = aggregate.version,
+            dependsOnOperationIds = dependencies,
+            createdAt = timestamp,
+        )
+        return commitInteractionLocal(session, operation) { current ->
+            current.copy(
+                projectCache = current.projectCache.copy(
+                    projectOrder = aggregate.copy(
+                        orderedProjectIds = orderedProjectIds,
+                        version = aggregate.version + 1,
+                        updatedAt = timestamp,
+                    ),
+                ),
+            )
+        }
+    }
+
+    @Synchronized
+    override fun deleteParking(
+        session: Session,
+        parkingId: String,
+        operationId: String,
+    ): BackgroundSyncResult {
+        val state = activeState(session).withProjectLinks()
+        val record = state.projectCache.parkingRecords.single { it.id == parkingId }
+        require(state.projectCache.pages.single { it.project.id == record.projectId }.project.lifecycle == ProjectLifecycle.ACTIVE)
+        if (state.projectCache.parkingTombstones.any { it.parkingId == parkingId }) return state.toResult()
+        val timestamp = now()
+        val dependencies = buildList {
+            state.projectCache.commands.firstOrNull {
+                it.type == ProjectMutationType.ADD_PARKING && it.clientResourceId == parkingId
+            }?.operationId?.let(::add)
+            state.projectCache.interactionOperations.lastOrNull {
+                it.type == InteractionMutationType.DELETE_PARKING && it.targetId == parkingId
+            }?.operationId?.let(::add)
+        }.distinct()
+        val operation = InteractionMutation(
+            operationId = operationId,
+            type = InteractionMutationType.DELETE_PARKING,
+            aggregateId = "parking:$parkingId",
+            projectId = record.projectId,
+            targetId = parkingId,
+            baseVersion = 0,
+            dependsOnOperationIds = dependencies,
+            createdAt = timestamp,
+        )
+        return commitInteractionLocal(session, operation) { current ->
+            current.copy(
+                projectCache = current.projectCache.copy(
+                    parkingTombstones = current.projectCache.parkingTombstones + ParkingTombstone(
+                        parkingId = parkingId,
+                        projectId = record.projectId,
+                        version = 1,
+                        deletedAt = timestamp,
+                        lastOperationId = operationId,
+                    ),
+                ).ensureInteractionState(),
+            )
         }
     }
 
@@ -1550,12 +1667,61 @@ class ProjectSyncRepository(
             return state.toResult()
         }
         val projected = projection(state)
-        val updated = projected.copy(
+        var updated = projected.copy(
             projectCache = projected.projectCache.copy(commands = projected.projectCache.commands + command),
         ).withProjectLinks()
-        syncStore.saveProjectMutation(session.tenantId, state, updated, command.type)
+        if (command.type in PROJECT_ORDER_DEPENDENCY_TYPES) {
+            updated = updated.withQueuedProjectOrderAfter(command)
+            syncStore.saveInteractionMutation(
+                session.tenantId,
+                state,
+                updated,
+                projectMutationType = command.type,
+            )
+        } else {
+            syncStore.saveProjectMutation(session.tenantId, state, updated, command.type)
+        }
         activeStateCache = updated
         return updated.toResult()
+    }
+
+    private fun TenantSyncState.withQueuedProjectOrderAfter(command: ProjectMutation): TenantSyncState {
+        val normalized = copy(projectCache = projectCache.ensureInteractionState())
+        val previousAggregate = activeStateCache?.projectCache?.ensureInteractionState()?.projectOrder
+            ?: normalized.projectCache.projectOrder
+        val ordered = when (command.type) {
+            ProjectMutationType.CREATE_PROJECT,
+            ProjectMutationType.REOPEN_PROJECT,
+            -> previousAggregate.orderedProjectIds.filterNot { it == command.targetId } + command.targetId
+            ProjectMutationType.ARCHIVE_PROJECT -> previousAggregate.orderedProjectIds - command.targetId
+            else -> return normalized
+        }
+        val timestamp = now()
+        val orderOperationId = newOperationIdentity()
+        val dependencies = buildList {
+            add(command.operationId)
+            normalized.projectCache.interactionOperations.lastOrNull {
+                it.type == InteractionMutationType.REORDER_PROJECTS
+            }?.operationId?.let(::add)
+        }.distinct()
+        return normalized.copy(
+            projectCache = normalized.projectCache.copy(
+                projectOrder = previousAggregate.copy(
+                    orderedProjectIds = ordered,
+                    version = previousAggregate.version + 1,
+                    updatedAt = timestamp,
+                ),
+                interactionOperations = normalized.projectCache.interactionOperations + InteractionMutation(
+                    operationId = orderOperationId,
+                    type = InteractionMutationType.REORDER_PROJECTS,
+                    aggregateId = ACTIVE_PROJECT_ORDER_AGGREGATE,
+                    orderedClientIds = ordered,
+                    baseVersion = previousAggregate.version,
+                    dependsOnOperationIds = dependencies,
+                    createdAt = timestamp,
+                ),
+            ),
+        )
     }
 
     private fun commitItemLocal(
@@ -1579,6 +1745,132 @@ class ProjectSyncRepository(
             ),
         )
         syncStore.saveProjectItemMutation(session.tenantId, state, updated, operation.type)
+        activeStateCache = updated
+        return updated.toResult()
+    }
+
+    private fun commitLinkMutationLocal(
+        session: Session,
+        operation: ProjectItemMutation,
+        projection: (TenantSyncState) -> TenantSyncState,
+    ): BackgroundSyncResult {
+        val state = activeState(session).withProjectLinks()
+        require(operation.operationId !in state.projectCache.retiredItemOperationIds) {
+            "A retired project item operation identity cannot be reused"
+        }
+        state.projectCache.itemOperations.firstOrNull { it.operationId == operation.operationId }?.let { existing ->
+            require(existing == operation) { "A project item operation identity cannot describe two requests" }
+            return state.toResult()
+        }
+        val localProjection = projection(state)
+        val projected = localProjection.copy(
+            projectCache = localProjection.projectCache.copy(
+                itemOperations = localProjection.projectCache.itemOperations + operation,
+            ),
+        ).withProjectLinks()
+        val order = projected.projectCache.linkOrders.single { it.projectId == operation.projectId }.orderedLinkIds
+        return commitLinkOrder(
+            session = session,
+            state = state,
+            projectId = operation.projectId,
+            orderedLinkIds = order,
+            operationId = newOperationIdentity(),
+            requiredOperation = operation,
+            projected = projected,
+        )
+    }
+
+    private fun commitLinkOrder(
+        session: Session,
+        state: TenantSyncState,
+        projectId: String,
+        orderedLinkIds: List<String>,
+        operationId: String,
+        requiredOperation: ProjectItemMutation? = null,
+        projected: TenantSyncState = state,
+    ): BackgroundSyncResult {
+        val aggregate = state.projectCache.linkOrders.firstOrNull { it.projectId == projectId }
+            ?: LinkOrderState(projectId)
+        val timestamp = now()
+        val dependencies = buildList {
+            requiredOperation?.operationId?.let(::add)
+            addAll(projected.projectCache.itemOperations.filter {
+                it.projectId == projectId && it.type in LINK_ORDER_DEPENDENCY_TYPES
+            }.map { it.operationId })
+            projected.projectCache.interactionOperations.lastOrNull {
+                it.type == InteractionMutationType.REORDER_LINKS && it.projectId == projectId
+            }?.operationId?.let(::add)
+        }.distinct()
+        val orderOperation = InteractionMutation(
+            operationId = operationId,
+            type = InteractionMutationType.REORDER_LINKS,
+            aggregateId = "links:$projectId",
+            projectId = projectId,
+            orderedClientIds = orderedLinkIds,
+            baseVersion = aggregate.version,
+            dependsOnOperationIds = dependencies,
+            createdAt = timestamp,
+        )
+        return commitInteractionLocal(
+            session,
+            orderOperation,
+            state,
+            projected,
+            requiredOperation?.type,
+        ) { current ->
+            val other = current.projectCache.linkOrders.filterNot { it.projectId == projectId }
+            current.copy(
+                projectCache = current.projectCache.copy(
+                    linkOrders = other + aggregate.copy(
+                        orderedLinkIds = orderedLinkIds,
+                        version = aggregate.version + 1,
+                        updatedAt = timestamp,
+                    ),
+                ),
+            )
+        }
+    }
+
+    private fun commitInteractionLocal(
+        session: Session,
+        operation: InteractionMutation,
+        projection: (TenantSyncState) -> TenantSyncState,
+    ): BackgroundSyncResult = commitInteractionLocal(
+        session,
+        operation,
+        activeState(session).withProjectLinks(),
+        activeState(session).withProjectLinks(),
+        null,
+        projection,
+    )
+
+    private fun commitInteractionLocal(
+        session: Session,
+        operation: InteractionMutation,
+        state: TenantSyncState,
+        projected: TenantSyncState,
+        itemMutationType: ProjectItemMutationType?,
+        projection: (TenantSyncState) -> TenantSyncState,
+    ): BackgroundSyncResult {
+        require(operation.operationId !in state.projectCache.retiredInteractionOperationIds) {
+            "A retired interaction operation identity cannot be reused"
+        }
+        state.projectCache.interactionOperations.firstOrNull { it.operationId == operation.operationId }?.let { existing ->
+            require(existing == operation) { "An interaction operation identity cannot describe two requests" }
+            return state.toResult()
+        }
+        val local = projection(projected)
+        val updated = local.copy(
+            projectCache = local.projectCache.copy(
+                interactionOperations = local.projectCache.interactionOperations + operation,
+            ).ensureInteractionState(),
+        )
+        syncStore.saveInteractionMutation(
+            session.tenantId,
+            state,
+            updated,
+            itemMutationType = itemMutationType,
+        )
         activeStateCache = updated
         return updated.toResult()
     }
@@ -2126,6 +2418,32 @@ class ProjectSyncRepository(
                         )
                     } else operation
                 },
+                projectOrder = projectCache.projectOrder.copy(
+                    orderedProjectIds = projectCache.projectOrder.orderedProjectIds.map {
+                        if (it == provisionalId) serverId else it
+                    }.distinct(),
+                ),
+                linkOrders = projectCache.linkOrders.map { order ->
+                    if (order.projectId == provisionalId) order.copy(projectId = serverId) else order
+                }.distinctBy { it.projectId },
+                parkingTombstones = projectCache.parkingTombstones.map { tombstone ->
+                    if (tombstone.projectId == provisionalId) tombstone.copy(projectId = serverId) else tombstone
+                },
+                interactionOperations = projectCache.interactionOperations.map { operation ->
+                    operation.copy(
+                        aggregateId = when {
+                            operation.aggregateId == "links:$provisionalId" -> "links:$serverId"
+                            else -> operation.aggregateId
+                        },
+                        projectId = if (operation.projectId == provisionalId) serverId else operation.projectId,
+                        orderedClientIds = if (operation.type == InteractionMutationType.REORDER_PROJECTS) {
+                            operation.orderedClientIds.map { if (it == provisionalId) serverId else it }.distinct()
+                        } else {
+                            operation.orderedClientIds
+                        },
+                        dependsOnOperationIds = operation.dependsOnOperationIds.filterNot { it in createOperationIds },
+                    )
+                },
             ),
             projectDrafts = mappedDrafts,
         ).withProjectedLists()
@@ -2266,7 +2584,8 @@ class ProjectSyncRepository(
 
     private fun TenantSyncState.withParkingRecord(record: ProjectParking): TenantSyncState {
         val records = projectCache.parkingRecords.upsertParking(record)
-        val newest = records.newestFirstFor(record.projectId).firstOrNull()
+        val hidden = projectCache.parkingTombstones.mapTo(mutableSetOf()) { it.parkingId }
+        val newest = records.filterNot { it.id in hidden }.newestFirstFor(record.projectId).firstOrNull()
         return copy(
             projectCache = projectCache.copy(
                 parkingRecords = records,
@@ -2299,9 +2618,13 @@ class ProjectSyncRepository(
         val localPending = projectCache.parkingRecords.filter {
             it.projectId == projectId && (it.clientId ?: it.id) in pendingClientIds
         }
-        val mergedForProject = (remote + localPending).distinctBy { it.clientId ?: it.id }
+        val tombstonedRecords = projectCache.parkingRecords.filter { record ->
+            record.projectId == projectId && projectCache.parkingTombstones.any { it.parkingId == record.id }
+        }
+        val mergedForProject = (remote + localPending + tombstonedRecords).distinctBy { it.clientId ?: it.id }
         val records = projectCache.parkingRecords.filterNot { it.projectId == projectId } + mergedForProject
-        val newest = records.newestFirstFor(projectId).firstOrNull()
+        val hidden = projectCache.parkingTombstones.mapTo(mutableSetOf()) { it.parkingId }
+        val newest = records.filterNot { it.id in hidden }.newestFirstFor(projectId).firstOrNull()
         return copy(
             projectCache = projectCache.copy(
                 parkingRecords = records,
@@ -2575,6 +2898,8 @@ class ProjectSyncRepository(
             it.status == ProjectMutationStatus.REQUIRES_RECONCILIATION
         } || projectCache.itemOperations.any {
             it.status == ProjectMutationStatus.REQUIRES_RECONCILIATION
+        } || projectCache.interactionOperations.any {
+            it.status == ProjectMutationStatus.REQUIRES_RECONCILIATION
         } || commands.any {
             it.status.name == ProjectMutationStatus.REQUIRES_RECONCILIATION.name
         } || projectCache.projectLinks.any { identity ->
@@ -2606,6 +2931,7 @@ class ProjectSyncRepository(
             pendingBlockOperations = projectCache.localBlockOperations.size,
             pendingItemOperations = projectCache.itemOperations.size,
             pendingNavigationAliases = pendingAliases,
+            pendingInteractionOperations = projectCache.interactionOperations.size,
         )
     }
 
@@ -2643,7 +2969,7 @@ class ProjectSyncRepository(
     }
 
     private fun TenantSyncState.withProjectLinks(): TenantSyncState = copy(
-        projectCache = projectCache.ensureProjectLinks(projectKeyFactory),
+        projectCache = projectCache.ensureProjectLinks(projectKeyFactory).ensureInteractionState(),
     )
 
     /** Keeps local commits made while transport is waiting when a background snapshot is saved. */
@@ -2779,6 +3105,72 @@ class ProjectSyncRepository(
                 },
                 noteItems = noteItems.distinctBy { it.id },
                 resourceLinks = resourceLinks.distinctBy { it.id },
+                projectOrder = if (current.projectCache.projectOrder != baseline.projectCache.projectOrder) {
+                    mappings.fold(current.projectCache.projectOrder) { order, identity ->
+                        order.copy(
+                            orderedProjectIds = order.orderedProjectIds.map {
+                                if (it == identity.provisionalId) identity.serverId else it
+                            }.distinct(),
+                        )
+                    }
+                } else {
+                    proposed.projectCache.projectOrder
+                },
+                linkOrders = if (current.projectCache.linkOrders != baseline.projectCache.linkOrders) {
+                    current.projectCache.linkOrders.map { order ->
+                        mappings.fold(order) { mapped, identity ->
+                            if (mapped.projectId == identity.provisionalId) {
+                                mapped.copy(projectId = identity.serverId)
+                            } else mapped
+                        }
+                    }.distinctBy { it.projectId }
+                } else {
+                    proposed.projectCache.linkOrders
+                },
+                parkingTombstones = if (
+                    current.projectCache.parkingTombstones != baseline.projectCache.parkingTombstones
+                ) {
+                    current.projectCache.parkingTombstones.map { tombstone ->
+                        mappings.fold(tombstone) { mapped, identity ->
+                            if (mapped.projectId == identity.provisionalId) {
+                                mapped.copy(projectId = identity.serverId)
+                            } else mapped
+                        }
+                    }
+                } else {
+                    proposed.projectCache.parkingTombstones
+                },
+                interactionOperations = if (
+                    current.projectCache.interactionOperations != baseline.projectCache.interactionOperations
+                ) {
+                    current.projectCache.interactionOperations.map { operation ->
+                        mappings.fold(operation) { mapped, identity ->
+                            mapped.copy(
+                                aggregateId = if (mapped.aggregateId == "links:${identity.provisionalId}") {
+                                    "links:${identity.serverId}"
+                                } else mapped.aggregateId,
+                                projectId = if (mapped.projectId == identity.provisionalId) {
+                                    identity.serverId
+                                } else mapped.projectId,
+                                orderedClientIds = if (mapped.type == InteractionMutationType.REORDER_PROJECTS) {
+                                    mapped.orderedClientIds.map {
+                                        if (it == identity.provisionalId) identity.serverId else it
+                                    }.distinct()
+                                } else mapped.orderedClientIds,
+                                dependsOnOperationIds = mapped.dependsOnOperationIds.filterNot {
+                                    it in acknowledgedCreateOperations[identity.provisionalId].orEmpty()
+                                },
+                            )
+                        }
+                    }
+                } else {
+                    proposed.projectCache.interactionOperations
+                },
+                retiredInteractionOperationIds = (
+                    proposed.projectCache.retiredInteractionOperationIds +
+                        (current.projectCache.retiredInteractionOperationIds -
+                            baseline.projectCache.retiredInteractionOperationIds.toSet())
+                    ).distinct(),
                 itemOperations = itemOperations,
                 retiredItemOperationIds = (
                     proposed.projectCache.retiredItemOperationIds +
@@ -2979,6 +3371,7 @@ class ProjectSyncRepository(
         const val MAX_BLOCK_LABEL = 200
         const val MAX_NOTE_BODY = 100_000
         const val MAX_LINK_TITLE = 200
+        const val ACTIVE_PROJECT_ORDER_AGGREGATE = "active-projects"
         val PENDING_TAG_STATES = setOf(LocalBlockState.AWAITING_WRITE, LocalBlockState.WRITE_UNCERTAIN)
         val NOTE_ITEM_TYPES = setOf(
             ProjectItemMutationType.CREATE_NOTE,
@@ -2990,6 +3383,15 @@ class ProjectSyncRepository(
             ProjectItemMutationType.CREATE_LINK,
             ProjectItemMutationType.EDIT_LINK,
             ProjectItemMutationType.DELETE_LINK,
+        )
+        val LINK_ORDER_DEPENDENCY_TYPES = setOf(
+            ProjectItemMutationType.CREATE_LINK,
+            ProjectItemMutationType.DELETE_LINK,
+        )
+        val PROJECT_ORDER_DEPENDENCY_TYPES = setOf(
+            ProjectMutationType.CREATE_PROJECT,
+            ProjectMutationType.ARCHIVE_PROJECT,
+            ProjectMutationType.REOPEN_PROJECT,
         )
         val LOCAL_AUTHOR_SENTINELS = setOf("local")
         val UNCERTAIN_TAG_FAILURES = setOf(

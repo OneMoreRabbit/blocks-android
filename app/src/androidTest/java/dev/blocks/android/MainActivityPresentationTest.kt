@@ -1072,15 +1072,18 @@ class MainActivityPresentationTest {
                 assertEquals(contentRightEdge, settingsLocation[0] + settings.width)
                 assertEquals((48 * activity.resources.displayMetrics.density).toInt(), settings.width)
 
-                (linkRow.getChildAt(2) as Button).performClick()
+                linkRow.descendants().filterIsInstance<Button>()
+                    .single { it.contentDescription == "Edit link" }.performClick()
                 assertTrue(launchedResourceLinks.isEmpty())
                 activity.findViewById<Button>(ProjectUiIds.BACK).performClick()
                 val restoredRow = activity.findViewById<ViewGroup>(ProjectUiIds.PROJECT_LINKS)
                     .getChildAt(0) as ViewGroup
-                (restoredRow.getChildAt(3) as Button).performClick()
+                restoredRow.descendants().filterIsInstance<Button>()
+                    .single { it.contentDescription == "Delete link" }.performClick()
                 assertTrue(launchedResourceLinks.isEmpty())
                 activity.dialogButton("Cancel").performClick()
-                (restoredRow.getChildAt(1) as Button).performClick()
+                restoredRow.descendants().filterIsInstance<Button>()
+                    .single { it.contentDescription == "Open Build notes" }.performClick()
                 assertEquals(listOf("https://example.com/private-path"), launchedResourceLinks)
                 }
 
@@ -1147,7 +1150,7 @@ class MainActivityPresentationTest {
                 activity.selectDialogItem("About")
                 val about = activity.dialogTexts().joinToString("\n")
                 assertTrue(about.contains("Blocks Android"))
-                assertTrue(about.contains("Version 0.8.2 (16)"))
+                assertTrue(about.contains("Version 0.9.0 (17)"))
                 assertTrue(about.contains("dev.blocks.android/debug"))
                 assertFalse(about.contains("tenant", ignoreCase = true))
                 assertFalse(about.contains("token", ignoreCase = true))

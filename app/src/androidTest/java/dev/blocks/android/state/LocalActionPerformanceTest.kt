@@ -97,6 +97,7 @@ class LocalActionPerformanceTest {
 
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.findViewById<View>(ProjectUiIds.PROJECT_TILES) != null }
+            stabilizePerformancePhase()
             val createdNames = mutableListOf<String>()
             val createTimings = (1..25).map { index ->
                 val name = "00 measured project ${(26 - index).toString().padStart(2, '0')}"
@@ -116,6 +117,7 @@ class LocalActionPerformanceTest {
             val projectName = createdNames.last()
             scenario.onActivity { activity -> activity.button(projectName).performClick() }
             waitFor(scenario) { it.findViewById<View>(ProjectUiIds.PARK) != null }
+            stabilizePerformancePhase()
             val parkTimings = (1..25).map { index ->
                 val location = "Visible bench $index"
                 scenario.onActivity { activity -> activity.findViewById<Button>(ProjectUiIds.PARK).performClick() }
@@ -134,6 +136,7 @@ class LocalActionPerformanceTest {
                 )
             }
 
+            stabilizePerformancePhase()
             val noteTimings = (1..25).map { index ->
                 val body = "Measured note $index"
                 scenario.onActivity { activity -> activity.findViewById<Button>(ProjectUiIds.ADD_NOTE).performClick() }
@@ -150,6 +153,7 @@ class LocalActionPerformanceTest {
                 )
             }
 
+            stabilizePerformancePhase()
             val linkTimings = (1..25).map { index ->
                 val title = "Measured link $index"
                 scenario.onActivity { activity -> activity.findViewById<Button>(ProjectUiIds.ADD_LINK).performClick() }
@@ -167,19 +171,64 @@ class LocalActionPerformanceTest {
                 )
             }
 
+            stabilizePerformancePhase()
+            val linkReorderTimings = (1..25).map {
+                var before = emptyList<String>()
+                scenario.onActivity { activity -> before = activity.visibleLinkOrder() }
+                measureUntilVisible(
+                    scenario,
+                    activate = { activity ->
+                        val move = activity.buttonsWithDescription("Move link down").firstOrNull { it.isEnabled }
+                            ?: activity.buttonsWithDescription("Move link up").first { it.isEnabled }
+                        move.performClick()
+                    },
+                    visible = { activity -> activity.visibleLinkOrder() != before },
+                )
+            }
+
+            stabilizePerformancePhase()
+            val parkDeleteTimings = (1..25).map {
+                var before = ""
+                scenario.onActivity { activity ->
+                    before = activity.newestParkingSignature()
+                    activity.newestParkingDeleteButton().performClick()
+                }
+                waitFor(scenario) { it.activeDialog != null }
+                measureUntilVisible(
+                    scenario,
+                    activate = { activity -> activity.dialogButton("Delete").performClick() },
+                    visible = { activity -> activity.newestParkingSignature() != before },
+                )
+            }
+
             val create = createTimings.statistics()
             val park = parkTimings.statistics()
             val note = noteTimings.statistics()
             val link = linkTimings.statistics()
+            val linkReorder = linkReorderTimings.statistics()
+            val parkDelete = parkDeleteTimings.statistics()
             Log.i(TAG, "activity_create median=${create.median}ms p95=${create.p95}ms slowest=${create.slowest}ms samples=25")
             Log.i(TAG, "activity_park median=${park.median}ms p95=${park.p95}ms slowest=${park.slowest}ms samples=25")
             Log.i(TAG, "activity_add_note median=${note.median}ms p95=${note.p95}ms slowest=${note.slowest}ms samples=25")
             Log.i(TAG, "activity_add_link median=${link.median}ms p95=${link.p95}ms slowest=${link.slowest}ms samples=25")
+            Log.i(TAG, "activity_reorder_link median=${linkReorder.median}ms p95=${linkReorder.p95}ms slowest=${linkReorder.slowest}ms samples=25")
+            Log.i(TAG, "activity_delete_park median=${parkDelete.median}ms p95=${parkDelete.p95}ms slowest=${parkDelete.slowest}ms samples=25")
             assertTrue("Activity Create p95 was ${create.p95}ms", create.p95 < 100.0)
             assertTrue("Activity Park p95 was ${park.p95}ms", park.p95 < 100.0)
             assertTrue("Activity Add Note p95 was ${note.p95}ms", note.p95 < 100.0)
             assertTrue("Activity Add Link p95 was ${link.p95}ms", link.p95 < 100.0)
+            assertTrue("Activity Link reorder p95 was ${linkReorder.p95}ms", linkReorder.p95 < 100.0)
+            assertTrue("Activity Park delete p95 was ${parkDelete.p95}ms", parkDelete.p95 < 100.0)
         }
+    }
+
+    /** Keeps unrelated prior-phase garbage collection outside each measured button boundary. */
+    private fun stabilizePerformancePhase() {
+        InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+        Runtime.getRuntime().gc()
+        System.runFinalization()
+        Thread.sleep(250)
+        InstrumentationRegistry.getInstrumentation().waitForIdleSync()
     }
 
     private fun measureUntilVisible(
@@ -233,6 +282,32 @@ class LocalActionPerformanceTest {
 
     private fun Activity.button(text: String): Button = findViewById<ViewGroup>(android.R.id.content)
         .descendants().filterIsInstance<Button>().single { it.text.toString() == text }
+
+    private fun Activity.buttonsWithDescription(description: String): List<Button> =
+        findViewById<ViewGroup>(android.R.id.content)
+            .descendants()
+            .filterIsInstance<Button>()
+            .filter {
+                (it.contentDescription?.toString() == description || it.text.toString() == description) && it.isShown
+            }
+            .toList()
+
+    private fun Activity.visibleLinkOrder(): List<String> = findViewById<ViewGroup>(android.R.id.content)
+        .descendants()
+        .filterIsInstance<Button>()
+        .filter { it.isShown && it.contentDescription?.toString()?.startsWith("Open Measured link ") == true }
+        .map { it.contentDescription.toString() }
+        .toList()
+
+    private fun Activity.newestParkingDeleteButton(): Button =
+        findViewById<ViewGroup>(ProjectUiIds.NEWEST_PARKING).descendants()
+            .filterIsInstance<Button>()
+            .single { it.text.toString() == "Delete park message" }
+
+    private fun Activity.newestParkingSignature(): String =
+        findViewById<ViewGroup>(ProjectUiIds.NEWEST_PARKING).descendants()
+            .filterIsInstance<TextView>()
+            .joinToString("|") { it.text.toString() }
 
     private fun Activity.hasVisibleText(text: String): Boolean = findViewById<ViewGroup>(android.R.id.content)
         .descendants()

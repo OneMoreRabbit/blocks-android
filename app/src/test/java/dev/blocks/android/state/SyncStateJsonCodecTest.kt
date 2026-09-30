@@ -20,6 +20,12 @@ import dev.blocks.android.project.ProjectPage
 import dev.blocks.android.project.ProjectParking
 import dev.blocks.android.project.ProjectSummary
 import dev.blocks.android.project.DashboardView
+import dev.blocks.android.project.DashboardOrderMode
+import dev.blocks.android.project.InteractionMutation
+import dev.blocks.android.project.InteractionMutationType
+import dev.blocks.android.project.LinkOrderState
+import dev.blocks.android.project.ParkingTombstone
+import dev.blocks.android.project.ProjectOrderState
 import dev.blocks.android.project.ProjectUiPreferences
 import dev.blocks.android.tag.LocalBlockOperation
 import dev.blocks.android.tag.LocalBlockOperationType
@@ -33,6 +39,87 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SyncStateStorageCodecTest {
+    @Test
+    fun schemaTenAddsNameOrderingWithoutTrustingAMissingEnumField() {
+        val rows = SyncStateRowCodec().encode(TenantSyncState()).copy(
+            schemaVersion = 10,
+            projectUiPreferences = """{"dashboardView":"LIST","archiveMode":true}""",
+            projectOrder = null,
+            linkOrders = emptyList(),
+            parkingTombstones = emptyList(),
+            interactionOperations = emptyList(),
+            retiredInteractionOperations = emptyList(),
+        )
+
+        val migrated = SyncStateRowCodec().decode(rows)
+
+        assertEquals(DashboardView.LIST, migrated.projectUiPreferences.dashboardView)
+        assertTrue(migrated.projectUiPreferences.archiveMode)
+        assertEquals(DashboardOrderMode.NAME, migrated.projectUiPreferences.dashboardOrderMode)
+    }
+
+    @Test
+    fun roundTripsVersionedOrderingTombstonesAndFrozenDependencies() {
+        val project = ProjectSummary(
+            id = "10000000-0000-4000-8000-000000000001",
+            tenantId = "tenant-a",
+            name = "Project",
+            lifecycle = ProjectLifecycle.ACTIVE,
+            rowVersion = 2,
+            createdAt = "2026-09-30T09:00:00Z",
+            updatedAt = "2026-09-30T09:00:00Z",
+        )
+        val parking = ProjectParking(
+            id = "20000000-0000-4000-8000-000000000002",
+            projectId = project.id,
+            location = "Bench",
+            nextAction = "Fit part",
+            mustNotForget = "Keep note",
+            authoredByUserId = "user-a",
+            createdAt = project.updatedAt,
+        )
+        val reorder = InteractionMutation(
+            operationId = "order-projects",
+            type = InteractionMutationType.REORDER_PROJECTS,
+            aggregateId = "active-projects",
+            orderedClientIds = listOf(project.id),
+            baseVersion = 0,
+            createdAt = project.updatedAt,
+        )
+        val deletion = InteractionMutation(
+            operationId = "delete-parking",
+            type = InteractionMutationType.DELETE_PARKING,
+            aggregateId = "parking:${parking.id}",
+            projectId = project.id,
+            targetId = parking.id,
+            baseVersion = 0,
+            dependsOnOperationIds = listOf(reorder.operationId),
+            createdAt = project.updatedAt,
+        )
+        val state = TenantSyncState(
+            projectUiPreferences = ProjectUiPreferences(dashboardOrderMode = DashboardOrderMode.CUSTOM),
+            projectCache = ProjectCacheState(
+                activeProjects = listOf(project),
+                activeProjectsLoaded = true,
+                pages = listOf(ProjectPage(project, ProjectNotes(project.id, "", 1, project.updatedAt), null)),
+                parkingRecords = listOf(parking),
+                projectOrder = ProjectOrderState(listOf(project.id), 1, project.updatedAt),
+                linkOrders = listOf(LinkOrderState(project.id, emptyList(), 0, "")),
+                parkingTombstones = listOf(
+                    ParkingTombstone(parking.id, project.id, 1, project.updatedAt, deletion.operationId),
+                ),
+                interactionOperations = listOf(reorder, deletion),
+            ),
+        )
+
+        val decoded = SyncStateRowCodec().decode(SyncStateRowCodec().encode(state))
+
+        assertEquals(
+            state,
+            decoded.copy(projectCache = decoded.projectCache.copy(projectLinks = emptyList())),
+        )
+    }
+
     @Test
     fun schemaNineDiscardsSingletonNotesAndDraftsWithoutCreatingDiscreteItems() {
         val first = ProjectSummary(
@@ -128,7 +215,7 @@ class SyncStateStorageCodecTest {
         val rows = SyncStateRowCodec().encode(state)
         val decoded = SyncStateRowCodec().decode(rows)
 
-        assertEquals(10, rows.schemaVersion)
+        assertEquals(11, rows.schemaVersion)
         assertEquals(1, rows.projects.size)
         assertEquals(1, rows.commands.size)
         assertEquals(1, rows.retiredIdempotencyKeys.size)
@@ -193,7 +280,7 @@ class SyncStateStorageCodecTest {
 
     @Test
     fun rejectsAnUnknownDatabaseRowSchemaWithoutDiscardingIt() {
-        val rows = SyncStateRowCodec().encode(TenantSyncState()).copy(schemaVersion = 11)
+        val rows = SyncStateRowCodec().encode(TenantSyncState()).copy(schemaVersion = 12)
 
         val error = runCatching { SyncStateRowCodec().decode(rows) }.exceptionOrNull()
 
@@ -380,7 +467,7 @@ class SyncStateStorageCodecTest {
         val rows = SyncStateRowCodec().encode(state)
         val decoded = SyncStateRowCodec().decode(rows)
 
-        assertEquals(10, rows.schemaVersion)
+        assertEquals(11, rows.schemaVersion)
         assertEquals(
             state,
             decoded.copy(projectCache = decoded.projectCache.copy(projectLinks = emptyList())),

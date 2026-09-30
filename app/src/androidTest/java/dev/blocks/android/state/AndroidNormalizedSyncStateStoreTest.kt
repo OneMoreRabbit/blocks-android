@@ -13,6 +13,11 @@ import dev.blocks.android.mvp.Session
 import dev.blocks.android.mvp.TenantSyncState
 import dev.blocks.android.project.ProjectCacheState
 import dev.blocks.android.project.ProjectCover
+import dev.blocks.android.project.DashboardOrderMode
+import dev.blocks.android.project.InteractionMutation
+import dev.blocks.android.project.InteractionMutationType
+import dev.blocks.android.project.LinkOrderState
+import dev.blocks.android.project.ParkingTombstone
 import dev.blocks.android.project.ProjectIdentityMapping
 import dev.blocks.android.project.ProjectItemAcknowledgement
 import dev.blocks.android.project.ProjectItemMutation
@@ -25,8 +30,10 @@ import dev.blocks.android.project.ProjectNoteItem
 import dev.blocks.android.project.ProjectPage
 import dev.blocks.android.project.ProjectParking
 import dev.blocks.android.project.ProjectResourceLink
+import dev.blocks.android.project.ProjectOrderState
 import dev.blocks.android.project.ProjectSummary
 import dev.blocks.android.project.ProjectService
+import dev.blocks.android.project.ProjectUiPreferences
 import dev.blocks.android.cover.InMemoryProjectCoverMediaStore
 import dev.blocks.android.sync.NoOpLegacyQueueReplay
 import dev.blocks.android.sync.ProjectSyncRepository
@@ -169,6 +176,7 @@ class AndroidNormalizedSyncStateStoreTest {
         store.saveSyncState(OTHER_TENANT, otherTenant)
         SQLiteDatabase.openDatabase(normalizedDatabase(TENANT).path, null, SQLiteDatabase.OPEN_READWRITE).use { db ->
             AndroidSyncStateStore.PROJECT_ITEM_TABLES.forEach { db.execSQL("DROP TABLE $it") }
+            AndroidSyncStateStore.INTERACTION_TABLES.forEach { db.execSQL("DROP TABLE $it") }
             db.execSQL(
                 "UPDATE ${AndroidSyncStateStore.TABLE_METADATA} SET value = '9' WHERE record_id = ?",
                 arrayOf(AndroidSyncStateStore.META_SCHEMA_VERSION),
@@ -513,6 +521,108 @@ class AndroidNormalizedSyncStateStoreTest {
         assertEquals(second, store.loadSyncState(OTHER_TENANT))
         assertFalse(normalizedDatabase(TENANT).exists())
         assertTrue(normalizedDatabase(OTHER_TENANT).exists())
+    }
+
+    @Test
+    fun realDatabaseMigratesSchemaTenThenSeedsInteractionAggregatesOnActivation() {
+        val legacy = state(TENANT).withoutCommands().copy(
+            projectCache = state(TENANT).withoutCommands().projectCache.copy(
+                resourceLinks = listOf(
+                    ProjectResourceLink(LINK_ID, PROJECT, "Reference", "https://example.com", NOW, NOW),
+                ),
+            ),
+        )
+        store.saveSyncState(TENANT, legacy)
+        SQLiteDatabase.openDatabase(normalizedDatabase(TENANT).path, null, SQLiteDatabase.OPEN_READWRITE).use { db ->
+            AndroidSyncStateStore.INTERACTION_TABLES.forEach { db.execSQL("DROP TABLE $it") }
+            db.execSQL(
+                "UPDATE ${AndroidSyncStateStore.TABLE_METADATA} SET value = '10' WHERE record_id = ?",
+                arrayOf(AndroidSyncStateStore.META_SCHEMA_VERSION),
+            )
+            db.version = 2
+        }
+
+        val migrated = AndroidSyncStateStore(context).loadSyncState(TENANT)
+        assertEquals(ProjectOrderState(), migrated.projectCache.projectOrder)
+        assertTrue(migrated.projectCache.linkOrders.isEmpty())
+
+        val service = java.lang.reflect.Proxy.newProxyInstance(
+            ProjectService::class.java.classLoader,
+            arrayOf(ProjectService::class.java),
+        ) { _, method, _ -> error("Unexpected Service call: ${method.name}") } as ProjectService
+        val repository = ProjectSyncRepository(
+            service,
+            NoOpLegacyQueueReplay,
+            NoOpDraftStore,
+            AndroidSyncStateStore(context),
+            coverMediaStore = InMemoryProjectCoverMediaStore(),
+        )
+        repository.activate(Session(TENANT, "test-token"))
+
+        val seeded = AndroidSyncStateStore(context).loadSyncState(TENANT)
+        assertEquals(listOf(PROJECT), seeded.projectCache.projectOrder.orderedProjectIds)
+        assertEquals(listOf(LINK_ID), seeded.projectCache.linkOrders.single().orderedLinkIds)
+        assertEquals(seeded, AndroidSyncStateStore(context).loadSyncState(TENANT))
+    }
+
+    @Test
+    fun realDatabasePersistsInteractionStateAndRollsBackTheWholeMutationOnFailure() {
+        val base = state(TENANT).withoutCommands().copy(
+            projectCache = state(TENANT).withoutCommands().projectCache.copy(
+                resourceLinks = listOf(
+                    ProjectResourceLink(LINK_ID, PROJECT, "Reference", "https://example.com", NOW, NOW),
+                ),
+            ),
+        )
+        store.saveSyncState(TENANT, base)
+        val parkingId = "$PROJECT-parking"
+        val operation = InteractionMutation(
+            operationId = "delete-parking-09",
+            type = InteractionMutationType.DELETE_PARKING,
+            aggregateId = "parking:$parkingId",
+            projectId = PROJECT,
+            targetId = parkingId,
+            baseVersion = 0,
+            createdAt = NOW,
+        )
+        val updated = base.copy(
+            projectUiPreferences = ProjectUiPreferences(dashboardOrderMode = DashboardOrderMode.CUSTOM),
+            projectCache = base.projectCache.copy(
+                projectOrder = ProjectOrderState(listOf(PROJECT), 1, NOW),
+                linkOrders = listOf(LinkOrderState(PROJECT, listOf(LINK_ID), 1, NOW)),
+                parkingTombstones = listOf(ParkingTombstone(parkingId, PROJECT, 1, NOW, operation.operationId)),
+                interactionOperations = listOf(operation),
+            ),
+        )
+
+        store.saveSyncState(TENANT, base, updated)
+        assertEquals(updated, AndroidSyncStateStore(context).loadSyncState(TENANT))
+
+        store.saveSyncState(TENANT, base)
+        val service = java.lang.reflect.Proxy.newProxyInstance(
+            ProjectService::class.java.classLoader,
+            arrayOf(ProjectService::class.java),
+        ) { _, method, _ -> error("Unexpected Service call: ${method.name}") } as ProjectService
+        val repository = ProjectSyncRepository(
+            service,
+            NoOpLegacyQueueReplay,
+            NoOpDraftStore,
+            store,
+            now = { NOW },
+            coverMediaStore = InMemoryProjectCoverMediaStore(),
+        )
+        val session = Session(TENANT, "test-token")
+        repository.activate(session)
+        val beforeFailedDelete = store.loadSyncState(TENANT)
+        SQLiteDatabase.openDatabase(normalizedDatabase(TENANT).path, null, SQLiteDatabase.OPEN_READWRITE).use { db ->
+            db.execSQL(
+                "CREATE TRIGGER fail_interaction_insert BEFORE INSERT ON " +
+                    "${AndroidSyncStateStore.TABLE_INTERACTION_OPERATIONS} " +
+                    "BEGIN SELECT RAISE(ABORT, 'simulated interaction failure'); END",
+            )
+        }
+        assertTrue(runCatching { repository.deleteParking(session, parkingId, "failed-delete") }.isFailure)
+        assertEquals(beforeFailedDelete, AndroidSyncStateStore(context).loadSyncState(TENANT))
     }
 
     private fun state(tenantId: String, projectId: String = PROJECT): TenantSyncState {

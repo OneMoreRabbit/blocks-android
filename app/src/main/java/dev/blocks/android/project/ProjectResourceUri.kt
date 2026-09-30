@@ -5,10 +5,13 @@ import java.net.Inet6Address
 import java.net.InetAddress
 
 object ProjectResourceUri {
-    private val allowedSchemes = setOf("http", "https", "obsidian")
+    private val allowedSchemes = setOf("http", "https", "obsidian", "onenote")
 
     fun validate(value: String): String {
         val trimmed = value.trim()
+        if (trimmed.startsWith("onenote:", ignoreCase = true)) {
+            require(value == trimmed) { "OneNote links cannot contain surrounding whitespace." }
+        }
         require(trimmed.isNotEmpty() && trimmed.all { it.code in 0x21..0x7e }) {
             "Enter a valid link."
         }
@@ -17,12 +20,13 @@ object ProjectResourceUri {
         }
         val scheme = parsed.scheme?.lowercase()
         require(parsed.isAbsolute && scheme in allowedSchemes) {
-            "Use an http, https or obsidian link."
+            "Use an http, https, obsidian or OneNote link."
         }
         require(parsed.rawUserInfo == null) { "Links containing credentials are not allowed." }
         when (scheme) {
             "http", "https" -> validateWebAuthority(parsed)
             "obsidian" -> validateObsidianDestination(parsed)
+            "onenote" -> validateOneNoteClientLink(trimmed, parsed)
         }
         return trimmed
     }
@@ -83,5 +87,19 @@ object ProjectResourceUri {
             .removePrefix("//")
             .trimStart('/')
         require(destination.isNotEmpty()) { "Obsidian links must include a destination." }
+    }
+
+    private fun validateOneNoteClientLink(value: String, uri: URI) {
+        require(value == value.trim() && (value.startsWith("onenote:http://") || value.startsWith("onenote:https://"))) {
+            "Use a copied onenote:http:// or onenote:https:// client link."
+        }
+        val nested = runCatching { URI(uri.rawSchemeSpecificPart) }.getOrElse {
+            throw IllegalArgumentException("Use a copied onenote:http:// or onenote:https:// client link.")
+        }
+        require(nested.scheme in setOf("http", "https")) {
+            "Use a copied onenote:http:// or onenote:https:// client link."
+        }
+        require(nested.rawUserInfo == null) { "Links containing credentials are not allowed." }
+        validateWebAuthority(nested)
     }
 }

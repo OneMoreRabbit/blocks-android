@@ -20,6 +20,11 @@ import dev.blocks.android.project.PhysicalBlock
 import dev.blocks.android.project.ProjectCacheState
 import dev.blocks.android.project.ProjectCover
 import dev.blocks.android.project.ProjectIdentityMapping
+import dev.blocks.android.project.InteractionMutation
+import dev.blocks.android.project.InteractionMutationType
+import dev.blocks.android.project.LinkOrderState
+import dev.blocks.android.project.ParkingTombstone
+import dev.blocks.android.project.ProjectOrderState
 import dev.blocks.android.project.ProjectItemMutation
 import dev.blocks.android.project.ProjectItemMutationType
 import dev.blocks.android.project.ProjectMutation
@@ -33,6 +38,7 @@ import dev.blocks.android.project.ProjectSummary
 import dev.blocks.android.project.ProjectUiPreferences
 import dev.blocks.android.project.noteItemDraftKey
 import dev.blocks.android.project.ensureProjectLinks
+import dev.blocks.android.project.ensureInteractionState
 import dev.blocks.android.tag.LocalBlockOperation
 import dev.blocks.android.tag.LocalBlockOperationType
 import dev.blocks.android.tag.LocalBlockRecord
@@ -85,6 +91,11 @@ internal data class EncodedSyncRows(
     val projectDrafts: String? = null,
     val projectDraftsMigrated: Boolean = false,
     val projectUiPreferences: String? = null,
+    val projectOrder: String? = null,
+    val linkOrders: List<String> = emptyList(),
+    val parkingTombstones: List<String> = emptyList(),
+    val interactionOperations: List<String> = emptyList(),
+    val retiredInteractionOperations: List<String> = emptyList(),
 )
 
 internal class SyncStateRowCodec(
@@ -136,6 +147,11 @@ internal class SyncStateRowCodec(
             projectDrafts = gson.toJson(state.projectDrafts),
             projectDraftsMigrated = state.projectDraftsMigrated,
             projectUiPreferences = gson.toJson(state.projectUiPreferences),
+            projectOrder = gson.toJson(projectCache.projectOrder),
+            linkOrders = projectCache.linkOrders.map(gson::toJson),
+            parkingTombstones = projectCache.parkingTombstones.map(gson::toJson),
+            interactionOperations = projectCache.interactionOperations.map(gson::toJson),
+            retiredInteractionOperations = projectCache.retiredInteractionOperationIds,
         )
     }
 
@@ -234,6 +250,31 @@ internal class SyncStateRowCodec(
                 } else {
                     emptyList()
                 },
+                projectOrder = if (rows.schemaVersion >= INTERACTION_ORDER_SCHEMA_VERSION) {
+                    rows.projectOrder?.let { gson.fromJson(it, ProjectOrderState::class.java) } ?: ProjectOrderState()
+                } else {
+                    ProjectOrderState()
+                },
+                linkOrders = if (rows.schemaVersion >= INTERACTION_ORDER_SCHEMA_VERSION) {
+                    rows.linkOrders.map { gson.fromJson(it, LinkOrderState::class.java) }
+                } else {
+                    emptyList()
+                },
+                parkingTombstones = if (rows.schemaVersion >= INTERACTION_ORDER_SCHEMA_VERSION) {
+                    rows.parkingTombstones.map { gson.fromJson(it, ParkingTombstone::class.java) }
+                } else {
+                    emptyList()
+                },
+                interactionOperations = if (rows.schemaVersion >= INTERACTION_ORDER_SCHEMA_VERSION) {
+                    rows.interactionOperations.map { gson.fromJson(it, InteractionMutation::class.java) }
+                } else {
+                    emptyList()
+                },
+                retiredInteractionOperationIds = if (rows.schemaVersion >= INTERACTION_ORDER_SCHEMA_VERSION) {
+                    rows.retiredInteractionOperations.distinct()
+                } else {
+                    emptyList()
+                },
             ).ensureProjectLinks(projectKeyFactory)
         }
         if (rows.schemaVersion < PROJECT_ITEM_SCHEMA_VERSION) {
@@ -279,6 +320,17 @@ internal class SyncStateRowCodec(
         } else {
             decodedDrafts
         }
+        val preferences = if (rows.schemaVersion >= STANDALONE_SCHEMA_VERSION) {
+            val decoded = rows.projectUiPreferences?.let { gson.fromJson(it, ProjectUiPreferences::class.java) }
+                ?: ProjectUiPreferences()
+            if (rows.schemaVersion < INTERACTION_ORDER_SCHEMA_VERSION) {
+                decoded.copy(dashboardOrderMode = dev.blocks.android.project.DashboardOrderMode.NAME)
+            } else {
+                decoded
+            }
+        } else {
+            ProjectUiPreferences()
+        }
         return TenantSyncState(
             projects = projects,
             projectsLoaded = rows.projectsLoaded,
@@ -291,12 +343,7 @@ internal class SyncStateRowCodec(
             projectCache = projectCache,
             projectDrafts = migratedDrafts,
             projectDraftsMigrated = rows.schemaVersion >= LOCAL_FIRST_SCHEMA_VERSION && rows.projectDraftsMigrated,
-            projectUiPreferences = if (rows.schemaVersion >= STANDALONE_SCHEMA_VERSION) {
-                rows.projectUiPreferences?.let { gson.fromJson(it, ProjectUiPreferences::class.java) }
-                    ?: ProjectUiPreferences()
-            } else {
-                ProjectUiPreferences()
-            },
+            projectUiPreferences = preferences,
         )
     }
 
@@ -319,7 +366,8 @@ internal class SyncStateRowCodec(
         const val PROJECT_LINK_SCHEMA_VERSION = 8
         const val PROJECT_COVER_SCHEMA_VERSION = 9
         const val PROJECT_ITEM_SCHEMA_VERSION = 10
-        const val CURRENT_SCHEMA_VERSION = PROJECT_ITEM_SCHEMA_VERSION
+        const val INTERACTION_ORDER_SCHEMA_VERSION = 11
+        const val CURRENT_SCHEMA_VERSION = INTERACTION_ORDER_SCHEMA_VERSION
     }
 }
 
@@ -599,6 +647,68 @@ private fun validateProjectCache(cache: ProjectCacheState) {
     }
     require(cache.projectsAwaitingNotesBaseline.distinct().size == cache.projectsAwaitingNotesBaseline.size) {
         "Projects awaiting a notes baseline are not unique"
+    }
+    validateInteractionState(cache)
+}
+
+internal fun validateInteractionState(cache: ProjectCacheState) {
+    val activeIds = cache.activeProjects.map { it.id }
+    require(cache.projectOrder.version >= 0) { "The Project order version is invalid" }
+    if (cache.projectOrder.orderedProjectIds.isNotEmpty() || cache.projectOrder.version > 0) {
+        require(cache.projectOrder.orderedProjectIds.size == cache.projectOrder.orderedProjectIds.distinct().size &&
+            cache.projectOrder.orderedProjectIds.toSet() == activeIds.toSet()) {
+            "The custom Project order must contain every active Project exactly once"
+        }
+    }
+    require(cache.linkOrders.map { it.projectId }.distinct().size == cache.linkOrders.size) {
+        "A Project has more than one Link order aggregate"
+    }
+    cache.linkOrders.forEach { order ->
+        require(order.version >= 0) { "A Link order version is invalid" }
+        val live = cache.resourceLinks.filter { it.projectId == order.projectId && it.deletedAt == null }.map { it.id }
+        require(order.orderedLinkIds.size == order.orderedLinkIds.distinct().size &&
+            order.orderedLinkIds.toSet() == live.toSet()) {
+            "A Link order must contain every live Link exactly once"
+        }
+    }
+    require(cache.parkingTombstones.map { it.parkingId }.distinct().size == cache.parkingTombstones.size) {
+        "A Park record has more than one tombstone"
+    }
+    cache.parkingTombstones.forEach { tombstone ->
+        require(tombstone.version > 0 && tombstone.deletedAt.isNotBlank()) { "A Park tombstone is invalid" }
+        require(cache.parkingRecords.any { it.id == tombstone.parkingId && it.projectId == tombstone.projectId }) {
+            "A Park tombstone must retain its immutable Park record"
+        }
+    }
+    require(cache.interactionOperations.map { it.operationId }.distinct().size == cache.interactionOperations.size) {
+        "Interaction operation identities are not unique"
+    }
+    require(cache.interactionOperations.none { it.operationId in cache.retiredInteractionOperationIds }) {
+        "A pending interaction operation is already retired"
+    }
+    val positions = cache.interactionOperations.mapIndexed { index, operation -> operation.operationId to index }.toMap()
+    cache.interactionOperations.forEachIndexed { index, operation ->
+        require(operation.contractVersion == "0.7" && operation.operationId.isNotBlank()) {
+            "An interaction operation has an invalid contract boundary"
+        }
+        require(operation.baseVersion >= 0) { "An interaction operation base version is invalid" }
+        operation.dependsOnOperationIds.forEach { dependency ->
+            val earlierInteraction = positions[dependency]?.let { it < index } == true
+            val earlierExisting = cache.commands.any { it.operationId == dependency } ||
+                cache.itemOperations.any { it.operationId == dependency } ||
+                dependency in cache.retiredOperationIds || dependency in cache.retiredItemOperationIds ||
+                dependency in cache.retiredInteractionOperationIds
+            require(earlierInteraction || earlierExisting) {
+                "An interaction operation dependency must precede it"
+            }
+        }
+        when (operation.type) {
+            InteractionMutationType.REORDER_PROJECTS -> require(operation.projectId == null && operation.targetId == null)
+            InteractionMutationType.REORDER_LINKS -> require(!operation.projectId.isNullOrBlank())
+            InteractionMutationType.DELETE_PARKING -> require(
+                !operation.projectId.isNullOrBlank() && !operation.targetId.isNullOrBlank(),
+            )
+        }
     }
 }
 
