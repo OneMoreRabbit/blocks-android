@@ -27,6 +27,7 @@ class ProjectResourceUriTest {
             "content://provider/private",
             "javascript:alert(1)",
             "https://user:password@example.com/private",
+            "onenote://user:password@example.com/private",
             "/relative/path",
             "https:///missing-host",
             "obsidian:",
@@ -59,11 +60,11 @@ class ProjectResourceUriTest {
     }
 
     @Test
-    fun matchesTheSharedVersionedAcceptanceCorpusIncludingStrictOneNoteClientLinks() {
+    fun matchesTheSharedVersionedAcceptanceCorpusIncludingOrdinaryOneNoteUris() {
         val corpus = requireNotNull(javaClass.classLoader)
-            .getResourceAsStream("project-resource-uri-validation-v0_2.json")
+            .getResourceAsStream("project-resource-uri-validation-v0_3.json")
             .use { input -> Gson().fromJson(input.reader(), UriCorpus::class.java) }
-        assertEquals("0.2", corpus.version)
+        assertEquals("0.3", corpus.version)
         corpus.accepted.forEach { value ->
             assertEquals(value, ProjectResourceUri.validate(value))
             assertTrue(ProjectResourceUri.canLaunch(value))

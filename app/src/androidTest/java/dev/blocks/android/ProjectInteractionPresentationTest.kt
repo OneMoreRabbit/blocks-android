@@ -357,6 +357,6 @@ class ProjectInteractionPresentationTest {
         const val LINK_B = "20000000-0000-4000-8000-000000000902"
         const val PARK_NEW = "30000000-0000-4000-8000-000000000901"
         const val NOW = "2026-09-30T10:00:00Z"
-        const val ONENOTE_URI = "onenote:https://example.com/Notebook/Section.one#Page"
+        const val ONENOTE_URI = "onenote:page-id=1234&section-id=5678"
     }
 }

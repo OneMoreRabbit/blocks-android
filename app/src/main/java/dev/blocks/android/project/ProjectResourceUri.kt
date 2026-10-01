@@ -26,7 +26,6 @@ object ProjectResourceUri {
         when (scheme) {
             "http", "https" -> validateWebAuthority(parsed)
             "obsidian" -> validateObsidianDestination(parsed)
-            "onenote" -> validateOneNoteClientLink(trimmed, parsed)
         }
         return trimmed
     }
@@ -87,19 +86,5 @@ object ProjectResourceUri {
             .removePrefix("//")
             .trimStart('/')
         require(destination.isNotEmpty()) { "Obsidian links must include a destination." }
-    }
-
-    private fun validateOneNoteClientLink(value: String, uri: URI) {
-        require(value == value.trim() && (value.startsWith("onenote:http://") || value.startsWith("onenote:https://"))) {
-            "Use a copied onenote:http:// or onenote:https:// client link."
-        }
-        val nested = runCatching { URI(uri.rawSchemeSpecificPart) }.getOrElse {
-            throw IllegalArgumentException("Use a copied onenote:http:// or onenote:https:// client link.")
-        }
-        require(nested.scheme in setOf("http", "https")) {
-            "Use a copied onenote:http:// or onenote:https:// client link."
-        }
-        require(nested.rawUserInfo == null) { "Links containing credentials are not allowed." }
-        validateWebAuthority(nested)
     }
 }

@@ -1424,7 +1424,7 @@ class MainActivity : ComponentActivity() {
             id = ProjectUiIds.LINK_TITLE
             markInvalid(ProjectFormField.LINK_TITLE)
         }
-        val uri = input("https://, obsidian:// or onenote:https://", uriValue) { uriValue = it; persist() }.apply {
+        val uri = input("https://, obsidian:// or onenote:", uriValue) { uriValue = it; persist() }.apply {
             id = ProjectUiIds.LINK_URI
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
             markInvalid(ProjectFormField.LINK_URI)

@@ -57,7 +57,7 @@ adb pull /sdcard/Android/data/dev.blocks.android/files/review-0.9.0/. "$EVIDENCE
 echo 'EXPECTED: project-populated.png, project-empty.png and project-long-history.png are copied outside git.'
 
 echo 'PAUSE: physical OneNote launch'
-echo 'On a supported physical device with OneNote installed: add the accepted onenote:https:// fixture, verify no launch occurs on save/render, then tap its title and verify OneNote opens the copied destination.'
+echo 'On a supported physical device with OneNote installed: add each accepted ordinary onenote: fixture from project-resource-uri-validation-v0_3.json, including a non-HTTP payload; verify no launch occurs on save/render, then tap its title and verify Android generic ACTION_VIEW opens the copied destination in OneNote.'
 if [ -t 0 ]; then
     printf 'Enter PASS or BLOCKED: '
     read -r one_note_verdict

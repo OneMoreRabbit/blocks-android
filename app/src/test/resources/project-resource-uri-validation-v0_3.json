@@ -1,5 +1,5 @@
 {
-  "version": "0.2",
+  "version": "0.3",
   "accepted": [
     "https://example.com/path?q=one",
     "HTTPS://Example.COM/path",
@@ -10,18 +10,17 @@
     "obsidian://new?vault=Blocks&name=Note%20one",
     "onenote:https://d.docs.live.net/0123456789abcdef/Documents/Notebook/Section.one#Page",
     "onenote:http://example.com/Notebook/Section.one",
-    "onenote:https://example.com/Notebook%20One/Section.one?section-id=%7B1234%7D"
+    "onenote:page-id=1234&section-id=5678",
+    "onenote://open?section-id=%7B1234%7D",
+    "ONENOTE:page-id=1234"
   ],
   "refused": [
-    " onenote:https://example.com/Notebook.one",
-    "onenote:https://example.com/Notebook.one ",
-    "ONENOTE:https://example.com/Notebook.one",
-    "onenote:ftp://example.com/Notebook.one",
-    "onenote:https:///missing-host",
-    "onenote:https://user:password@example.com/Notebook.one",
-    "onenote:https://example.com/Notebook one",
-    "onenote:https://example.com/Notebøok.one",
-    "onenote:javascript:alert(1)",
+    " onenote:page-id=1234",
+    "onenote:page-id=1234 ",
+    "onenote:",
+    "onenote:page id=1234",
+    "onenote:line\nbreak",
+    "onenote:Notebøok",
     "intent://open/#Intent;scheme=https;end",
     "file:///tmp/private",
     "content://provider/private",
