@@ -178,9 +178,12 @@ class LocalActionPerformanceTest {
                 measureUntilVisible(
                     scenario,
                     activate = { activity ->
-                        val move = activity.buttonsWithDescription("Move link down").firstOrNull { it.isEnabled }
-                            ?: activity.buttonsWithDescription("Move link up").first { it.isEnabled }
-                        move.performClick()
+                        val move = activity.buttonsWithDescriptionPrefix("Reorder ").first { button ->
+                            button.createAccessibilityNodeInfo().actionList.any {
+                                it.label?.toString() == "Move link later"
+                            }
+                        }
+                        move.performAccessibilityActionNamed("Move link later")
                     },
                     visible = { activity -> activity.visibleLinkOrder() != before },
                 )
@@ -188,16 +191,16 @@ class LocalActionPerformanceTest {
 
             stabilizePerformancePhase()
             val parkDeleteTimings = (1..25).map {
-                var before = ""
+                lateinit var deleteButton: Button
                 scenario.onActivity { activity ->
-                    before = activity.newestParkingSignature()
-                    activity.newestParkingDeleteButton().performClick()
+                    deleteButton = activity.historicalParkingDeleteButton()
+                    deleteButton.performClick()
                 }
                 waitFor(scenario) { it.activeDialog != null }
                 measureUntilVisible(
                     scenario,
                     activate = { activity -> activity.dialogButton("Delete").performClick() },
-                    visible = { activity -> activity.newestParkingSignature() != before },
+                    visible = { !deleteButton.isAttachedToWindow },
                 )
             }
 
@@ -292,6 +295,18 @@ class LocalActionPerformanceTest {
             }
             .toList()
 
+    private fun Activity.buttonsWithDescriptionPrefix(prefix: String): List<Button> =
+        findViewById<ViewGroup>(android.R.id.content)
+            .descendants()
+            .filterIsInstance<Button>()
+            .filter { it.contentDescription?.toString()?.startsWith(prefix) == true && it.isShown }
+            .toList()
+
+    private fun Button.performAccessibilityActionNamed(label: String) {
+        val action = createAccessibilityNodeInfo().actionList.single { it.label?.toString() == label }
+        check(performAccessibilityAction(action.id, null))
+    }
+
     private fun Activity.visibleLinkOrder(): List<String> = findViewById<ViewGroup>(android.R.id.content)
         .descendants()
         .filterIsInstance<Button>()
@@ -299,10 +314,10 @@ class LocalActionPerformanceTest {
         .map { it.contentDescription.toString() }
         .toList()
 
-    private fun Activity.newestParkingDeleteButton(): Button =
-        findViewById<ViewGroup>(ProjectUiIds.NEWEST_PARKING).descendants()
+    private fun Activity.historicalParkingDeleteButton(): Button =
+        findViewById<ViewGroup>(ProjectUiIds.PROJECT_ACTIVITY).descendants()
             .filterIsInstance<Button>()
-            .single { it.text.toString() == "Delete park message" }
+            .first { it.contentDescription?.toString() == "Delete park message" }
 
     private fun Activity.newestParkingSignature(): String =
         findViewById<ViewGroup>(ProjectUiIds.NEWEST_PARKING).descendants()

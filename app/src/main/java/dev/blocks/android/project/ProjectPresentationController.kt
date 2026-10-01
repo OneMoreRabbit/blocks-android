@@ -474,6 +474,15 @@ class ProjectPresentationController(
     }
 
     @Synchronized
+    fun moveResourceLink(linkId: String, targetLinkId: String) {
+        activeProjectPage()
+        val from = state.resourceLinks.indexOfFirst { it.id == linkId }
+        val to = state.resourceLinks.indexOfFirst { it.id == targetLinkId }
+        if (from < 0 || to < 0 || from == to) return
+        applyResult(workspace.moveResourceLink(activeSession(), linkId, to - from))
+    }
+
+    @Synchronized
     fun deleteParking(parkingId: String) {
         activeProjectPage()
         applyResult(workspace.deleteParking(activeSession(), parkingId))

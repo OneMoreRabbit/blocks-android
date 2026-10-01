@@ -33,6 +33,7 @@ import dev.blocks.android.auth.AcceptedTenantContinuity
 import dev.blocks.android.auth.AcceptedTenantContinuityStore
 import dev.blocks.android.auth.AndroidEncryptedAcceptedTenantContinuityStore
 import dev.blocks.android.auth.IdentityProvider
+import dev.blocks.android.auth.ReturningAccountCredential
 import dev.blocks.android.cover.ProjectCoverImporter
 import dev.blocks.android.cover.CoverCropSelection
 import dev.blocks.android.cover.AndroidEncryptedProjectCoverMediaStore
@@ -211,6 +212,108 @@ class MainActivityPresentationTest {
             assertEquals(0, workspace.syncCalls)
             assertEquals(0, sessionExchanges.get())
             assertEquals(0, identity.signInCalls)
+            assertEquals(1, identity.returningAccountCalls)
+        }
+    }
+
+    @Test
+    fun authorizedReturningAccountValidatesBindingThenSynchronizesInBackground() {
+        identity.returningAccountResult = ReturningAccountCredential.Available("returning-token")
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            waitUntil { workspace.syncCalls > 0 }
+
+            scenario.onActivity { activity -> assertTrue(activity.hasButton("Active project")) }
+            assertEquals(1, identity.returningAccountCalls)
+            assertEquals(0, identity.signInCalls)
+            assertEquals(1, sessionExchanges.get())
+            assertFalse(presentationController.state.sessionConfirmationRequired)
+        }
+    }
+
+    @Test
+    fun cancelledReturningAccountCheckKeepsCachedWorkUsableAndContained() {
+        identity.returningAccountResult = ReturningAccountCredential.Cancelled
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { activity ->
+                assertTrue(activity.hasButton("Active project"))
+                assertTrue(activity.hasDescription("Saved on this device. Reconnect in Settings to synchronize."))
+            }
+            assertEquals(1, identity.returningAccountCalls)
+            assertEquals(0, sessionExchanges.get())
+            assertTrue(presentationController.state.sessionConfirmationRequired)
+        }
+    }
+
+    @Test
+    fun unavailableOrNonAutoSelectableReturningAccountsNeverFallBackToNewAccount() {
+        identity.returningAccountResult = ReturningAccountCredential.Unavailable
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { assertTrue(it.hasButton("Active project")) }
+            assertEquals(1, identity.returningAccountCalls)
+            assertEquals(0, identity.signInCalls)
+            assertEquals(0, sessionExchanges.get())
+        }
+    }
+
+    @Test
+    fun returningAccountWithWrongServiceBindingFailsClosed() {
+        identity.returningAccountResult = ReturningAccountCredential.Available("wrong-binding")
+        authenticatedTenant = OTHER_TENANT_ID
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_LOGIN }
+            assertFalse(continuity.shouldRestore)
+            assertEquals(1, identity.returningAccountCalls)
+            assertEquals(1, sessionExchanges.get())
+            assertEquals(null, acceptedTenant.load())
+        }
+    }
+
+    @Test
+    fun explicitSignOutSuppressesReturningAccountAttemptsAcrossRestart() {
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                activity.selectDialogItem("Sign out")
+            }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_LOGIN }
+            scenario.recreate()
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_LOGIN }
+            assertEquals(1, identity.returningAccountCalls)
+            assertEquals(0, identity.signInCalls)
+        }
+    }
+
+    @Test
+    fun eachProcessStyleRestartMakesOnlyOneBoundedReturningAttempt() {
+        ActivityScenario.launch(MainActivity::class.java).use { first ->
+            waitFor(first) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+        }
+        ActivityScenario.launch(MainActivity::class.java).use { restarted ->
+            waitFor(restarted) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+        }
+        assertEquals(2, identity.returningAccountCalls)
+        assertEquals(0, identity.signInCalls)
+    }
+
+    @Test
+    fun validatedReturningSessionResynchronizesAfterLifecycleConnectivityOpportunity() {
+        identity.returningAccountResult = ReturningAccountCredential.Available("returning-token")
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitUntil { workspace.syncCalls > 0 }
+            val initialSyncs = workspace.syncCalls
+            scenario.moveToState(Lifecycle.State.CREATED)
+            scenario.moveToState(Lifecycle.State.RESUMED)
+            waitUntil { workspace.syncCalls > initialSyncs }
+            assertEquals(1, identity.returningAccountCalls)
         }
     }
 
@@ -1064,7 +1167,9 @@ class MainActivityPresentationTest {
                 val settings = activity.findViewById<Button>(ProjectUiIds.PROJECT_SETTINGS)
                 val topBar = settings.parent as LinearLayout
                 assertEquals(topBar.childCount - 1, topBar.indexOfChild(settings))
-                val spacer = topBar.getChildAt(topBar.childCount - 2)
+                val spacer = (0 until topBar.childCount).map(topBar::getChildAt).single {
+                    (it.layoutParams as LinearLayout.LayoutParams).weight > 0f
+                }
                 assertTrue((spacer.layoutParams as LinearLayout.LayoutParams).weight > 0f)
                 val settingsLocation = IntArray(2).also(settings::getLocationOnScreen)
                 val contentLocation = IntArray(2).also(content::getLocationOnScreen)
@@ -1150,7 +1255,7 @@ class MainActivityPresentationTest {
                 activity.selectDialogItem("About")
                 val about = activity.dialogTexts().joinToString("\n")
                 assertTrue(about.contains("Blocks Android"))
-                assertTrue(about.contains("Version 0.9.0 (17)"))
+                assertTrue(about.contains("Version 0.9.1 (18)"))
                 assertTrue(about.contains("dev.blocks.android/debug"))
                 assertFalse(about.contains("tenant", ignoreCase = true))
                 assertFalse(about.contains("token", ignoreCase = true))
@@ -2156,12 +2261,14 @@ class MainActivityPresentationTest {
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             scenario.onActivity { activity ->
                 val density = activity.resources.displayMetrics.density
-                val tiles = activity.findViewById<Button>(ProjectUiIds.VIEW_TILES)
                 val list = activity.findViewById<Button>(ProjectUiIds.VIEW_LIST)
-                assertTrue(tiles.isSelected)
-                assertFalse(list.isSelected)
-                assertTrue(tiles.width >= (48 * density).toInt())
+                assertEquals(null, activity.findViewById<Button>(ProjectUiIds.VIEW_TILES))
+                assertEquals("List", list.text.toString())
+                assertEquals("Show List view", list.contentDescription.toString())
                 assertTrue(list.width >= (48 * density).toInt())
+                val order = activity.findViewById<Button>(ProjectUiIds.DASHBOARD_ORDER)
+                assertEquals("", order.text.toString())
+                assertTrue(order.contentDescription.toString().contains("Current: Name"))
                 assertTrue(activity.findViewById<View>(ProjectUiIds.DASHBOARD_WATERMARK) != null)
                 assertFalse(activity.texts().contains("Blocks"))
                 assertFalse(activity.texts().any { it.contains("park message", ignoreCase = true) })
@@ -2192,7 +2299,8 @@ class MainActivityPresentationTest {
             }
             waitFor(scenario) { it.findViewById<View>(ProjectUiIds.PROJECT_LIST) != null }
             scenario.onActivity { activity ->
-                assertTrue(activity.findViewById<Button>(ProjectUiIds.VIEW_LIST).isSelected)
+                assertEquals(null, activity.findViewById<Button>(ProjectUiIds.VIEW_LIST))
+                assertEquals("Tiles", activity.findViewById<Button>(ProjectUiIds.VIEW_TILES).text.toString())
                 val ordered = activity.findViewById<LinearLayout>(ProjectUiIds.PROJECT_LIST)
                     .descendants()
                     .filterIsInstance<Button>()
@@ -2207,7 +2315,7 @@ class MainActivityPresentationTest {
             scenario.recreate()
             waitFor(scenario) { it.findViewById<View>(ProjectUiIds.PROJECT_LIST) != null }
             scenario.onActivity { activity ->
-                assertTrue(activity.findViewById<Button>(ProjectUiIds.VIEW_LIST).isSelected)
+                assertEquals("Tiles", activity.findViewById<Button>(ProjectUiIds.VIEW_TILES).text.toString())
             }
         }
     }
@@ -2452,7 +2560,6 @@ class MainActivityPresentationTest {
                 waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
                 scenario.onActivity { activity ->
                     assertTrue(activity.findViewById<ScrollView>(ProjectUiIds.ROOT_SCROLL) != null)
-                    assertTrue(activity.findViewById<Button>(ProjectUiIds.VIEW_TILES).contentDescription.toString().isNotBlank())
                     assertTrue(activity.findViewById<Button>(ProjectUiIds.VIEW_LIST).contentDescription.toString().isNotBlank())
                     assertTrue(activity.findViewById<Button>(ProjectUiIds.SETTINGS).contentDescription.toString().isNotBlank())
                     activity.button("Active project").performClick()
@@ -2569,6 +2676,10 @@ class MainActivityPresentationTest {
         .descendants()
         .filterIsInstance<Button>()
         .any { it.text.toString() == text }
+
+    private fun Activity.hasDescription(description: String) = findViewById<ViewGroup>(android.R.id.content)
+        .descendants()
+        .any { it.contentDescription?.toString() == description && it.isShown }
 
     private fun Activity.texts() = findViewById<ViewGroup>(android.R.id.content)
         .descendants()
@@ -2859,12 +2970,18 @@ class MainActivityPresentationTest {
 
     private class FakeIdentity : IdentityProvider {
         var signInCalls = 0
+        var returningAccountCalls = 0
         var clearCalls = 0
         var signInFailure: Exception? = null
+        var returningAccountResult: ReturningAccountCredential = ReturningAccountCredential.Unavailable
         override suspend fun signIn(activity: Activity): String {
             signInCalls += 1
             signInFailure?.let { throw it }
             return "identity-token"
+        }
+        override suspend fun returningAccount(activity: Activity): ReturningAccountCredential {
+            returningAccountCalls += 1
+            return returningAccountResult
         }
         override suspend fun clear(activity: Activity) {
             clearCalls += 1

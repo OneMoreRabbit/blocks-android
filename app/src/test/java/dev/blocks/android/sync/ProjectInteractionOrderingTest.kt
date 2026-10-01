@@ -57,6 +57,27 @@ class ProjectInteractionOrderingTest {
     }
 
     @Test
+    fun directDragCanCommitAnArbitraryLinkMoveAsOneAtomicOrderOperation() {
+        val initial = state().copy(
+            projectCache = state().projectCache.copy(
+                resourceLinks = listOf(link(LINK_A, "A"), link(LINK_B, "B"), link(LINK_C, "C")),
+            ),
+        )
+        val store = MemoryStore().apply { saveSyncState(TENANT_A, initial) }
+        val repository = repository(store)
+        repository.activate(SESSION_A)
+
+        repository.moveResourceLink(SESSION_A, LINK_A, 2, "drag-order")
+
+        val cache = store.cache(TENANT_A)
+        assertEquals(listOf(LINK_B, LINK_C, LINK_A), cache.orderedResourceLinks(PROJECT_A).map { it.id })
+        val operations = cache.interactionOperations.filter { it.type == InteractionMutationType.REORDER_LINKS }
+        assertEquals(1, operations.size)
+        assertEquals("drag-order", operations.single().operationId)
+        assertEquals(listOf(LINK_B, LINK_C, LINK_A), operations.single().orderedClientIds)
+    }
+
+    @Test
     fun linkReorderRollsBackStateAndQueueWhenTheAtomicStoreCommitFails() {
         val initial = state().copy(
             projectCache = state().projectCache.copy(
@@ -302,6 +323,7 @@ class ProjectInteractionOrderingTest {
         const val PROJECT_C = "10000000-0000-4000-8000-000000000003"
         const val LINK_A = "20000000-0000-4000-8000-000000000001"
         const val LINK_B = "20000000-0000-4000-8000-000000000002"
+        const val LINK_C = "20000000-0000-4000-8000-000000000003"
         const val NOTE_A = "30000000-0000-4000-8000-000000000001"
         const val PARK_A = "40000000-0000-4000-8000-000000000001"
         const val PARK_B = "40000000-0000-4000-8000-000000000002"

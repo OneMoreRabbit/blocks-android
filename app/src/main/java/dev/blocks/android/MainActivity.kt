@@ -50,6 +50,7 @@ import dev.blocks.android.auth.AcceptedTenantContinuityStore
 import dev.blocks.android.auth.AndroidEncryptedAcceptedTenantContinuityStore
 import dev.blocks.android.auth.GoogleIdentityClient
 import dev.blocks.android.auth.IdentityProvider
+import dev.blocks.android.auth.ReturningAccountCredential
 import dev.blocks.android.cover.AndroidProjectCoverImporter
 import dev.blocks.android.cover.AndroidProjectCoverCropper
 import dev.blocks.android.cover.AndroidEncryptedProjectCoverMediaStore
@@ -511,6 +512,9 @@ class MainActivity : ComponentActivity() {
         }
         if (controller.state.screen == ProjectScreen.PROJECT) {
             bar.addView(View(this), LinearLayout.LayoutParams(0, 0, 1f))
+            if (controller.state.authenticationRequired || controller.state.sessionConfirmationRequired) {
+                bar.addView(unsynchronizedIndicator(), LinearLayout.LayoutParams(dp(24), dp(48)))
+            }
             bar.addView(iconOnlyButton(R.drawable.ic_settings, "Settings") { showProjectSettings() }.apply {
                 id = ProjectUiIds.PROJECT_SETTINGS
             }, LinearLayout.LayoutParams(dp(48), dp(48)))
@@ -535,18 +539,6 @@ class MainActivity : ComponentActivity() {
             gravity = Gravity.CENTER
         }
         if (archiveMode) body.addView(heading("Archive", 24f).apply { setPadding(0, dp(16), 0, dp(8)) })
-        if (!archiveMode) {
-            body.addView(
-                secondaryButton(
-                    "Order: ${dashboardOrderLabel(controller.state.dashboardOrderMode)}",
-                    R.drawable.ic_list,
-                ) { showDashboardOrderMode() }.apply { id = ProjectUiIds.DASHBOARD_ORDER },
-                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)).apply {
-                    bottomMargin = dp(6)
-                },
-            )
-        }
-
         val collection = FrameLayout(this).apply {
             setBackgroundColor(Color.TRANSPARENT)
             minimumHeight = dp(360)
@@ -649,27 +641,32 @@ class MainActivity : ComponentActivity() {
         }
         controls.addView(search, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginEnd = dp(6) })
 
-        val toggle = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-        }
         val tilesSelected = controller.state.dashboardView == DashboardView.TILES
-        toggle.addView(
-            viewToggleButton(R.drawable.ic_grid, "Tile view", tilesSelected) {
-                if (!tilesSelected) runRepositoryAction { controller.toggleDashboardView() }
-            }.apply { id = ProjectUiIds.VIEW_TILES },
-            LinearLayout.LayoutParams(dp(48), dp(48)),
+        if (!controller.state.archiveMode) {
+            controls.addView(iconOnlyButton(
+                R.drawable.ic_list,
+                "Project order. Current: ${dashboardOrderLabel(controller.state.dashboardOrderMode)}",
+            ) { showDashboardOrderMode() }.apply {
+                id = ProjectUiIds.DASHBOARD_ORDER
+                ViewCompat.setStateDescription(this, dashboardOrderLabel(controller.state.dashboardOrderMode))
+            }, LinearLayout.LayoutParams(dp(48), dp(48)).apply { marginStart = dp(4) })
+        }
+        val destinationLabel = if (tilesSelected) "List" else "Tiles"
+        val destinationIcon = if (tilesSelected) R.drawable.ic_list else R.drawable.ic_grid
+        controls.addView(
+            dashboardDestinationButton(destinationIcon, destinationLabel) {
+                runRepositoryAction { controller.toggleDashboardView() }
+            }.apply {
+                id = if (tilesSelected) ProjectUiIds.VIEW_LIST else ProjectUiIds.VIEW_TILES
+            },
+            LinearLayout.LayoutParams(dp(76), dp(48)).apply {
+                marginStart = dp(4)
+                marginEnd = dp(4)
+            },
         )
-        toggle.addView(
-            viewToggleButton(R.drawable.ic_list, "List view", !tilesSelected) {
-                if (tilesSelected) runRepositoryAction { controller.toggleDashboardView() }
-            }.apply { id = ProjectUiIds.VIEW_LIST },
-            LinearLayout.LayoutParams(dp(48), dp(48)),
-        )
-        controls.addView(toggle, LinearLayout.LayoutParams(dp(96), dp(48)).apply {
-            marginStart = dp(4)
-            marginEnd = dp(4)
-        })
+        if (controller.state.authenticationRequired || controller.state.sessionConfirmationRequired) {
+            controls.addView(unsynchronizedIndicator(), LinearLayout.LayoutParams(dp(24), dp(48)))
+        }
         controls.addView(iconOnlyButton(R.drawable.ic_settings, "Settings") { showSettings() }.apply {
             id = ProjectUiIds.SETTINGS
         }, LinearLayout.LayoutParams(dp(48), dp(48)))
@@ -810,6 +807,21 @@ class MainActivity : ComponentActivity() {
                         true
                     }
                     else -> true
+                }
+            }
+            val position = controller.state.activeProjects.indexOfFirst { it.id == project.id }
+            if (position > 0) {
+                val target = controller.state.activeProjects[position - 1]
+                ViewCompat.addAccessibilityAction(this, "Move project earlier") { _, _ ->
+                    runRepositoryAction { controller.moveActiveProject(project.id, target.id) }
+                    true
+                }
+            }
+            if (position >= 0 && position < controller.state.activeProjects.lastIndex) {
+                val target = controller.state.activeProjects[position + 1]
+                ViewCompat.addAccessibilityAction(this, "Move project later") { _, _ ->
+                    runRepositoryAction { controller.moveActiveProject(project.id, target.id) }
+                    true
                 }
             }
         }
@@ -992,7 +1004,7 @@ class MainActivity : ComponentActivity() {
         )
 
         val newestParking = page.newestParking
-        content.addView(newestParkingBlock(newestParking, archived))
+        content.addView(newestParkingBlock(newestParking))
 
         if (archived) {
             bottomActions.addView(primaryButton("Reopen", R.drawable.ic_archive) { source ->
@@ -1104,7 +1116,7 @@ class MainActivity : ComponentActivity() {
             .thenByDescending { it.second })
     }
 
-    /** Reuses the existing Link rows and only changes their order and boundary controls. */
+    /** Reuses the existing Link rows after one atomic local drag reorder. */
     private fun renderResourceLinkOrder(): Boolean {
         if (controller.state.screen != ProjectScreen.PROJECT) return false
         val container = content.findViewById<LinearLayout>(ProjectUiIds.PROJECT_LINKS) ?: return false
@@ -1112,20 +1124,8 @@ class MainActivity : ComponentActivity() {
         val existing = (0 until container.childCount).map(container::getChildAt).associateBy { it.tag as? String }
         if (desired.map { it.id }.toSet() != existing.keys.filterNotNull().toSet()) return false
         container.removeAllViews()
-        desired.forEachIndexed { index, link ->
+        desired.forEach { link ->
             val row = existing.getValue(link.id)
-            (0 until (row as ViewGroup).childCount).map(row::getChildAt).forEach { child ->
-                when (child.contentDescription?.toString()) {
-                    "Move link up" -> {
-                        child.isEnabled = index > 0
-                        child.alpha = if (child.isEnabled) 1f else 0.35f
-                    }
-                    "Move link down" -> {
-                        child.isEnabled = index < desired.lastIndex
-                        child.alpha = if (child.isEnabled) 1f else 0.35f
-                    }
-                }
-            }
             container.addView(row)
         }
         return true
@@ -1154,7 +1154,7 @@ class MainActivity : ComponentActivity() {
             desired.forEach { entry -> activity.addView(existing[entry.second] ?: entry.third()) }
         }
         content.removeViewAt(newestIndex)
-        content.addView(newestParkingBlock(page.newestParking, archived), newestIndex)
+        content.addView(newestParkingBlock(page.newestParking), newestIndex)
         return true
     }
 
@@ -1162,7 +1162,7 @@ class MainActivity : ComponentActivity() {
         if (!end) marginEnd = dp(6)
     }
 
-    private fun newestParkingBlock(record: ProjectParking?, archived: Boolean) = LinearLayout(this).apply {
+    private fun newestParkingBlock(record: ProjectParking?) = LinearLayout(this).apply {
         id = ProjectUiIds.NEWEST_PARKING
         orientation = LinearLayout.VERTICAL
         setPadding(0, dp(4), 0, dp(4))
@@ -1175,16 +1175,13 @@ class MainActivity : ComponentActivity() {
             addView(label(formatProjectTimestamp(record.occurredAt), 12f, brandColor(R.color.blocks_muted)).apply {
                 setPadding(0, 0, 0, dp(4))
             })
-            if (!archived) addView(secondaryButton("Delete park message", R.drawable.ic_delete) {
-                confirmDeleteParking(record)
-            }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)))
         }
     }
 
     private fun noteTimelineRow(note: ProjectNoteItem, archived: Boolean) = LinearLayout(this).apply {
         tag = "note:${note.id}"
         orientation = LinearLayout.VERTICAL
-        setPadding(0, dp(6), 0, 0)
+        setPadding(0, dp(2), 0, 0)
         addView(label(note.body, 16f, brandColor(R.color.blocks_ink)).apply {
             setTextIsSelectable(true)
             setPadding(0, 0, 0, dp(2))
@@ -1203,7 +1200,7 @@ class MainActivity : ComponentActivity() {
                 addView(iconOnlyButton(R.drawable.ic_pin, if (note.pinned) "Unpin note" else "Pin note") { source ->
                     runRepositoryAction(source = source) { controller.setNotePinned(note.id, !note.pinned) }
                 }, LinearLayout.LayoutParams(dp(48), dp(48)))
-                addView(iconOnlyButton(R.drawable.ic_delete, "Delete note") { confirmDeleteNote(note) },
+                addView(destructiveIconButton(R.drawable.ic_delete, "Delete note") { confirmDeleteNote(note) },
                     LinearLayout.LayoutParams(dp(48), dp(48)))
             }
         })
@@ -1220,13 +1217,13 @@ class MainActivity : ComponentActivity() {
     private fun parkingHistoryRow(record: ProjectParking, archived: Boolean) = LinearLayout(this).apply {
         tag = "park:${record.id}"
         orientation = LinearLayout.VERTICAL
-        setPadding(0, dp(6), 0, 0)
+        setPadding(0, dp(2), 0, 0)
         addView(label("Park · ${formatProjectTimestamp(record.occurredAt)}", 12f,
             brandColor(R.color.blocks_muted)).apply { setPadding(0, 0, 0, dp(3)) })
         addView(fieldValue("Where I was", record.location))
         addView(fieldValue("Next physical action", record.nextAction))
         addView(fieldValue("Must not forget", record.mustNotForget))
-        if (!archived) addView(iconOnlyButton(R.drawable.ic_delete, "Delete park message") {
+        if (!archived) addView(destructiveIconButton(R.drawable.ic_delete, "Delete park message") {
             confirmDeleteParking(record)
         }, LinearLayout.LayoutParams(dp(48), dp(48)).apply { gravity = Gravity.END })
         addView(compactDivider())
@@ -1265,33 +1262,26 @@ class MainActivity : ComponentActivity() {
             setOnClickListener { launchProjectLink(link) }
         }, LinearLayout.LayoutParams(0, dp(48), 1f))
         if (!archived) {
-            val position = controller.state.resourceLinks.indexOfFirst { it.id == link.id }
-            addView(iconOnlyButton(R.drawable.ic_arrow, "Move link up") { source ->
-                runRepositoryAction(
-                    source = source,
-                    renderCommitted = { renderResourceLinkOrder() },
-                ) { controller.moveResourceLink(link.id, -1) }
-            }.apply {
-                rotation = -90f
-                isEnabled = position > 0
-                alpha = if (isEnabled) 1f else 0.35f
-            }, LinearLayout.LayoutParams(dp(48), dp(48)))
-            addView(iconOnlyButton(R.drawable.ic_arrow, "Move link down") { source ->
-                runRepositoryAction(
-                    source = source,
-                    renderCommitted = { renderResourceLinkOrder() },
-                ) { controller.moveResourceLink(link.id, 1) }
-            }.apply {
-                rotation = 90f
-                isEnabled = position >= 0 && position < controller.state.resourceLinks.lastIndex
-                alpha = if (isEnabled) 1f else 0.35f
-            }, LinearLayout.LayoutParams(dp(48), dp(48)))
+            addView(resourceLinkDragHandle(link), LinearLayout.LayoutParams(dp(48), dp(48)))
             addView(iconOnlyButton(R.drawable.ic_edit, "Edit link") {
                 controller.showEditLinkForm(link.id)
                 render()
             }, LinearLayout.LayoutParams(dp(48), dp(48)))
-            addView(iconOnlyButton(R.drawable.ic_delete, "Delete link") { confirmDeleteResourceLink(link) },
+            addView(destructiveIconButton(R.drawable.ic_delete, "Delete link") { confirmDeleteResourceLink(link) },
                 LinearLayout.LayoutParams(dp(48), dp(48)))
+        }
+        if (!archived) setOnDragListener { _, event ->
+            when (event.action) {
+                DragEvent.ACTION_DRAG_STARTED -> event.localState is String
+                DragEvent.ACTION_DROP -> {
+                    val draggedId = event.localState as? String ?: return@setOnDragListener false
+                    runRepositoryAction(renderCommitted = { renderResourceLinkOrder() }) {
+                        controller.moveResourceLink(draggedId, link.id)
+                    }
+                    true
+                }
+                else -> true
+            }
         }
     }.also {
         it.tag = link.id
@@ -1303,11 +1293,41 @@ class MainActivity : ComponentActivity() {
 
     private fun resourceLinkCard(link: ProjectResourceLink, archived: Boolean) = resourceLinkRow(link, archived)
 
+    private fun resourceLinkDragHandle(link: ProjectResourceLink) =
+        iconOnlyButton(R.drawable.ic_more, "Reorder ${link.title}. Long press and drag.") { }.apply {
+            setOnLongClickListener {
+                startDragAndDrop(
+                    ClipData.newPlainText("Blocks Link", link.id),
+                    View.DragShadowBuilder(this),
+                    link.id,
+                    0,
+                )
+                true
+            }
+            val position = controller.state.resourceLinks.indexOfFirst { it.id == link.id }
+            if (position > 0) {
+                ViewCompat.addAccessibilityAction(this, "Move link earlier") { _, _ ->
+                    runRepositoryAction(renderCommitted = { renderResourceLinkOrder() }) {
+                        controller.moveResourceLink(link.id, -1)
+                    }
+                    true
+                }
+            }
+            if (position >= 0 && position < controller.state.resourceLinks.lastIndex) {
+                ViewCompat.addAccessibilityAction(this, "Move link later") { _, _ ->
+                    runRepositoryAction(renderCommitted = { renderResourceLinkOrder() }) {
+                        controller.moveResourceLink(link.id, 1)
+                    }
+                    true
+                }
+            }
+        }
+
     private fun compactDivider() = View(this).apply {
-        setBackgroundColor(brandColor(R.color.blocks_line))
-        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1)).apply {
-            topMargin = dp(2)
-            bottomMargin = dp(2)
+        setBackgroundColor(brandColor(R.color.blocks_input))
+        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(2)).apply {
+            topMargin = dp(1)
+            bottomMargin = dp(1)
         }
         importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
     }
@@ -2396,26 +2416,36 @@ class MainActivity : ComponentActivity() {
         setOnClickListener(action)
     }
 
-    private fun viewToggleButton(icon: Int, description: String, selected: Boolean, action: (View) -> Unit) =
+    private fun destructiveIconButton(icon: Int, description: String, action: (View) -> Unit) =
+        iconOnlyButton(icon, description, action).apply {
+            compoundDrawableTintList = ColorStateList.valueOf(brandColor(R.color.blocks_muted))
+        }
+
+    private fun dashboardDestinationButton(icon: Int, destination: String, action: (View) -> Unit) =
         Button(this).apply {
-            text = ""
-            contentDescription = description
-            isSelected = selected
-            ViewCompat.setStateDescription(this, if (selected) "Selected" else "Not selected")
+            text = destination
+            contentDescription = "Show $destination view"
+            isAllCaps = false
+            textSize = 12f
+            typeface = interTypeface
+            setTextColor(brandColor(R.color.blocks_ink))
             setCompoundDrawablesRelativeWithIntrinsicBounds(icon, 0, 0, 0)
-            compoundDrawableTintList = ColorStateList.valueOf(
-                if (selected) brandColor(R.color.blocks_white) else brandColor(R.color.blocks_ink),
-            )
-            background = roundedBackground(
-                if (selected) brandColor(R.color.blocks_teal) else brandColor(R.color.blocks_white),
-                brandColor(R.color.blocks_input),
-                9f,
-            )
-            minimumWidth = dp(48)
+            compoundDrawableTintList = ColorStateList.valueOf(brandColor(R.color.blocks_ink))
+            compoundDrawablePadding = dp(3)
+            background = roundedBackground(brandColor(R.color.blocks_white), brandColor(R.color.blocks_input), 9f)
+            minimumWidth = dp(76)
             minimumHeight = dp(48)
-            setPadding(dp(12), dp(12), dp(12), dp(12))
+            setPadding(dp(8), 0, dp(8), 0)
             setOnClickListener(action)
         }
+
+    private fun unsynchronizedIndicator() = ImageView(this).apply {
+        setImageResource(R.drawable.ic_more)
+        imageTintList = ColorStateList.valueOf(brandColor(R.color.blocks_muted))
+        contentDescription = "Saved on this device. Reconnect in Settings to synchronize."
+        setPadding(dp(4), dp(16), dp(4), dp(16))
+        importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
+    }
 
     private fun loadCover(image: ImageView, cover: ProjectCover, thumbnail: Boolean) {
         val tenantId = controller.activeTenantId ?: return
@@ -2549,6 +2579,7 @@ class MainActivity : ComponentActivity() {
                     }
                     render()
                     resolvePendingTagLocator()
+                    revalidateReturningAccount(acceptedTenant)
                 }
             } catch (_: CancellationException) {
                 return@launch
@@ -2561,6 +2592,41 @@ class MainActivity : ComponentActivity() {
                 }
                 render()
             }
+        }
+    }
+
+    private suspend fun revalidateReturningAccount(acceptedTenant: AcceptedTenantContinuity) {
+        if (acceptedTenant.accountIdentity == null) return
+        val result = try {
+            identity.returningAccount(this@MainActivity)
+        } catch (_: CancellationException) {
+            return
+        } catch (_: Exception) {
+            ReturningAccountCredential.Unavailable
+        }
+        if (result !is ReturningAccountCredential.Available) return
+        try {
+            val authenticated = withContext(Dispatchers.IO) {
+                controller.authenticate(result.identityToken)
+            }
+            if (
+                authenticated.tenantId != acceptedTenant.tenantId ||
+                authenticated.accountIdentity != acceptedTenant.accountIdentity
+            ) {
+                throw AcceptedAccountBindingException()
+            }
+            withContext(localStateDispatcher) {
+                controller.activateAuthenticated(authenticated)
+                restoreTransientDraftsIfReady()
+            }
+            render()
+            resolvePendingTagLocator()
+            synchronizeAutomatically()
+        } catch (_: AcceptedAccountBindingException) {
+            failClosedAccountBinding()
+        } catch (_: Exception) {
+            // Local continuity is already open. A failed automatic check remains a quiet,
+            // contained reconnect state and never becomes a foreground error.
         }
     }
 
