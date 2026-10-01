@@ -172,32 +172,62 @@ class LocalActionPerformanceTest {
             }
 
             stabilizePerformancePhase()
-            val linkReorderTimings = (1..25).map {
+            val linkReorderTimings = (1..25).map { sample ->
                 var before = emptyList<String>()
                 scenario.onActivity { activity -> before = activity.visibleLinkOrder() }
                 measureUntilVisible(
                     scenario,
                     activate = { activity ->
-                        val move = activity.buttonsWithDescription("Move link down").firstOrNull { it.isEnabled }
-                            ?: activity.buttonsWithDescription("Move link up").first { it.isEnabled }
-                        move.performClick()
+                        val candidates = activity.buttonsWithDescriptionPrefix("Reorder ")
+                        val move = candidates.firstOrNull { button ->
+                            button.createAccessibilityNodeInfo().actionList.any {
+                                it.label?.toString() == "Move link later"
+                            }
+                        } ?: error(
+                            "No visible Link can move later at performance sample $sample; " +
+                                "handles=${candidates.map { it.contentDescription to it.createAccessibilityNodeInfo().actionList.map { action -> action.label } }}",
+                        )
+                        move.performAccessibilityActionNamed("Move link later")
                     },
                     visible = { activity -> activity.visibleLinkOrder() != before },
                 )
             }
 
+            scenario.onActivity { activity -> activity.findViewById<Button>(ProjectUiIds.PARK).performClick() }
+            waitFor(scenario) { it.findViewById<View>(ProjectUiIds.SAVE_PARKING) != null }
+            scenario.onActivity { activity ->
+                activity.findViewById<EditText>(ProjectUiIds.PARKING_LOCATION).setText("Delete warmup")
+                activity.findViewById<EditText>(ProjectUiIds.PARKING_NEXT_ACTION).setText("Prepare deletion")
+                activity.findViewById<EditText>(ProjectUiIds.PARKING_MUST_NOT_FORGET).setText("Keep current summary")
+                activity.findViewById<Button>(ProjectUiIds.SAVE_PARKING).performClick()
+            }
+            waitFor(scenario) {
+                it.findViewById<View>(ProjectUiIds.PARK) != null && it.hasVisibleText("Delete warmup")
+            }
             stabilizePerformancePhase()
-            val parkDeleteTimings = (1..25).map {
-                var before = ""
+            val parkDeleteTimings = (1..25).map { index ->
+                lateinit var deleteButton: Button
+                val setupLocation = "Delete setup $index"
+                scenario.onActivity { activity -> activity.findViewById<Button>(ProjectUiIds.PARK).performClick() }
+                waitFor(scenario) { it.findViewById<View>(ProjectUiIds.SAVE_PARKING) != null }
                 scenario.onActivity { activity ->
-                    before = activity.newestParkingSignature()
-                    activity.newestParkingDeleteButton().performClick()
+                    activity.findViewById<EditText>(ProjectUiIds.PARKING_LOCATION).setText(setupLocation)
+                    activity.findViewById<EditText>(ProjectUiIds.PARKING_NEXT_ACTION).setText("Prepare delete $index")
+                    activity.findViewById<EditText>(ProjectUiIds.PARKING_MUST_NOT_FORGET).setText("Keep boundary $index")
+                    activity.findViewById<Button>(ProjectUiIds.SAVE_PARKING).performClick()
+                }
+                waitFor(scenario) {
+                    it.findViewById<View>(ProjectUiIds.PARK) != null && it.hasVisibleText(setupLocation)
+                }
+                scenario.onActivity { activity ->
+                    deleteButton = activity.historicalParkingDeleteButton()
+                    deleteButton.performClick()
                 }
                 waitFor(scenario) { it.activeDialog != null }
                 measureUntilVisible(
                     scenario,
                     activate = { activity -> activity.dialogButton("Delete").performClick() },
-                    visible = { activity -> activity.newestParkingSignature() != before },
+                    visible = { !deleteButton.isAttachedToWindow },
                 )
             }
 
@@ -292,6 +322,19 @@ class LocalActionPerformanceTest {
             }
             .toList()
 
+    private fun Activity.buttonsWithDescriptionPrefix(prefix: String): List<Button> =
+        findViewById<ViewGroup>(android.R.id.content)
+            .descendants()
+            .filterIsInstance<Button>()
+            .filter { it.contentDescription?.toString()?.startsWith(prefix) == true && it.isShown }
+            .toList()
+
+    private fun Button.performAccessibilityActionNamed(label: String) {
+        val action = createAccessibilityNodeInfo().actionList.singleOrNull { it.label?.toString() == label }
+            ?: error("Accessibility action '$label' is missing from $contentDescription")
+        check(performAccessibilityAction(action.id, null))
+    }
+
     private fun Activity.visibleLinkOrder(): List<String> = findViewById<ViewGroup>(android.R.id.content)
         .descendants()
         .filterIsInstance<Button>()
@@ -299,10 +342,13 @@ class LocalActionPerformanceTest {
         .map { it.contentDescription.toString() }
         .toList()
 
-    private fun Activity.newestParkingDeleteButton(): Button =
-        findViewById<ViewGroup>(ProjectUiIds.NEWEST_PARKING).descendants()
+    private fun Activity.historicalParkingDeleteButton(): Button =
+        requireNotNull(historicalParkingDeleteButtonOrNull())
+
+    private fun Activity.historicalParkingDeleteButtonOrNull(): Button? =
+        findViewById<ViewGroup>(ProjectUiIds.PROJECT_ACTIVITY).descendants()
             .filterIsInstance<Button>()
-            .single { it.text.toString() == "Delete park message" }
+            .firstOrNull { it.contentDescription?.toString() == "Delete park message" }
 
     private fun Activity.newestParkingSignature(): String =
         findViewById<ViewGroup>(ProjectUiIds.NEWEST_PARKING).descendants()

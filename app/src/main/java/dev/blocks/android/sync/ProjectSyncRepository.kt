@@ -1264,7 +1264,7 @@ class ProjectSyncRepository(
         delta: Int,
         operationId: String,
     ): BackgroundSyncResult {
-        require(delta == -1 || delta == 1) { "A Link can move only one place at a time" }
+        if (delta == 0) return activeState(session).toResult()
         val state = activeState(session).withProjectLinks()
         val link = state.projectCache.resourceLinks.single { it.id == linkId && it.deletedAt == null }
         require(state.projectCache.pages.single { it.project.id == link.projectId }.project.lifecycle == ProjectLifecycle.ACTIVE)

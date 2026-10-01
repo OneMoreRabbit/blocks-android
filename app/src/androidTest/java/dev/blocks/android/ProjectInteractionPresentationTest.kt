@@ -4,11 +4,13 @@ import android.app.Activity
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.Rect
 import android.util.Log
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.test.core.app.ActivityScenario
@@ -23,6 +25,8 @@ import dev.blocks.android.mvp.NoOpDraftStore
 import dev.blocks.android.mvp.Session
 import dev.blocks.android.mvp.TenantSyncState
 import dev.blocks.android.project.LinkOrderState
+import dev.blocks.android.project.DashboardView
+import dev.blocks.android.project.DashboardOrderMode
 import dev.blocks.android.project.ProjectCacheState
 import dev.blocks.android.project.ProjectLifecycle
 import dev.blocks.android.project.ProjectNoteItem
@@ -34,6 +38,7 @@ import dev.blocks.android.project.ProjectPresentationController
 import dev.blocks.android.project.ProjectResourceLink
 import dev.blocks.android.project.ProjectService
 import dev.blocks.android.project.ProjectSummary
+import dev.blocks.android.project.ProjectUiPreferences
 import dev.blocks.android.state.AndroidSyncStateStore
 import dev.blocks.android.state.SessionContinuity
 import dev.blocks.android.sync.NoOpLegacyQueueReplay
@@ -87,20 +92,60 @@ class ProjectInteractionPresentationTest {
             assertEquals(listOf(ONENOTE_URI), launchedLinks)
 
             first.onActivity { activity ->
-                activity.buttonsWithDescription("Move link down").first { it.isEnabled }.performClick()
+                val firstHandle = activity.buttonWithDescription("Reorder First reference. Long press and drag.")
+                assertTrue(
+                    renderAlpha(requireNotNull(firstHandle.compoundDrawablesRelative[0])).contentEquals(
+                        renderAlpha(requireNotNull(activity.getDrawable(R.drawable.ic_link))),
+                    ),
+                )
+                val firstRow = activity.findViewById<ViewGroup>(ProjectUiIds.PROJECT_LINKS).getChildAt(0) as ViewGroup
+                assertEquals(4, firstRow.childCount)
+                assertTrue(firstRow.getChildAt(0) === firstHandle)
+                firstHandle.performAccessibilityActionNamed("Move link later")
             }
             waitFor(first) { it.visibleLinkTitles().firstOrNull() == "Second reference" }
 
-            first.onActivity { activity -> activity.newestParkDeleteButton().performClick() }
+            first.onActivity { activity ->
+                assertTrue(
+                    activity.findViewById<ViewGroup>(ProjectUiIds.NEWEST_PARKING).descendants()
+                        .filterIsInstance<Button>()
+                        .none { it.contentDescription?.toString() == "Delete park message" },
+                )
+                val destructive = activity.findViewById<ViewGroup>(android.R.id.content).descendants()
+                    .filterIsInstance<Button>()
+                    .filter { it.contentDescription?.toString()?.startsWith("Delete ") == true }
+                    .toList()
+                assertTrue(destructive.size >= 3)
+                val minimumTouch = (48 * activity.resources.displayMetrics.density).toInt()
+                assertTrue(destructive.all { button ->
+                    Color.alpha(requireNotNull(button.compoundDrawableTintList).defaultColor) <= 72 &&
+                        button.minimumWidth >= minimumTouch && button.minimumHeight >= minimumTouch &&
+                        button.isEnabled && button.hasOnClickListeners()
+                })
+                val historicalPark = activity.findViewById<ViewGroup>(ProjectUiIds.PROJECT_ACTIVITY)
+                    .descendants().filterIsInstance<LinearLayout>()
+                    .single { it.tag?.toString()?.startsWith("park:") == true }
+                val inlineHeader = historicalPark.getChildAt(0) as LinearLayout
+                assertTrue(
+                    inlineHeader.descendants().filterIsInstance<Button>()
+                        .single().contentDescription.toString() == "Delete park message",
+                )
+                assertEquals(0, historicalPark.paddingBottom)
+                val divider = historicalPark.getChildAt(historicalPark.childCount - 1)
+                val dividerMargins = divider.layoutParams as ViewGroup.MarginLayoutParams
+                assertEquals(0, dividerMargins.topMargin)
+                assertEquals(0, dividerMargins.bottomMargin)
+                activity.historicalParkDeleteButton().performClick()
+            }
             waitFor(first) { it.activeDialog != null }
             first.onActivity { it.dialogButton("Cancel").performClick() }
             assertTrue(store.loadSyncState(TENANT).projectCache.parkingTombstones.isEmpty())
 
-            first.onActivity { activity -> activity.newestParkDeleteButton().performClick() }
+            first.onActivity { activity -> activity.historicalParkDeleteButton().performClick() }
             waitFor(first) { it.activeDialog != null }
             first.onActivity { it.dialogButton("Delete").performClick() }
             waitFor(first) { store.loadSyncState(TENANT).projectCache.parkingTombstones.size == 1 }
-            assertEquals(PARK_NEW, store.loadSyncState(TENANT).projectCache.parkingTombstones.single().parkingId)
+            assertFalse(store.loadSyncState(TENANT).projectCache.parkingTombstones.single().parkingId == PARK_NEW)
             assertTrue(
                 store.loadSyncState(TENANT).projectCache.parkingRecords
                     .any { it.id == PARK_NEW && it.location == "Newest bench" },
@@ -112,27 +157,93 @@ class ProjectInteractionPresentationTest {
             restarted.openProject()
             restarted.onActivity { activity ->
                 assertEquals(listOf("Second reference", "First reference"), activity.visibleLinkTitles())
-                assertFalse(activity.visibleTexts().contains("Newest bench"))
-                assertTrue(activity.visibleTexts().contains("Older bench"))
+                assertTrue(activity.visibleTexts().contains("Newest bench"))
+                assertFalse(activity.visibleTexts().contains("Older bench"))
             }
             assertEquals(1, store.loadSyncState(TENANT).projectCache.parkingTombstones.size)
         }
     }
 
     @Test
-    fun writesPopulatedEmptyAndLongHistoryReviewPngsOutsideTheAppRepository() {
-        val output = requireNotNull(context.getExternalFilesDir("review-0.9.0"))
+    fun customProjectOrderUsesOnePersistedAggregateInTileAndListViews() {
+        store.saveSyncState(
+            TENANT,
+            populatedState(parkingCount = 2).copy(
+                projectUiPreferences = ProjectUiPreferences(
+                    dashboardView = DashboardView.TILES,
+                    dashboardOrderMode = DashboardOrderMode.CUSTOM,
+                ),
+            ),
+        )
+        installDependencies()
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.findViewById<View>(ProjectUiIds.PROJECT_TILES) != null }
+            scenario.onActivity { activity ->
+                val first = activity.viewWithDescriptionPrefix("Open Workshop shelves")
+                first.performAccessibilityActionNamed("Move project later")
+            }
+            waitFor(scenario) { it.visibleProjectOrder().firstOrNull() == "Reference cards" }
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.VIEW_LIST).performClick()
+            }
+            waitFor(scenario) { it.findViewById<View>(ProjectUiIds.PROJECT_LIST) != null }
+            scenario.onActivity { activity ->
+                assertEquals(
+                    listOf("Reference cards", project().name, "Tooling refresh"),
+                    activity.visibleProjectOrder(),
+                )
+                activity.viewWithDescriptionPrefix("Open Tooling refresh")
+                    .performAccessibilityActionNamed("Move project earlier")
+            }
+            waitFor(scenario) {
+                it.visibleProjectOrder() == listOf("Reference cards", "Tooling refresh", project().name)
+            }
+        }
+
+        installDependencies()
+        ActivityScenario.launch(MainActivity::class.java).use { restarted ->
+            waitFor(restarted) { it.findViewById<View>(ProjectUiIds.PROJECT_LIST) != null }
+            restarted.onActivity { activity ->
+                assertEquals(
+                    listOf("Reference cards", "Tooling refresh", project().name),
+                    activity.visibleProjectOrder(),
+                )
+                activity.findViewById<Button>(ProjectUiIds.VIEW_TILES).performClick()
+            }
+            waitFor(restarted) { it.findViewById<View>(ProjectUiIds.PROJECT_TILES) != null }
+            restarted.onActivity { activity ->
+                assertEquals(
+                    listOf("Reference cards", "Tooling refresh", project().name),
+                    activity.visibleProjectOrder(),
+                )
+            }
+        }
+    }
+
+    @Test
+    fun writesDashboardAndProjectReviewPngsOutsideTheAppRepository() {
+        val output = requireNotNull(context.getExternalFilesDir("review-0.9.1"))
         output.mkdirs()
         listOf(
-            "project-populated" to populatedState(parkingCount = 3),
-            "project-empty" to emptyState(),
-            "project-long-history" to populatedState(parkingCount = 24),
-        ).forEach { (name, fixture) ->
+            Triple("dashboard-tile", populatedState(parkingCount = 3), false),
+            Triple(
+                "dashboard-list",
+                populatedState(parkingCount = 3).copy(
+                    projectUiPreferences = ProjectUiPreferences(dashboardView = DashboardView.LIST),
+                ),
+                false,
+            ),
+            Triple("project-populated", populatedState(parkingCount = 3), true),
+            Triple("project-long-history", populatedState(parkingCount = 24), true),
+        ).forEach { (name, fixture, openProject) ->
             store.clearSyncState(TENANT)
             store.saveSyncState(TENANT, fixture)
             installDependencies()
             ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-                scenario.openProject()
+                if (openProject) scenario.openProject() else waitFor(scenario) {
+                    it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD
+                }
                 if (name == "project-long-history") {
                     scenario.onActivity { activity ->
                         activity.findViewById<ScrollView>(ProjectUiIds.ROOT_SCROLL).fullScroll(View.FOCUS_DOWN)
@@ -141,7 +252,13 @@ class ProjectInteractionPresentationTest {
                 InstrumentationRegistry.getInstrumentation().waitForIdleSync()
                 val file = File(output, "$name.png")
                 scenario.onActivity { activity ->
-                    check(activity.screenTag() == ProjectUiIds.SCREEN_PROJECT)
+                    check(
+                        activity.screenTag() == if (openProject) {
+                            ProjectUiIds.SCREEN_PROJECT
+                        } else {
+                            ProjectUiIds.SCREEN_DASHBOARD
+                        },
+                    )
                     val decor = activity.window.decorView
                     val bitmap = Bitmap.createBitmap(decor.width, decor.height, Bitmap.Config.ARGB_8888)
                     decor.draw(Canvas(bitmap))
@@ -215,7 +332,11 @@ class ProjectInteractionPresentationTest {
         }
         return TenantSyncState(
             projectCache = ProjectCacheState(
-                activeProjects = listOf(project),
+                activeProjects = listOf(
+                    project,
+                    project().copy(id = PROJECT_B, clientId = PROJECT_B, name = "Reference cards"),
+                    project().copy(id = PROJECT_C, clientId = PROJECT_C, name = "Tooling refresh"),
+                ),
                 activeProjectsLoaded = true,
                 archivedProjectsLoaded = true,
                 pages = listOf(ProjectPage(project, ProjectNotes(PROJECT, "", 1, NOW), parking.lastOrNull())),
@@ -224,7 +345,7 @@ class ProjectInteractionPresentationTest {
                 noteItems = notes,
                 resourceLinks = links,
                 projectLinks = listOf(ProjectLinkIdentity(PROJECT, ProjectKey.parse(PROJECT)!!)),
-                projectOrder = ProjectOrderState(listOf(PROJECT), 0, NOW),
+                projectOrder = ProjectOrderState(listOf(PROJECT, PROJECT_B, PROJECT_C), 0, NOW),
                 linkOrders = listOf(LinkOrderState(PROJECT, links.map { it.id }, 0, NOW)),
             ),
             projectDraftsMigrated = true,
@@ -285,6 +406,11 @@ class ProjectInteractionPresentationTest {
             it.contentDescription?.toString() == description && it.isShown
         }
 
+    private fun Activity.viewWithDescriptionPrefix(prefix: String): View =
+        findViewById<ViewGroup>(android.R.id.content).descendants().single {
+            it.contentDescription?.toString()?.startsWith(prefix) == true && it.isShown
+        }
+
     private fun Activity.buttonWithDescription(description: String): Button =
         buttonsWithDescription(description).single()
 
@@ -294,10 +420,22 @@ class ProjectInteractionPresentationTest {
             .filter { it.contentDescription?.toString() == description && it.isShown }
             .toList()
 
-    private fun Activity.newestParkDeleteButton(): Button =
-        findViewById<ViewGroup>(ProjectUiIds.NEWEST_PARKING).descendants()
+    private fun Activity.historicalParkDeleteButton(): Button =
+        findViewById<ViewGroup>(ProjectUiIds.PROJECT_ACTIVITY).descendants()
             .filterIsInstance<Button>()
-            .single { it.text.toString() == "Delete park message" }
+            .first { it.contentDescription?.toString() == "Delete park message" }
+
+    private fun View.performAccessibilityActionNamed(label: String) {
+        val action = createAccessibilityNodeInfo().actionList.single { it.label?.toString() == label }
+        check(performAccessibilityAction(action.id, null))
+    }
+
+    private fun Activity.visibleProjectOrder(): List<String> =
+        findViewById<ViewGroup>(android.R.id.content).descendants()
+            .filter { it.isShown && it.contentDescription?.toString()?.startsWith("Open ") == true }
+            .map { it.contentDescription.toString().removePrefix("Open ").substringBefore(". Long press") }
+            .filter { it in setOf(project().name, "Reference cards", "Tooling refresh") }
+            .toList()
 
     private fun Activity.visibleLinkTitles(): List<String> = findViewById<ViewGroup>(android.R.id.content)
         .descendants()
@@ -313,6 +451,15 @@ class ProjectInteractionPresentationTest {
         .filter { view -> Rect().let { view.isShown && view.getGlobalVisibleRect(it) && !it.isEmpty } }
         .map { it.text.toString() }
         .toList()
+
+    private fun renderAlpha(drawable: android.graphics.drawable.Drawable): IntArray {
+        val size = 96
+        val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        drawable.setBounds(0, 0, size, size)
+        drawable.draw(Canvas(bitmap))
+        return IntArray(size * size).also { bitmap.getPixels(it, 0, size, 0, 0, size, size) }
+            .map { Color.alpha(it) }.toIntArray().also { bitmap.recycle() }
+    }
 
     private fun MainActivity.dialogButton(text: String): Button = requireNotNull(activeDialog)
         .window!!.decorView.descendants().filterIsInstance<Button>().single { it.text.toString() == text }
@@ -353,6 +500,8 @@ class ProjectInteractionPresentationTest {
         const val TAG = "BlocksInteraction"
         const val TENANT = "00000000-0000-0000-0000-000000000901"
         const val PROJECT = "10000000-0000-4000-8000-000000000901"
+        const val PROJECT_B = "10000000-0000-4000-8000-000000000902"
+        const val PROJECT_C = "10000000-0000-4000-8000-000000000903"
         const val LINK_A = "20000000-0000-4000-8000-000000000901"
         const val LINK_B = "20000000-0000-4000-8000-000000000902"
         const val PARK_NEW = "30000000-0000-4000-8000-000000000901"
