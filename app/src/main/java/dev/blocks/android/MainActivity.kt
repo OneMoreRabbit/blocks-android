@@ -1479,6 +1479,7 @@ class MainActivity : ComponentActivity() {
                                 return@restoreProjectView
                             }
                             links.addView(resourceLinkCard(added, archived = false), 0)
+                            renderResourceLinkOrder()
                         }
                     },
                     complete = {
