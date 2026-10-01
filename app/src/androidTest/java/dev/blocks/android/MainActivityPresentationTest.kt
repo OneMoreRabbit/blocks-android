@@ -1155,11 +1155,18 @@ class MainActivityPresentationTest {
 
                 val linkRow = activity.findViewById<ViewGroup>(ProjectUiIds.PROJECT_LINKS).getChildAt(0) as ViewGroup
                 assertTrue(linkRow.background == null)
-                assertTrue(linkRow.getChildAt(0) is android.widget.ImageView)
+                val dragHandle = linkRow.getChildAt(0) as Button
+                assertEquals("Reorder Build notes. Long press and drag.", dragHandle.contentDescription.toString())
+                assertTrue(
+                    renderAlpha(requireNotNull(dragHandle.compoundDrawablesRelative[0])).contentEquals(
+                        renderAlpha(requireNotNull(activity.getDrawable(R.drawable.ic_link))),
+                    ),
+                )
                 val title = linkRow.getChildAt(1) as Button
                 val minimumTouch = (48 * activity.resources.displayMetrics.density).toInt()
                 assertEquals("Build notes", title.text.toString())
                 assertFalse(descendantText(linkRow).contains("https://"))
+                assertTrue(dragHandle.minimumHeight >= minimumTouch)
                 assertTrue(title.minimumHeight >= minimumTouch)
                 assertTrue(linkRow.getChildAt(2).minimumHeight >= minimumTouch)
                 assertTrue(linkRow.getChildAt(3).minimumHeight >= minimumTouch)
@@ -2263,12 +2270,23 @@ class MainActivityPresentationTest {
                 val density = activity.resources.displayMetrics.density
                 val list = activity.findViewById<Button>(ProjectUiIds.VIEW_LIST)
                 assertEquals(null, activity.findViewById<Button>(ProjectUiIds.VIEW_TILES))
-                assertEquals("List", list.text.toString())
+                assertEquals("", list.text.toString())
                 assertEquals("Show List view", list.contentDescription.toString())
                 assertTrue(list.width >= (48 * density).toInt())
                 val order = activity.findViewById<Button>(ProjectUiIds.DASHBOARD_ORDER)
                 assertEquals("", order.text.toString())
                 assertTrue(order.contentDescription.toString().contains("Current: Name"))
+                val orderGlyph = renderAlpha(requireNotNull(order.compoundDrawablesRelative[0]))
+                val listGlyph = renderAlpha(requireNotNull(list.compoundDrawablesRelative[0]))
+                assertFalse(orderGlyph.contentEquals(listGlyph))
+                assertTrue(
+                    orderGlyph.contentEquals(
+                        renderAlpha(requireNotNull(activity.getDrawable(R.drawable.ic_sort_descending))),
+                    ),
+                )
+                assertTrue(
+                    listGlyph.contentEquals(renderAlpha(requireNotNull(activity.getDrawable(R.drawable.ic_list)))),
+                )
                 assertTrue(activity.findViewById<View>(ProjectUiIds.DASHBOARD_WATERMARK) != null)
                 assertFalse(activity.texts().contains("Blocks"))
                 assertFalse(activity.texts().any { it.contains("park message", ignoreCase = true) })
@@ -2300,7 +2318,14 @@ class MainActivityPresentationTest {
             waitFor(scenario) { it.findViewById<View>(ProjectUiIds.PROJECT_LIST) != null }
             scenario.onActivity { activity ->
                 assertEquals(null, activity.findViewById<Button>(ProjectUiIds.VIEW_LIST))
-                assertEquals("Tiles", activity.findViewById<Button>(ProjectUiIds.VIEW_TILES).text.toString())
+                val tiles = activity.findViewById<Button>(ProjectUiIds.VIEW_TILES)
+                assertEquals("", tiles.text.toString())
+                assertEquals("Show Tiles view", tiles.contentDescription.toString())
+                assertTrue(
+                    renderAlpha(requireNotNull(tiles.compoundDrawablesRelative[0])).contentEquals(
+                        renderAlpha(requireNotNull(activity.getDrawable(R.drawable.ic_grid))),
+                    ),
+                )
                 val ordered = activity.findViewById<LinearLayout>(ProjectUiIds.PROJECT_LIST)
                     .descendants()
                     .filterIsInstance<Button>()
@@ -2315,7 +2340,7 @@ class MainActivityPresentationTest {
             scenario.recreate()
             waitFor(scenario) { it.findViewById<View>(ProjectUiIds.PROJECT_LIST) != null }
             scenario.onActivity { activity ->
-                assertEquals("Tiles", activity.findViewById<Button>(ProjectUiIds.VIEW_TILES).text.toString())
+                assertEquals("", activity.findViewById<Button>(ProjectUiIds.VIEW_TILES).text.toString())
             }
         }
     }

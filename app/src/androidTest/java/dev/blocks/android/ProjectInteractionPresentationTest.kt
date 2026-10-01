@@ -4,11 +4,13 @@ import android.app.Activity
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.Rect
 import android.util.Log
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.test.core.app.ActivityScenario
@@ -91,6 +93,14 @@ class ProjectInteractionPresentationTest {
 
             first.onActivity { activity ->
                 val firstHandle = activity.buttonWithDescription("Reorder First reference. Long press and drag.")
+                assertTrue(
+                    renderAlpha(requireNotNull(firstHandle.compoundDrawablesRelative[0])).contentEquals(
+                        renderAlpha(requireNotNull(activity.getDrawable(R.drawable.ic_link))),
+                    ),
+                )
+                val firstRow = activity.findViewById<ViewGroup>(ProjectUiIds.PROJECT_LINKS).getChildAt(0) as ViewGroup
+                assertEquals(4, firstRow.childCount)
+                assertTrue(firstRow.getChildAt(0) === firstHandle)
                 firstHandle.performAccessibilityActionNamed("Move link later")
             }
             waitFor(first) { it.visibleLinkTitles().firstOrNull() == "Second reference" }
@@ -101,6 +111,30 @@ class ProjectInteractionPresentationTest {
                         .filterIsInstance<Button>()
                         .none { it.contentDescription?.toString() == "Delete park message" },
                 )
+                val destructive = activity.findViewById<ViewGroup>(android.R.id.content).descendants()
+                    .filterIsInstance<Button>()
+                    .filter { it.contentDescription?.toString()?.startsWith("Delete ") == true }
+                    .toList()
+                assertTrue(destructive.size >= 3)
+                val minimumTouch = (48 * activity.resources.displayMetrics.density).toInt()
+                assertTrue(destructive.all { button ->
+                    Color.alpha(requireNotNull(button.compoundDrawableTintList).defaultColor) <= 72 &&
+                        button.minimumWidth >= minimumTouch && button.minimumHeight >= minimumTouch &&
+                        button.isEnabled && button.hasOnClickListeners()
+                })
+                val historicalPark = activity.findViewById<ViewGroup>(ProjectUiIds.PROJECT_ACTIVITY)
+                    .descendants().filterIsInstance<LinearLayout>()
+                    .single { it.tag?.toString()?.startsWith("park:") == true }
+                val inlineHeader = historicalPark.getChildAt(0) as LinearLayout
+                assertTrue(
+                    inlineHeader.descendants().filterIsInstance<Button>()
+                        .single().contentDescription.toString() == "Delete park message",
+                )
+                assertEquals(0, historicalPark.paddingBottom)
+                val divider = historicalPark.getChildAt(historicalPark.childCount - 1)
+                val dividerMargins = divider.layoutParams as ViewGroup.MarginLayoutParams
+                assertEquals(0, dividerMargins.topMargin)
+                assertEquals(0, dividerMargins.bottomMargin)
                 activity.historicalParkDeleteButton().performClick()
             }
             waitFor(first) { it.activeDialog != null }
@@ -417,6 +451,15 @@ class ProjectInteractionPresentationTest {
         .filter { view -> Rect().let { view.isShown && view.getGlobalVisibleRect(it) && !it.isEmpty } }
         .map { it.text.toString() }
         .toList()
+
+    private fun renderAlpha(drawable: android.graphics.drawable.Drawable): IntArray {
+        val size = 96
+        val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        drawable.setBounds(0, 0, size, size)
+        drawable.draw(Canvas(bitmap))
+        return IntArray(size * size).also { bitmap.getPixels(it, 0, size, 0, 0, size, size) }
+            .map { Color.alpha(it) }.toIntArray().also { bitmap.recycle() }
+    }
 
     private fun MainActivity.dialogButton(text: String): Button = requireNotNull(activeDialog)
         .window!!.decorView.descendants().filterIsInstance<Button>().single { it.text.toString() == text }

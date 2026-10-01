@@ -644,7 +644,7 @@ class MainActivity : ComponentActivity() {
         val tilesSelected = controller.state.dashboardView == DashboardView.TILES
         if (!controller.state.archiveMode) {
             controls.addView(iconOnlyButton(
-                R.drawable.ic_list,
+                R.drawable.ic_sort_descending,
                 "Project order. Current: ${dashboardOrderLabel(controller.state.dashboardOrderMode)}",
             ) { showDashboardOrderMode() }.apply {
                 id = ProjectUiIds.DASHBOARD_ORDER
@@ -659,7 +659,7 @@ class MainActivity : ComponentActivity() {
             }.apply {
                 id = if (tilesSelected) ProjectUiIds.VIEW_LIST else ProjectUiIds.VIEW_TILES
             },
-            LinearLayout.LayoutParams(dp(76), dp(48)).apply {
+            LinearLayout.LayoutParams(dp(48), dp(48)).apply {
                 marginStart = dp(4)
                 marginEnd = dp(4)
             },
@@ -1228,15 +1228,20 @@ class MainActivity : ComponentActivity() {
     private fun parkingHistoryRow(record: ProjectParking, archived: Boolean) = LinearLayout(this).apply {
         tag = "park:${record.id}"
         orientation = LinearLayout.VERTICAL
-        setPadding(0, dp(2), 0, 0)
-        addView(label("Park · ${formatProjectTimestamp(record.occurredAt)}", 12f,
-            brandColor(R.color.blocks_muted)).apply { setPadding(0, 0, 0, dp(3)) })
-        addView(fieldValue("Where I was", record.location))
-        addView(fieldValue("Next physical action", record.nextAction))
-        addView(fieldValue("Must not forget", record.mustNotForget))
-        if (!archived) addView(destructiveIconButton(R.drawable.ic_delete, "Delete park message") {
-            confirmDeleteParking(record)
-        }, LinearLayout.LayoutParams(dp(48), dp(48)).apply { gravity = Gravity.END })
+        setPadding(0, 0, 0, 0)
+        addView(LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(label("Park · ${formatProjectTimestamp(record.occurredAt)}", 12f,
+                brandColor(R.color.blocks_muted)).apply { setPadding(0, 0, 0, 0) },
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            if (!archived) addView(destructiveIconButton(R.drawable.ic_delete, "Delete park message") {
+                confirmDeleteParking(record)
+            }, LinearLayout.LayoutParams(dp(48), dp(48)))
+        }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)))
+        addView(historyFieldValue("Where I was", record.location))
+        addView(historyFieldValue("Next physical action", record.nextAction))
+        addView(historyFieldValue("Must not forget", record.mustNotForget))
         addView(compactDivider())
     }.also {
         it.layoutParams = LinearLayout.LayoutParams(
@@ -1249,13 +1254,7 @@ class MainActivity : ComponentActivity() {
         orientation = LinearLayout.HORIZONTAL
         gravity = Gravity.CENTER_VERTICAL
         minimumHeight = dp(48)
-        addView(ImageView(this@MainActivity).apply {
-            setImageResource(R.drawable.ic_link)
-            imageTintList = ColorStateList.valueOf(brandColor(R.color.blocks_teal))
-            contentDescription = null
-            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-            setPadding(dp(12), dp(12), dp(12), dp(12))
-        }, LinearLayout.LayoutParams(dp(48), dp(48)))
+        addView(resourceLinkLeadingIcon(link, archived), LinearLayout.LayoutParams(dp(48), dp(48)))
         addView(Button(this@MainActivity).apply {
             text = if (link.requiresReconciliation) "${link.title} · Update required" else link.title
             contentDescription = "Open ${link.title}"
@@ -1273,7 +1272,6 @@ class MainActivity : ComponentActivity() {
             setOnClickListener { launchProjectLink(link) }
         }, LinearLayout.LayoutParams(0, dp(48), 1f))
         if (!archived) {
-            addView(resourceLinkDragHandle(link), LinearLayout.LayoutParams(dp(48), dp(48)))
             addView(iconOnlyButton(R.drawable.ic_edit, "Edit link") {
                 controller.showEditLinkForm(link.id)
                 render()
@@ -1304,8 +1302,22 @@ class MainActivity : ComponentActivity() {
 
     private fun resourceLinkCard(link: ProjectResourceLink, archived: Boolean) = resourceLinkRow(link, archived)
 
+    private fun resourceLinkLeadingIcon(link: ProjectResourceLink, archived: Boolean): View =
+        if (archived) {
+            ImageView(this).apply {
+                setImageResource(R.drawable.ic_link)
+                imageTintList = ColorStateList.valueOf(brandColor(R.color.blocks_teal))
+                contentDescription = null
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                setPadding(dp(12), dp(12), dp(12), dp(12))
+            }
+        } else {
+            resourceLinkDragHandle(link)
+        }
+
     private fun resourceLinkDragHandle(link: ProjectResourceLink) =
-        iconOnlyButton(R.drawable.ic_more, "Reorder ${link.title}. Long press and drag.") { }.apply {
+        iconOnlyButton(R.drawable.ic_link, "Reorder ${link.title}. Long press and drag.") { }.apply {
+            compoundDrawableTintList = ColorStateList.valueOf(brandColor(R.color.blocks_teal))
             setOnLongClickListener {
                 startDragAndDrop(
                     ClipData.newPlainText("Blocks Link", link.id),
@@ -1337,8 +1349,8 @@ class MainActivity : ComponentActivity() {
     private fun compactDivider() = View(this).apply {
         setBackgroundColor(brandColor(R.color.blocks_input))
         layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(2)).apply {
-            topMargin = dp(1)
-            bottomMargin = dp(1)
+            topMargin = 0
+            bottomMargin = 0
         }
         importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
     }
@@ -2358,6 +2370,17 @@ class MainActivity : ComponentActivity() {
         })
     }
 
+    private fun historyFieldValue(title: String, value: String) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        addView(label(title, 13f, brandColor(R.color.blocks_teal)).apply {
+            typeface = manropeTypeface
+            setPadding(0, 0, 0, dp(1))
+        })
+        addView(label(value, 17f, brandColor(R.color.blocks_ink)).apply {
+            setPadding(0, 0, 0, dp(4))
+        })
+    }
+
     private fun divider() = View(this).apply {
         setBackgroundColor(brandColor(R.color.blocks_line))
         layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1)).apply {
@@ -2430,24 +2453,23 @@ class MainActivity : ComponentActivity() {
 
     private fun destructiveIconButton(icon: Int, description: String, action: (View) -> Unit) =
         iconOnlyButton(icon, description, action).apply {
-            compoundDrawableTintList = ColorStateList.valueOf(brandColor(R.color.blocks_muted))
+            val muted = brandColor(R.color.blocks_muted)
+            compoundDrawableTintList = ColorStateList.valueOf(
+                Color.argb(72, Color.red(muted), Color.green(muted), Color.blue(muted)),
+            )
         }
 
     private fun dashboardDestinationButton(icon: Int, destination: String, action: (View) -> Unit) =
         Button(this).apply {
-            text = destination
+            text = ""
             contentDescription = "Show $destination view"
             isAllCaps = false
-            textSize = 12f
-            typeface = interTypeface
-            setTextColor(brandColor(R.color.blocks_ink))
             setCompoundDrawablesRelativeWithIntrinsicBounds(icon, 0, 0, 0)
             compoundDrawableTintList = ColorStateList.valueOf(brandColor(R.color.blocks_ink))
-            compoundDrawablePadding = dp(3)
             background = roundedBackground(brandColor(R.color.blocks_white), brandColor(R.color.blocks_input), 9f)
-            minimumWidth = dp(76)
+            minimumWidth = dp(48)
             minimumHeight = dp(48)
-            setPadding(dp(8), 0, dp(8), 0)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
             setOnClickListener(action)
         }
 
