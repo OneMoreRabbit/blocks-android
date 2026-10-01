@@ -269,8 +269,14 @@ class AndroidSyncStateStore internal constructor(
         when (operation.type) {
             InteractionMutationType.REORDER_PROJECTS -> {
                 require(operation.projectId == null && operation.targetId == null)
+                val clientIdByProjectId = current.activeProjects.associate { project ->
+                    project.id to project.clientId
+                }
+                val orderedClientIds = current.projectOrder.orderedProjectIds.map { projectId ->
+                    clientIdByProjectId[projectId] ?: projectId
+                }
                 require(current.projectOrder.version == before.projectOrder.version + 1 &&
-                    current.projectOrder.orderedProjectIds == operation.orderedClientIds &&
+                    orderedClientIds == operation.orderedClientIds &&
                     current.projectOrder.orderedProjectIds.toSet() == current.activeProjects.map { it.id }.toSet() &&
                     current.projectOrder.orderedProjectIds.distinct().size == current.projectOrder.orderedProjectIds.size) {
                     "The appended Project order does not match its aggregate"

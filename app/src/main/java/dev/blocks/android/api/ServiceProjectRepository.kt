@@ -2,42 +2,52 @@ package dev.blocks.android.api
 
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
-import dev.blocks.android.api.generated.v06.model.AliasIn
-import dev.blocks.android.api.generated.v06.model.AliasOut
-import dev.blocks.android.api.generated.v06.model.BindIn
-import dev.blocks.android.api.generated.v06.model.BindingOut
-import dev.blocks.android.api.generated.v06.model.BlockOut
-import dev.blocks.android.api.generated.v06.model.ChangesOut
-import dev.blocks.android.api.generated.v06.model.DeleteIn
-import dev.blocks.android.api.generated.v06.model.LinkAck
-import dev.blocks.android.api.generated.v06.model.LinkCreateIn
-import dev.blocks.android.api.generated.v06.model.LinkEditIn
-import dev.blocks.android.api.generated.v06.model.LinkOut
-import dev.blocks.android.api.generated.v06.model.LegacyBlockIn
-import dev.blocks.android.api.generated.v06.model.LookupIn
-import dev.blocks.android.api.generated.v06.model.LookupOut
-import dev.blocks.android.api.generated.v06.model.NoteAck
-import dev.blocks.android.api.generated.v06.model.NoteCreateIn
-import dev.blocks.android.api.generated.v06.model.NoteEditIn
-import dev.blocks.android.api.generated.v06.model.NoteOut
-import dev.blocks.android.api.generated.v06.model.NotePinIn
-import dev.blocks.android.api.generated.v06.model.NotesIn
-import dev.blocks.android.api.generated.v06.model.NotesOut
-import dev.blocks.android.api.generated.v06.model.ProjectIn
-import dev.blocks.android.api.generated.v06.model.ProjectOut
-import dev.blocks.android.api.generated.v06.model.ProjectPageOut
-import dev.blocks.android.api.generated.v06.model.ProjectParkIn
-import dev.blocks.android.api.generated.v06.model.ProjectParkingOut
-import dev.blocks.android.api.generated.v06.model.ProjectRename
-import dev.blocks.android.api.generated.v06.model.RegisteredBlockOut
-import dev.blocks.android.api.generated.v06.model.ResolveKeyIn
-import dev.blocks.android.api.generated.v06.model.ResolveKeyOut
+import dev.blocks.android.api.generated.v07.model.AliasIn
+import dev.blocks.android.api.generated.v07.model.AliasOut
+import dev.blocks.android.api.generated.v07.model.BindIn
+import dev.blocks.android.api.generated.v07.model.BindingOut
+import dev.blocks.android.api.generated.v07.model.BlockOut
+import dev.blocks.android.api.generated.v07.model.ChangesOut
+import dev.blocks.android.api.generated.v07.model.DeleteIn
+import dev.blocks.android.api.generated.v07.model.DeleteParkingIn
+import dev.blocks.android.api.generated.v07.model.LinkAck
+import dev.blocks.android.api.generated.v07.model.LinkCreateIn
+import dev.blocks.android.api.generated.v07.model.LinkEditIn
+import dev.blocks.android.api.generated.v07.model.LinkOut
+import dev.blocks.android.api.generated.v07.model.LegacyBlockIn
+import dev.blocks.android.api.generated.v07.model.LookupIn
+import dev.blocks.android.api.generated.v07.model.LookupOut
+import dev.blocks.android.api.generated.v07.model.NoteAck
+import dev.blocks.android.api.generated.v07.model.NoteCreateIn
+import dev.blocks.android.api.generated.v07.model.NoteEditIn
+import dev.blocks.android.api.generated.v07.model.NoteOut
+import dev.blocks.android.api.generated.v07.model.NotePinIn
+import dev.blocks.android.api.generated.v07.model.NotesIn
+import dev.blocks.android.api.generated.v07.model.NotesOut
+import dev.blocks.android.api.generated.v07.model.OrderOut
+import dev.blocks.android.api.generated.v07.model.ParkingDeleteOut
+import dev.blocks.android.api.generated.v07.model.ParkingTombstoneOut
+import dev.blocks.android.api.generated.v07.model.ProjectIn
+import dev.blocks.android.api.generated.v07.model.ProjectOut
+import dev.blocks.android.api.generated.v07.model.ProjectPageOut
+import dev.blocks.android.api.generated.v07.model.ProjectParkIn
+import dev.blocks.android.api.generated.v07.model.ProjectParkingOut
+import dev.blocks.android.api.generated.v07.model.ProjectRename
+import dev.blocks.android.api.generated.v07.model.RegisteredBlockOut
+import dev.blocks.android.api.generated.v07.model.ReorderIn
+import dev.blocks.android.api.generated.v07.model.ResolveKeyIn
+import dev.blocks.android.api.generated.v07.model.ResolveKeyOut
 import dev.blocks.android.mvp.ChangeEvent
 import dev.blocks.android.mvp.ChangePage
 import dev.blocks.android.mvp.ParkingDraft
 import dev.blocks.android.mvp.Session
 import dev.blocks.android.project.BlockBinding
 import dev.blocks.android.project.BlockLookup
+import dev.blocks.android.project.AuthoritativeOrder
+import dev.blocks.android.project.InteractionAcknowledgement
+import dev.blocks.android.project.InteractionMutation
+import dev.blocks.android.project.InteractionMutationType
+import dev.blocks.android.project.ParkingTombstone
 import dev.blocks.android.project.PhysicalBlock
 import dev.blocks.android.project.ProjectLifecycle
 import dev.blocks.android.project.ProjectItemAcknowledgement
@@ -53,7 +63,7 @@ import dev.blocks.android.project.RegisteredBlock
 import dev.blocks.android.tag.ProjectKey
 import java.util.UUID
 
-/** Maps generated API 0.6 transport models into Android-owned project-domain models. */
+/** Maps generated API 0.7 transport models into Android-owned project-domain models. */
 class ServiceProjectRepository(
     private val client: ProjectTransport,
     private val json: Gson = Gson(),
@@ -414,6 +424,145 @@ class ServiceProjectRepository(
         }
     }
 
+    override fun projectOrder(session: Session): AuthoritativeOrder = decodeContract {
+        json.fromJson(
+            client.projectOrder(session.identityToken, session.tenantId).successBody(),
+            OrderOut::class.java,
+        ).toAuthoritativeOrder(null)
+    }
+
+    override fun reorderProjects(
+        session: Session,
+        operation: InteractionMutation,
+    ): InteractionAcknowledgement.Order = reorder(session, operation) { body ->
+        client.reorderProjects(session.identityToken, session.tenantId, body)
+    }
+
+    override fun linkOrder(session: Session, projectId: String): AuthoritativeOrder = decodeContract {
+        json.fromJson(
+            client.linkOrder(session.identityToken, session.tenantId, projectId).successBody(),
+            OrderOut::class.java,
+        ).toAuthoritativeOrder(projectId)
+    }
+
+    override fun reorderLinks(
+        session: Session,
+        operation: InteractionMutation,
+    ): InteractionAcknowledgement.Order = reorder(session, operation) { body ->
+        client.reorderLinks(
+            session.identityToken,
+            session.tenantId,
+            requireNotNull(operation.projectId),
+            body,
+        )
+    }
+
+    override fun parkingTombstones(session: Session, projectId: String): List<ParkingTombstone> = decodeContract {
+        json.fromJson<List<ParkingTombstoneOut>>(
+            client.parkingTombstones(session.identityToken, session.tenantId, projectId).successBody(),
+            PARKING_TOMBSTONE_LIST_TYPE,
+        ).map { tombstone ->
+            check(tombstone.projectId.toString() == projectId) {
+                "Service returned a Park tombstone from another Project"
+            }
+            ParkingTombstone(
+                parkingId = tombstone.targetId.toString(),
+                projectId = tombstone.projectId.toString(),
+                version = tombstone.version,
+                deletedAt = tombstone.deletedAt,
+                lastOperationId = tombstone.operationId.toString(),
+            )
+        }
+    }
+
+    override fun deleteParking(
+        session: Session,
+        operation: InteractionMutation,
+    ): InteractionAcknowledgement.Parking = decodeContract {
+        require(operation.type == InteractionMutationType.DELETE_PARKING)
+        val targetId = requireNotNull(operation.targetId)
+        val projectId = requireNotNull(operation.projectId)
+        val response = json.fromJson(
+            client.deleteParking(
+                session.identityToken,
+                session.tenantId,
+                projectId,
+                targetId,
+                json.toJson(
+                    DeleteParkingIn(
+                        aggregateId = UUID.fromString(operation.aggregateId),
+                        baseVersion = operation.baseVersion,
+                        operationId = UUID.fromString(operation.operationId),
+                        targetId = UUID.fromString(targetId),
+                    ),
+                ),
+            ).successBody(),
+            ParkingDeleteOut::class.java,
+        )
+        check(response.operationId.toString() == operation.operationId &&
+            response.aggregateId.toString() == operation.aggregateId &&
+            response.projectId.toString() == projectId &&
+            response.targetId.toString() == targetId) {
+            "Service acknowledged a different Park deletion operation"
+        }
+        InteractionAcknowledgement.Parking(
+            operationId = response.operationId.toString(),
+            aggregateId = response.aggregateId.toString(),
+            version = response.version,
+            projectId = response.projectId.toString(),
+            targetId = response.targetId.toString(),
+            deletedAt = response.deletedAt,
+            changed = response.changed,
+        )
+    }
+
+    private fun reorder(
+        session: Session,
+        operation: InteractionMutation,
+        send: (String) -> ApiResponse,
+    ): InteractionAcknowledgement.Order = decodeContract {
+        require(operation.type in setOf(
+            InteractionMutationType.REORDER_PROJECTS,
+            InteractionMutationType.REORDER_LINKS,
+        ))
+        val response = json.fromJson(
+            send(
+                json.toJson(
+                    ReorderIn(
+                        aggregateId = UUID.fromString(operation.aggregateId),
+                        baseVersion = operation.baseVersion,
+                        operationId = UUID.fromString(operation.operationId),
+                        orderedClientIds = operation.orderedClientIds.map(UUID::fromString),
+                    ),
+                ),
+            ).successBody(),
+            OrderOut::class.java,
+        )
+        check(response.operationId?.toString() == operation.operationId &&
+            response.aggregateId.toString() == operation.aggregateId &&
+            response.projectId?.toString() == operation.projectId) {
+            "Service acknowledged a different order operation"
+        }
+        InteractionAcknowledgement.Order(
+            operationId = requireNotNull(response.operationId).toString(),
+            aggregateId = response.aggregateId.toString(),
+            version = response.version,
+            projectId = response.projectId?.toString(),
+            orderedClientIds = response.orderedClientIds.map(UUID::toString),
+        )
+    }
+
+    private fun OrderOut.toAuthoritativeOrder(expectedProjectId: String?): AuthoritativeOrder {
+        check(projectId?.toString() == expectedProjectId) { "Service returned an unexpected order aggregate" }
+        return AuthoritativeOrder(
+            aggregateId = aggregateId.toString(),
+            projectId = projectId?.toString(),
+            orderedClientIds = orderedClientIds.map(UUID::toString),
+            version = version,
+            operationId = operationId?.toString(),
+        )
+    }
+
     private fun noteMutation(
         session: Session,
         operation: ProjectItemMutation,
@@ -616,6 +765,9 @@ class ServiceProjectRepository(
             clientId = clientId?.toString(),
             deviceId = deviceId?.toString(),
             supersedesId = supersedesId?.toString(),
+            rowVersion = rowVersion ?: 1,
+            deletedAt = deletedAt,
+            lastOperationId = lastOperationId?.toString(),
         )
     }
 
@@ -642,6 +794,7 @@ class ServiceProjectRepository(
     private companion object {
         val BLOCK_LIST_TYPE = object : TypeToken<List<BlockOut>>() {}.type
         val PARKING_LIST_TYPE = object : TypeToken<List<ProjectParkingOut>>() {}.type
+        val PARKING_TOMBSTONE_LIST_TYPE = object : TypeToken<List<ParkingTombstoneOut>>() {}.type
         val PROJECT_LIST_TYPE = object : TypeToken<List<ProjectOut>>() {}.type
     }
 }

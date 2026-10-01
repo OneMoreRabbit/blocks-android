@@ -8,6 +8,8 @@ import dev.blocks.android.api.generated.v04.model.ProjectIn
 import dev.blocks.android.api.generated.v04.model.ProjectPageOut
 import dev.blocks.android.api.generated.v04.model.ProjectParkIn
 import dev.blocks.android.api.generated.v06.model.NoteAck
+import dev.blocks.android.api.generated.v07.model.OrderOut
+import dev.blocks.android.api.generated.v07.model.ParkingTombstoneOut
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -165,5 +167,38 @@ class GeneratedContractModelsTest {
         assertEquals("00000000-0000-4000-8000-00000000000a", receipt.operationId.toString())
         assertEquals("00000000-0000-4000-8000-00000000000b", receipt.lastOperationId.toString())
         assertEquals(2, receipt.rowVersion)
+    }
+
+    @Test
+    fun generatedApi07ModelsCarryCompleteOrderAndIdentifierOnlyParkTombstone() {
+        val order = json.fromJson(
+            """
+            {
+              "aggregate_id":"40000000-0000-4000-8000-000000000001",
+              "operation_id":"50000000-0000-4000-8000-000000000001",
+              "ordered_client_ids":["10000000-0000-4000-8000-000000000001"],
+              "project_id":null,
+              "version":3
+            }
+            """.trimIndent(),
+            OrderOut::class.java,
+        )
+        val tombstone = json.fromJson(
+            """
+            {
+              "deleted_at":"2026-10-01T10:00:00Z",
+              "operation_id":"50000000-0000-4000-8000-000000000002",
+              "project_id":"20000000-0000-4000-8000-000000000001",
+              "target_id":"30000000-0000-4000-8000-000000000001",
+              "version":2
+            }
+            """.trimIndent(),
+            ParkingTombstoneOut::class.java,
+        )
+
+        assertEquals(3, order.version)
+        assertEquals(1, order.orderedClientIds.size)
+        assertEquals("30000000-0000-4000-8000-000000000001", tombstone.targetId.toString())
+        assertEquals(2, tombstone.version)
     }
 }

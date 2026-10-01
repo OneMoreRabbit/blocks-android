@@ -1,7 +1,7 @@
 package dev.blocks.android.api
 
-/** The reachable Service is not serving the accepted API 0.4 response contract yet. */
+/** The reachable Service returned bytes that do not satisfy the generated active contract. */
 class IncompatibleServiceApiException(cause: Throwable? = null) : RuntimeException(
-    "The Blocks Service is not yet serving the accepted API 0.4 contract",
+    "The Blocks Service response does not satisfy the active contract",
     cause,
 )

@@ -56,6 +56,9 @@ data class ProjectParking(
     val clientId: String? = null,
     val deviceId: String? = null,
     val supersedesId: String? = null,
+    val rowVersion: Int = 0,
+    val deletedAt: String? = null,
+    val lastOperationId: String? = null,
 )
 
 data class ProjectNoteItem(
@@ -84,7 +87,7 @@ data class ProjectResourceLink(
     val deletedAt: String? = null,
     /** State provenance only; acknowledgement is always the response/event operation id. */
     val lastOperationId: String? = null,
-    /** Retained local value that cannot cross the accepted API 0.6 URI boundary unchanged. */
+    /** Retained local value that cannot cross the active API 0.7 URI boundary unchanged. */
     val requiresReconciliation: Boolean = false,
 )
 
@@ -385,6 +388,18 @@ interface ProjectService {
         throw UnsupportedOperationException("Service API 0.6 navigation aliases are unavailable")
     fun resolveNavigationKey(session: Session, key: ProjectKey): String? =
         throw UnsupportedOperationException("Service API 0.6 navigation aliases are unavailable")
+    fun projectOrder(session: Session): AuthoritativeOrder =
+        throw UnsupportedOperationException("Service API 0.7 Project order is unavailable")
+    fun reorderProjects(session: Session, operation: InteractionMutation): InteractionAcknowledgement.Order =
+        throw UnsupportedOperationException("Service API 0.7 Project ordering is unavailable")
+    fun linkOrder(session: Session, projectId: String): AuthoritativeOrder =
+        throw UnsupportedOperationException("Service API 0.7 Link order is unavailable")
+    fun reorderLinks(session: Session, operation: InteractionMutation): InteractionAcknowledgement.Order =
+        throw UnsupportedOperationException("Service API 0.7 Link ordering is unavailable")
+    fun parkingTombstones(session: Session, projectId: String): List<ParkingTombstone> =
+        throw UnsupportedOperationException("Service API 0.7 Park tombstones are unavailable")
+    fun deleteParking(session: Session, operation: InteractionMutation): InteractionAcknowledgement.Parking =
+        throw UnsupportedOperationException("Service API 0.7 Park deletion is unavailable")
 }
 
 fun interface SessionAuthenticator {

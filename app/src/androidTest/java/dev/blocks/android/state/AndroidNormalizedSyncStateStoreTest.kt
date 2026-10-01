@@ -625,6 +625,55 @@ class AndroidNormalizedSyncStateStoreTest {
         assertEquals(beforeFailedDelete, AndroidSyncStateStore(context).loadSyncState(TENANT))
     }
 
+    @Test
+    fun realDatabasePersistsProjectOrderUsingWireClientIdentitiesWithoutReplacingLocalProjectIds() {
+        val firstClientId = "11000000-0000-4000-8000-000000000001"
+        val secondProjectId = "12000000-0000-4000-8000-000000000002"
+        val secondClientId = "11000000-0000-4000-8000-000000000002"
+        val first = state(TENANT).withoutCommands().projectCache.activeProjects.single().copy(
+            clientId = firstClientId,
+        )
+        val second = first.copy(id = secondProjectId, clientId = secondClientId, name = "Second")
+        val base = state(TENANT).withoutCommands().copy(
+            projectCache = state(TENANT).withoutCommands().projectCache.copy(
+                activeProjects = listOf(first, second),
+                pages = listOf(
+                    ProjectPage(first, ProjectNotes(first.id, "", 1, NOW), null),
+                    ProjectPage(second, ProjectNotes(second.id, "", 1, NOW), null),
+                ),
+                projectOrder = ProjectOrderState(
+                    orderedProjectIds = listOf(first.id, second.id),
+                    version = 1,
+                    updatedAt = NOW,
+                    aggregateId = "40000000-0000-4000-8000-000000000001",
+                ),
+            ),
+        )
+        store.saveSyncState(TENANT, base)
+        val persistedBase = AndroidSyncStateStore(context).loadSyncState(TENANT)
+        val operation = InteractionMutation(
+            operationId = "50000000-0000-4000-8000-000000000001",
+            type = InteractionMutationType.REORDER_PROJECTS,
+            aggregateId = "40000000-0000-4000-8000-000000000001",
+            orderedClientIds = listOf(secondClientId, firstClientId),
+            baseVersion = 1,
+            createdAt = NOW,
+        )
+        val updated = persistedBase.copy(
+            projectCache = persistedBase.projectCache.copy(
+                projectOrder = persistedBase.projectCache.projectOrder.copy(
+                    orderedProjectIds = listOf(second.id, first.id),
+                    version = 2,
+                ),
+                interactionOperations = listOf(operation),
+            ),
+        )
+
+        store.saveInteractionMutation(TENANT, persistedBase, updated)
+
+        assertEquals(updated, AndroidSyncStateStore(context).loadSyncState(TENANT))
+    }
+
     private fun state(tenantId: String, projectId: String = PROJECT): TenantSyncState {
         val project = ProjectSummary(
             id = projectId,

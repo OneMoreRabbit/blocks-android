@@ -13,7 +13,7 @@ import org.junit.Test
 
 class ProjectApiClientTest {
     @Test
-    fun sendsLegacyNotesAndParkingToTenantScopedProjectRoutesWithApi06Negotiation() {
+    fun sendsLegacyNotesAndParkingToTenantScopedProjectRoutesWithApi07ClientNegotiation() {
         val captured = mutableListOf<Request>()
         val server = server(captured::add)
         try {
@@ -39,7 +39,7 @@ class ProjectApiClientTest {
             assertEquals("POST", captured[1].method)
             assertEquals("/v1/tenants/$tenant/projects/$project/parking", captured[1].path)
             assertEquals("parking-key", captured[1].idempotencyKey)
-            assertEquals(listOf("0.6", "0.6"), captured.map { it.clientVersion })
+            assertEquals(listOf("0.7", "0.7"), captured.map { it.clientVersion })
             assertTrue(captured.all { it.authorization == "Bearer token" })
         } finally {
             server.stop(0)
@@ -47,7 +47,7 @@ class ProjectApiClientTest {
     }
 
     @Test
-    fun sendsApi06ItemsAndAliasesOnlyThroughTenantAndProjectScopedBodies() {
+    fun sendsItemsAndAliasesOnlyThroughTenantAndProjectScopedBodies() {
         val captured = mutableListOf<Request>()
         val server = server(captured::add)
         try {
@@ -87,7 +87,45 @@ class ProjectApiClientTest {
             )
             assertEquals(listOf(null, "3", "4", "5", null, "6", "7", null, null), captured.map { it.ifMatch })
             assertTrue(captured.none { it.path.contains(key) || it.query?.contains(key) == true })
-            assertEquals(listOf("0.6"), captured.map { it.clientVersion }.distinct())
+            assertEquals(listOf("0.7"), captured.map { it.clientVersion }.distinct())
+            assertEquals("0.7", captured[4].apiVersion)
+            assertEquals("0.7", captured[5].apiVersion)
+            assertNull(captured[6].apiVersion)
+        } finally {
+            server.stop(0)
+        }
+    }
+
+    @Test
+    fun sendsApi07InteractionOperationsToTheirExactTenantScopedRoutes() {
+        val captured = mutableListOf<Request>()
+        val server = server(captured::add)
+        try {
+            val client = ProjectApiClient(URI("http://127.0.0.1:${server.address.port}"))
+            val tenant = "tenant-a"
+            val project = "project-a"
+            val park = "park-a"
+
+            client.projectOrder("token", tenant)
+            client.reorderProjects("token", tenant, "{\"operation_id\":\"one\"}")
+            client.linkOrder("token", tenant, project)
+            client.reorderLinks("token", tenant, project, "{\"operation_id\":\"two\"}")
+            client.parkingTombstones("token", tenant, project)
+            client.deleteParking("token", tenant, project, park, "{\"operation_id\":\"three\"}")
+
+            assertEquals(listOf("GET", "PUT", "GET", "PUT", "GET", "POST"), captured.map { it.method })
+            assertEquals(
+                listOf(
+                    "/v1/tenants/$tenant/interaction/project-order",
+                    "/v1/tenants/$tenant/interaction/project-order",
+                    "/v1/tenants/$tenant/projects/$project/interaction/link-order",
+                    "/v1/tenants/$tenant/projects/$project/interaction/link-order",
+                    "/v1/tenants/$tenant/projects/$project/interaction/parking-tombstones",
+                    "/v1/tenants/$tenant/projects/$project/parking/$park/delete",
+                ),
+                captured.map { it.path },
+            )
+            assertTrue(captured.all { it.clientVersion == "0.7" })
         } finally {
             server.stop(0)
         }
@@ -140,6 +178,7 @@ class ProjectApiClientTest {
                     query = exchange.requestURI.rawQuery,
                     authorization = exchange.requestHeaders.getFirst("Authorization"),
                     clientVersion = exchange.requestHeaders.getFirst("X-Blocks-Client-Version"),
+                    apiVersion = exchange.requestHeaders.getFirst("X-Blocks-API-Version"),
                     ifMatch = exchange.requestHeaders.getFirst("If-Match"),
                     idempotencyKey = exchange.requestHeaders.getFirst("Idempotency-Key"),
                     body = exchange.requestBody.bufferedReader().use { it.readText() },
@@ -158,6 +197,7 @@ class ProjectApiClientTest {
         val query: String?,
         val authorization: String?,
         val clientVersion: String?,
+        val apiVersion: String?,
         val ifMatch: String?,
         val idempotencyKey: String?,
         val body: String,
