@@ -7,10 +7,12 @@ import dev.blocks.android.cover.InMemoryProjectCoverMediaStore
 import dev.blocks.android.mvp.ChangeEvent
 import dev.blocks.android.mvp.ChangePage
 import dev.blocks.android.mvp.NoOpDraftStore
+import dev.blocks.android.mvp.ParkingDraft
 import dev.blocks.android.mvp.Session
 import dev.blocks.android.mvp.SyncStateStore
 import dev.blocks.android.mvp.TenantSyncState
 import dev.blocks.android.project.AuthoritativeOrder
+import dev.blocks.android.project.BackgroundSyncResult
 import dev.blocks.android.project.InteractionAcknowledgement
 import dev.blocks.android.project.InteractionMutation
 import dev.blocks.android.project.LinkOrderState
@@ -25,6 +27,9 @@ import dev.blocks.android.project.ProjectService
 import dev.blocks.android.project.ProjectSummary
 import dev.blocks.android.project.visibleParking
 import java.lang.reflect.Proxy
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
@@ -32,6 +37,362 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class Api07InteractionSyncTest {
+    @Test
+    fun unknownProjectInPagedOrderFeedHydratesAndAdvancesCursorAcrossRestart() {
+        val store = MemoryStore().apply { saveSyncState(TENANT_A, state()) }
+        val third = project(PROJECT_C, CLIENT_C, TENANT_A)
+        val farEnd = FarEnd().apply {
+            projects += third
+            projectOrder = AuthoritativeOrder(
+                PROJECT_AGGREGATE,
+                null,
+                listOf(CLIENT_C, CLIENT_A, CLIENT_B),
+                3,
+                REMOTE_ORDER,
+            )
+            changes += ChangePage(
+                listOf(change("41", "project.created", mapOf("projectId" to PROJECT_C))),
+                "41",
+                true,
+            )
+            changes += ChangePage(
+                listOf(
+                    change(
+                        "42",
+                        "project.order_changed",
+                        mapOf("aggregateId" to PROJECT_AGGREGATE, "operationId" to REMOTE_ORDER),
+                    ),
+                ),
+                "42",
+                false,
+            )
+        }
+
+        var repository = repository(store, farEnd.service())
+        repository.activate(SESSION_A)
+        repository.backgroundSync(SESSION_A)
+
+        val synced = store.loadSyncState(TENANT_A)
+        assertEquals("42", synced.changeCursor)
+        assertEquals(listOf(PROJECT_C, PROJECT_A, PROJECT_B), synced.projectCache.projectOrder.orderedProjectIds)
+        assertTrue(synced.projectCache.activeProjects.any { it.id == PROJECT_C })
+
+        repository.deactivate(SESSION_A)
+        repository = repository(store, farEnd.service())
+        repository.activate(SESSION_A)
+        assertEquals("42", repository.snapshot(SESSION_A).cursor)
+        assertEquals(
+            listOf(PROJECT_C, PROJECT_A, PROJECT_B),
+            repository.snapshot(SESSION_A).cache.projectOrder.orderedProjectIds,
+        )
+    }
+
+    @Test
+    fun unknownProjectCreatedAndOrderedOnSamePageHydratesBeforeAggregateApplication() {
+        val store = MemoryStore().apply { saveSyncState(TENANT_A, state()) }
+        val third = project(PROJECT_C, CLIENT_C, TENANT_A)
+        val farEnd = FarEnd().apply {
+            projects += third
+            projectOrder = AuthoritativeOrder(
+                PROJECT_AGGREGATE,
+                null,
+                listOf(CLIENT_A, CLIENT_C, CLIENT_B),
+                2,
+                REMOTE_ORDER,
+            )
+            changes += ChangePage(
+                listOf(
+                    change("61", "project.created", mapOf("projectId" to PROJECT_C)),
+                    change(
+                        "62",
+                        "project.order_changed",
+                        mapOf("aggregateId" to PROJECT_AGGREGATE, "operationId" to REMOTE_ORDER),
+                    ),
+                ),
+                "62",
+                false,
+            )
+        }
+        val repository = repository(store, farEnd.service())
+        repository.activate(SESSION_A)
+
+        repository.backgroundSync(SESSION_A)
+
+        assertEquals("62", store.loadSyncState(TENANT_A).changeCursor)
+        assertEquals(
+            listOf(PROJECT_A, PROJECT_C, PROJECT_B),
+            store.loadSyncState(TENANT_A).projectCache.projectOrder.orderedProjectIds,
+        )
+    }
+
+    @Test
+    fun inaccessibleProjectIdentityDoesNotEnterCacheOrBlockCursor() {
+        val store = MemoryStore().apply { saveSyncState(TENANT_A, state()) }
+        val farEnd = FarEnd().apply {
+            projectOrder = AuthoritativeOrder(
+                PROJECT_AGGREGATE,
+                null,
+                listOf(CLIENT_A, FOREIGN_CLIENT, CLIENT_B),
+                2,
+                REMOTE_ORDER,
+            )
+            changes += ChangePage(
+                listOf(
+                    change(
+                        "71",
+                        "project.order_changed",
+                        mapOf("aggregateId" to PROJECT_AGGREGATE, "operationId" to REMOTE_ORDER),
+                    ),
+                ),
+                "71",
+                false,
+            )
+        }
+        val repository = repository(store, farEnd.service())
+        repository.activate(SESSION_A)
+
+        repository.backgroundSync(SESSION_A)
+
+        val durable = store.loadSyncState(TENANT_A)
+        assertEquals("71", durable.changeCursor)
+        assertFalse(durable.projectCache.activeProjects.any { it.clientId == FOREIGN_CLIENT })
+        assertEquals(listOf(PROJECT_A, PROJECT_B), durable.projectCache.projectOrder.orderedProjectIds)
+    }
+
+    @Test
+    fun knownAggregateIsPreparedAgainstCurrentVersionBeforeFirstDelivery() {
+        val initial = state().let { state ->
+            state.copy(
+                projectCache = state.projectCache.copy(
+                    projectOrder = dev.blocks.android.project.ProjectOrderState(
+                        listOf(PROJECT_A, PROJECT_B),
+                        1,
+                        NOW,
+                        PROJECT_AGGREGATE,
+                    ),
+                    interactionOperations = listOf(
+                        InteractionMutation(
+                            OP_PROJECT_ORDER,
+                            dev.blocks.android.project.InteractionMutationType.REORDER_PROJECTS,
+                            PROJECT_AGGREGATE,
+                            orderedClientIds = listOf(CLIENT_B, CLIENT_A),
+                            baseVersion = 1,
+                            createdAt = NOW,
+                        ),
+                    ),
+                ),
+            )
+        }
+        val store = MemoryStore().apply { saveSyncState(TENANT_A, initial) }
+        val farEnd = FarEnd().apply {
+            projectOrder = AuthoritativeOrder(PROJECT_AGGREGATE, null, listOf(CLIENT_A, CLIENT_B), 4, null)
+        }
+        val repository = repository(store, farEnd.service())
+        repository.activate(SESSION_A)
+
+        repository.backgroundSync(SESSION_A)
+
+        assertEquals(4, farEnd.projectReorders.single().baseVersion)
+        assertTrue(store.loadSyncState(TENANT_A).projectCache.interactionOperations.isEmpty())
+    }
+
+    @Test
+    fun lifecycleTriggeredOrdersPrepareAfterServiceMembershipVersionChanges() {
+        val initial = state().copy(
+            projectCache = state().projectCache.copy(
+                projectOrder = dev.blocks.android.project.ProjectOrderState(
+                    listOf(PROJECT_A, PROJECT_B),
+                    1,
+                    NOW,
+                    PROJECT_AGGREGATE,
+                ),
+            ),
+        )
+        val store = MemoryStore().apply { saveSyncState(TENANT_A, initial) }
+        val farEnd = FarEnd()
+        val repository = repository(store, farEnd.service())
+        repository.activate(SESSION_A)
+
+        repository.queueArchiveProject(SESSION_A, PROJECT_A, 1, OP_ARCHIVE)
+        repository.backgroundSync(SESSION_A)
+        val archivedVersion = repository.snapshot(SESSION_A).cache.archivedProjects.single { it.id == PROJECT_A }.rowVersion
+        repository.queueReopenProject(SESSION_A, PROJECT_A, archivedVersion, OP_REOPEN)
+        repository.backgroundSync(SESSION_A)
+        repository.queueCreateProject(SESSION_A, "third", OP_CREATE, CLIENT_C)
+        repository.backgroundSync(SESSION_A)
+
+        assertEquals(listOf(2, 4, 6), farEnd.projectReorders.map { it.baseVersion })
+        assertEquals(listOf(CLIENT_B, CLIENT_A, CLIENT_C), farEnd.projectOrder.orderedClientIds)
+        assertTrue(repository.snapshot(SESSION_A).cache.interactionOperations.isEmpty())
+    }
+
+    @Test
+    fun foregroundProjectOrderDuringAcknowledgementDoesNotResurrectRetiredOperation() {
+        val initial = stateWithThirdProject()
+        val store = MemoryStore().apply { saveSyncState(TENANT_A, initial) }
+        val farEnd = FarEnd().apply {
+            projects.clear()
+            projects.addAll(initial.projectCache.activeProjects)
+            projectOrder = AuthoritativeOrder(
+                PROJECT_AGGREGATE,
+                null,
+                listOf(CLIENT_A, CLIENT_B, CLIENT_C),
+                1,
+                null,
+            )
+            blockFirstProjectReorder = true
+        }
+        var repository = repository(store, farEnd.service())
+        repository.activate(SESSION_A)
+        repository.reorderActiveProjects(SESSION_A, listOf(PROJECT_B, PROJECT_A, PROJECT_C), OP_PROJECT_ORDER)
+        val executor = Executors.newSingleThreadExecutor()
+        val sync = executor.submit<BackgroundSyncResult> { repository.backgroundSync(SESSION_A) }
+        assertTrue(farEnd.projectReorderEntered.await(5, TimeUnit.SECONDS))
+
+        repository.reorderActiveProjects(SESSION_A, listOf(PROJECT_C, PROJECT_B, PROJECT_A), OP_PROJECT_ORDER_B)
+        farEnd.releaseProjectReorder.countDown()
+        sync.get(10, TimeUnit.SECONDS)
+        executor.shutdownNow()
+
+        val durable = store.loadSyncState(TENANT_A).projectCache
+        assertEquals(listOf(OP_PROJECT_ORDER, OP_PROJECT_ORDER_B), farEnd.projectReorders.map { it.operationId })
+        assertTrue(durable.interactionOperations.isEmpty())
+        assertTrue(setOf(OP_PROJECT_ORDER, OP_PROJECT_ORDER_B).all(durable.retiredInteractionOperationIds::contains))
+        repository.deactivate(SESSION_A)
+        repository = repository(store, farEnd.service())
+        repository.activate(SESSION_A)
+        assertEquals(listOf(PROJECT_C, PROJECT_B, PROJECT_A), repository.snapshot(SESSION_A).cache.projectOrder.orderedProjectIds)
+    }
+
+    @Test
+    fun foregroundLinkOrderDuringAcknowledgementPreservesBothOperations() {
+        val initial = stateWithThirdLink()
+        val store = MemoryStore().apply { saveSyncState(TENANT_A, initial) }
+        val farEnd = FarEnd().apply {
+            linkOrders[PROJECT_A] = AuthoritativeOrder(
+                LINK_AGGREGATE_A,
+                PROJECT_A,
+                listOf(LINK_A, LINK_B, LINK_C),
+                1,
+                null,
+            )
+            blockFirstLinkReorder = true
+        }
+        var repository = repository(store, farEnd.service())
+        repository.activate(SESSION_A)
+        repository.moveResourceLink(SESSION_A, LINK_B, -1, OP_LINK_ORDER)
+        val executor = Executors.newSingleThreadExecutor()
+        val sync = executor.submit<BackgroundSyncResult> { repository.backgroundSync(SESSION_A) }
+        assertTrue(farEnd.linkReorderEntered.await(5, TimeUnit.SECONDS))
+
+        repository.moveResourceLink(SESSION_A, LINK_C, -2, OP_LINK_ORDER_B)
+        farEnd.releaseLinkReorder.countDown()
+        sync.get(10, TimeUnit.SECONDS)
+        executor.shutdownNow()
+
+        val durable = store.loadSyncState(TENANT_A).projectCache
+        assertEquals(listOf(OP_LINK_ORDER, OP_LINK_ORDER_B), farEnd.linkReorders.map { it.operationId })
+        assertTrue(durable.interactionOperations.isEmpty())
+        assertTrue(setOf(OP_LINK_ORDER, OP_LINK_ORDER_B).all(durable.retiredInteractionOperationIds::contains))
+        repository.deactivate(SESSION_A)
+        repository = repository(store, farEnd.service())
+        repository.activate(SESSION_A)
+        assertEquals(
+            listOf(LINK_C, LINK_B, LINK_A),
+            repository.snapshot(SESSION_A).cache.linkOrders.single { it.projectId == PROJECT_A }.orderedLinkIds,
+        )
+    }
+
+    @Test
+    fun remoteTombstoneAndConcurrentLocalDeleteBothPersistWithAdvancedCursor() {
+        val initial = stateWithSecondPark()
+        val store = MemoryStore().apply { saveSyncState(TENANT_A, initial) }
+        val farEnd = FarEnd().apply {
+            parkingRecords[PROJECT_A] = initial.projectCache.parkingRecords.toMutableList()
+            tombstones[PROJECT_A] = listOf(
+                ParkingTombstone(PARK_A, PROJECT_A, 2, LATER, REMOTE_DELETE),
+            )
+            changes += ChangePage(
+                listOf(
+                    change(
+                        "51",
+                        "project.parking_deleted",
+                        mapOf(
+                            "projectId" to PROJECT_A,
+                            "parkingRecordId" to PARK_A,
+                            "operationId" to REMOTE_DELETE,
+                        ),
+                    ),
+                ),
+                "51",
+                false,
+            )
+            blockFirstTombstoneRead = true
+            failSubsequentTombstoneReads = true
+        }
+        var repository = repository(store, farEnd.service())
+        repository.activate(SESSION_A)
+        val executor = Executors.newSingleThreadExecutor()
+        val sync = executor.submit<BackgroundSyncResult> { repository.backgroundSync(SESSION_A) }
+        assertTrue(farEnd.tombstoneReadEntered.await(5, TimeUnit.SECONDS))
+
+        repository.deleteParking(SESSION_A, PARK_B, OP_DELETE_PARK_B)
+        farEnd.releaseTombstoneRead.countDown()
+        sync.get(10, TimeUnit.SECONDS)
+        executor.shutdownNow()
+
+        val durable = store.loadSyncState(TENANT_A)
+        assertEquals("51", durable.changeCursor)
+        assertEquals(setOf(PARK_A, PARK_B), durable.projectCache.parkingTombstones.map { it.parkingId }.toSet())
+        assertTrue(durable.projectCache.parkingRecords.any { it.id == PARK_A })
+        assertTrue(durable.projectCache.parkingRecords.any { it.id == PARK_B })
+        repository.deactivate(SESSION_A)
+        repository = repository(store, farEnd.service())
+        repository.activate(SESSION_A)
+        assertTrue(repository.snapshot(SESSION_A).cache.visibleParking(PROJECT_A).isEmpty())
+    }
+
+    @Test
+    fun provisionalParkDeleteRemapsToCanonicalIdentityAndSurvivesRestart() {
+        val store = MemoryStore().apply { saveSyncState(TENANT_A, state()) }
+        val farEnd = FarEnd()
+        var repository = repository(store, farEnd.service())
+        repository.activate(SESSION_A)
+        repository.queueParking(
+            SESSION_A,
+            PROJECT_A,
+            ParkingDraft("local location", "local next", "local reminder"),
+            operationId = OP_ADD_PARK,
+            clientId = LOCAL_PARK,
+        )
+        repository.queueParking(
+            SESSION_A,
+            PROJECT_A,
+            ParkingDraft("newest location", "newest next", "newest reminder"),
+            operationId = OP_ADD_PARK_B,
+            clientId = LOCAL_PARK_B,
+        )
+        repository.deleteParking(SESSION_A, LOCAL_PARK, OP_DELETE_LOCAL_PARK)
+
+        repository.backgroundSync(SESSION_A)
+
+        assertEquals(SERVER_PARK, farEnd.parkDeletes.single().targetId)
+        val durable = store.loadSyncState(TENANT_A).projectCache
+        assertTrue(durable.interactionOperations.isEmpty())
+        assertTrue(durable.parkingTombstones.any {
+            it.parkingId == SERVER_PARK && it.lastOperationId == OP_DELETE_LOCAL_PARK
+        })
+        assertTrue(durable.parkingRecords.any {
+            it.id == SERVER_PARK && it.clientId == LOCAL_PARK && it.location == "local location"
+        })
+        assertFalse(durable.visibleParking(PROJECT_A).any { it.id == SERVER_PARK })
+
+        repository.deactivate(SESSION_A)
+        repository = repository(store, farEnd.service())
+        repository.activate(SESSION_A)
+        assertFalse(repository.snapshot(SESSION_A).cache.visibleParking(PROJECT_A).any { it.id == SERVER_PARK })
+    }
+
     @Test
     fun drainsAllThreeDurableOperationsWithAuthoritativeIdentitiesAndOriginalKeys() {
         val store = MemoryStore().apply { saveSyncState(TENANT_A, state()) }
@@ -201,6 +562,66 @@ class Api07InteractionSyncTest {
         )
     }
 
+    private fun stateWithThirdProject(): TenantSyncState {
+        val base = state()
+        val third = project(PROJECT_C, CLIENT_C, TENANT_A)
+        return base.copy(
+            projectCache = base.projectCache.copy(
+                activeProjects = base.projectCache.activeProjects + third,
+                pages = base.projectCache.pages + ProjectPage(third, ProjectNotes(PROJECT_C, "", 1, NOW), null),
+                parkingLoadedProjectIds = base.projectCache.parkingLoadedProjectIds + PROJECT_C,
+                projectOrder = dev.blocks.android.project.ProjectOrderState(
+                    listOf(PROJECT_A, PROJECT_B, PROJECT_C),
+                    1,
+                    NOW,
+                    PROJECT_AGGREGATE,
+                ),
+            ),
+        )
+    }
+
+    private fun stateWithThirdLink(): TenantSyncState {
+        val base = state()
+        return base.copy(
+            projectCache = base.projectCache.copy(
+                resourceLinks = base.projectCache.resourceLinks + link(LINK_C),
+                linkOrders = listOf(
+                    LinkOrderState(PROJECT_A, listOf(LINK_A, LINK_B, LINK_C), 1, NOW, LINK_AGGREGATE_A),
+                    LinkOrderState(PROJECT_B, emptyList(), 1, NOW, LINK_AGGREGATE_B),
+                ),
+            ),
+        )
+    }
+
+    private fun stateWithSecondPark(): TenantSyncState {
+        val base = state()
+        val second = parking().copy(
+            id = PARK_B,
+            clientId = PARK_B,
+            location = "second location",
+            nextAction = "second next",
+            mustNotForget = "second reminder",
+            occurredAt = LATER,
+            createdAt = LATER,
+        )
+        return base.copy(
+            projectCache = base.projectCache.copy(
+                parkingRecords = base.projectCache.parkingRecords + second,
+                pages = base.projectCache.pages.map {
+                    if (it.project.id == PROJECT_A) it.copy(newestParking = second) else it
+                },
+            ),
+        )
+    }
+
+    private fun change(id: String, type: String, payload: Map<String, Any?>) = ChangeEvent(
+        eventId = id,
+        eventType = type,
+        eventVersion = if (type in setOf("project.order_changed", "project.parking_deleted")) "0.1" else "0.7",
+        tenantId = TENANT_A,
+        payload = payload,
+    )
+
     private fun project(id: String, clientId: String, tenantId: String) = ProjectSummary(
         id = id,
         tenantId = tenantId,
@@ -240,18 +661,39 @@ class Api07InteractionSyncTest {
     }
 
     private class FarEnd {
+        val projects = mutableListOf(
+            projectStatic(PROJECT_A, CLIENT_A),
+            projectStatic(PROJECT_B, CLIENT_B),
+        )
+        val parkingRecords = mutableMapOf(PROJECT_A to mutableListOf(parkingStatic()))
         var projectOrder = AuthoritativeOrder(PROJECT_AGGREGATE, null, listOf(CLIENT_A, CLIENT_B), 1, null)
         val linkOrders = mutableMapOf(
             PROJECT_A to AuthoritativeOrder(LINK_AGGREGATE_A, PROJECT_A, listOf(LINK_A, LINK_B), 1, null),
             PROJECT_B to AuthoritativeOrder(LINK_AGGREGATE_B, PROJECT_B, emptyList(), 1, null),
+            PROJECT_C to AuthoritativeOrder(LINK_AGGREGATE_C, PROJECT_C, emptyList(), 1, null),
         )
-        val tombstones = mutableMapOf(PROJECT_A to emptyList<ParkingTombstone>(), PROJECT_B to emptyList())
+        val tombstones = mutableMapOf(
+            PROJECT_A to emptyList<ParkingTombstone>(),
+            PROJECT_B to emptyList(),
+            PROJECT_C to emptyList(),
+        )
         val changes = ArrayDeque<ChangePage>()
         val projectReorders = mutableListOf<InteractionMutation>()
         val linkReorders = mutableListOf<InteractionMutation>()
         val parkDeletes = mutableListOf<InteractionMutation>()
         var loseNextProjectOrderResponse = false
         var conflictNextProjectOrder = false
+        var blockFirstProjectReorder = false
+        val projectReorderEntered = CountDownLatch(1)
+        val releaseProjectReorder = CountDownLatch(1)
+        var blockFirstLinkReorder = false
+        val linkReorderEntered = CountDownLatch(1)
+        val releaseLinkReorder = CountDownLatch(1)
+        var blockFirstTombstoneRead = false
+        var failSubsequentTombstoneReads = false
+        val tombstoneReadEntered = CountDownLatch(1)
+        val releaseTombstoneRead = CountDownLatch(1)
+        var tombstoneReads = 0
 
         @Suppress("UNCHECKED_CAST")
         fun service(): ProjectService = Proxy.newProxyInstance(
@@ -260,15 +702,102 @@ class Api07InteractionSyncTest {
         ) { _, method, arguments ->
             val args = arguments.orEmpty()
             when (method.name) {
+                "listProjects" -> projects.filter { it.lifecycle == args[1] }
+                "projectPage" -> {
+                    val project = projects.single { it.id == args[1] }
+                    ProjectPage(
+                        project,
+                        ProjectNotes(project.id, "", 1, project.updatedAt),
+                        parkingRecords[project.id].orEmpty().maxByOrNull { it.occurredAt },
+                    )
+                }
+                "archiveProject" -> {
+                    val projectId = args[1] as String
+                    val index = projects.indexOfFirst { it.id == projectId }
+                    val updated = projects[index].copy(
+                        lifecycle = ProjectLifecycle.ARCHIVED,
+                        rowVersion = projects[index].rowVersion + 1,
+                        updatedAt = LATER,
+                        archivedAt = LATER,
+                    )
+                    projects[index] = updated
+                    projectOrder = projectOrder.copy(
+                        orderedClientIds = projectOrder.orderedClientIds - requireNotNull(updated.clientId),
+                        version = projectOrder.version + 1,
+                    )
+                    updated
+                }
+                "reopenProject" -> {
+                    val projectId = args[1] as String
+                    val index = projects.indexOfFirst { it.id == projectId }
+                    val updated = projects[index].copy(
+                        lifecycle = ProjectLifecycle.ACTIVE,
+                        rowVersion = projects[index].rowVersion + 1,
+                        updatedAt = LATER,
+                        archivedAt = null,
+                    )
+                    projects[index] = updated
+                    projectOrder = projectOrder.copy(
+                        orderedClientIds = projectOrder.orderedClientIds + requireNotNull(updated.clientId),
+                        version = projectOrder.version + 1,
+                    )
+                    updated
+                }
+                "createProject" -> {
+                    val clientId = args[2] as String
+                    val created = projectStatic(PROJECT_C, clientId).copy(name = args[1] as String)
+                    projects += created
+                    projectOrder = projectOrder.copy(
+                        orderedClientIds = projectOrder.orderedClientIds + clientId,
+                        version = projectOrder.version + 1,
+                    )
+                    created
+                }
+                "blocks" -> emptyList<Any>()
+                "parking" -> parkingRecords[args[1] as String].orEmpty()
+                "addParking" -> {
+                    val projectId = args[1] as String
+                    val draft = args[2] as ParkingDraft
+                    val clientId = args[4] as String
+                    val serverId = if (clientId == LOCAL_PARK) SERVER_PARK else SERVER_PARK_B
+                    ProjectParking(
+                        serverId,
+                        projectId,
+                        draft.location,
+                        draft.nextAction,
+                        draft.mustNotForget,
+                        USER_A,
+                        args[5] as String? ?: NOW,
+                        args[5] as String? ?: NOW,
+                        clientId,
+                        rowVersion = 1,
+                    ).also { parkingRecords.getOrPut(projectId, ::mutableListOf).add(it) }
+                }
                 "changes" -> if (changes.isEmpty()) ChangePage(emptyList(), null, false) else changes.removeFirst()
                 "projectOrder" -> projectOrder
                 "linkOrder" -> linkOrders.getValue(args[1] as String)
-                "parkingTombstones" -> tombstones[args[1] as String].orEmpty()
+                "parkingTombstones" -> {
+                    tombstoneReads += 1
+                    if (blockFirstTombstoneRead && tombstoneReads == 1) {
+                        tombstoneReadEntered.countDown()
+                        check(releaseTombstoneRead.await(5, TimeUnit.SECONDS))
+                    } else if (failSubsequentTombstoneReads) {
+                        throw ServiceException(503, ApiError(ApiErrorCode.UNKNOWN, "offline after event read"))
+                    }
+                    tombstones[args[1] as String].orEmpty()
+                }
                 "reorderProjects" -> {
                     val operation = args[1] as InteractionMutation
                     projectReorders += operation
+                    if (blockFirstProjectReorder && projectReorders.size == 1) {
+                        projectReorderEntered.countDown()
+                        check(releaseProjectReorder.await(5, TimeUnit.SECONDS))
+                    }
                     if (conflictNextProjectOrder) {
                         conflictNextProjectOrder = false
+                        throw ServiceException(409, ApiError(ApiErrorCode.CONFLICT, "stale order"))
+                    }
+                    if (operation.aggregateId != projectOrder.aggregateId || operation.baseVersion != projectOrder.version) {
                         throw ServiceException(409, ApiError(ApiErrorCode.CONFLICT, "stale order"))
                     }
                     projectOrder = AuthoritativeOrder(
@@ -293,7 +822,15 @@ class Api07InteractionSyncTest {
                 "reorderLinks" -> {
                     val operation = args[1] as InteractionMutation
                     linkReorders += operation
+                    if (blockFirstLinkReorder && linkReorders.size == 1) {
+                        linkReorderEntered.countDown()
+                        check(releaseLinkReorder.await(5, TimeUnit.SECONDS))
+                    }
                     val projectId = requireNotNull(operation.projectId)
+                    if (
+                        operation.aggregateId != linkOrders.getValue(projectId).aggregateId ||
+                        operation.baseVersion != linkOrders.getValue(projectId).version
+                    ) throw ServiceException(409, ApiError(ApiErrorCode.CONFLICT, "stale link order"))
                     val next = AuthoritativeOrder(
                         operation.aggregateId,
                         projectId,
@@ -313,6 +850,11 @@ class Api07InteractionSyncTest {
                 "deleteParking" -> {
                     val operation = args[1] as InteractionMutation
                     parkDeletes += operation
+                    val authoritative = parkingRecords[requireNotNull(operation.projectId)]
+                        .orEmpty().single { it.id == operation.targetId }
+                    if (operation.baseVersion != authoritative.rowVersion) {
+                        throw ServiceException(409, ApiError(ApiErrorCode.CONFLICT, "stale Park"))
+                    }
                     val tombstone = ParkingTombstone(
                         requireNotNull(operation.targetId),
                         requireNotNull(operation.projectId),
@@ -334,6 +876,19 @@ class Api07InteractionSyncTest {
                 else -> error("Unexpected Service call ${method.name}")
             }
         } as ProjectService
+
+        companion object {
+            private fun projectStatic(id: String, clientId: String) = ProjectSummary(
+                id, TENANT_A, id.takeLast(4), ProjectLifecycle.ACTIVE, 1, NOW, NOW,
+                clientId = clientId,
+                navigationKey = "00000000-0000-4000-8000-000000000099",
+            )
+
+            private fun parkingStatic() = ProjectParking(
+                PARK_A, PROJECT_A, "authored location", "authored next action", "authored reminder",
+                USER_A, NOW, NOW, PARK_A, rowVersion = 1,
+            )
+        }
     }
 
     private companion object {
@@ -342,18 +897,38 @@ class Api07InteractionSyncTest {
         const val USER_A = "00000000-0000-4000-8000-00000000000c"
         const val PROJECT_A = "10000000-0000-4000-8000-000000000001"
         const val PROJECT_B = "10000000-0000-4000-8000-000000000002"
+        const val PROJECT_C = "10000000-0000-4000-8000-000000000003"
         const val CLIENT_A = "11000000-0000-4000-8000-000000000001"
         const val CLIENT_B = "11000000-0000-4000-8000-000000000002"
+        const val CLIENT_C = "11000000-0000-4000-8000-000000000003"
         const val LINK_A = "20000000-0000-4000-8000-000000000001"
         const val LINK_B = "20000000-0000-4000-8000-000000000002"
+        const val LINK_C = "20000000-0000-4000-8000-000000000003"
         const val PARK_A = "30000000-0000-4000-8000-000000000001"
+        const val PARK_B = "30000000-0000-4000-8000-000000000002"
+        const val LOCAL_PARK = "30000000-0000-4000-8000-000000000011"
+        const val LOCAL_PARK_B = "30000000-0000-4000-8000-000000000012"
+        const val SERVER_PARK = "30000000-0000-4000-8000-000000000021"
+        const val SERVER_PARK_B = "30000000-0000-4000-8000-000000000022"
         const val PROJECT_AGGREGATE = "40000000-0000-4000-8000-000000000001"
         const val LINK_AGGREGATE_A = "40000000-0000-4000-8000-000000000002"
         const val LINK_AGGREGATE_B = "40000000-0000-4000-8000-000000000003"
+        const val LINK_AGGREGATE_C = "40000000-0000-4000-8000-000000000004"
         const val OP_PROJECT_ORDER = "50000000-0000-4000-8000-000000000001"
         const val OP_LINK_ORDER = "50000000-0000-4000-8000-000000000002"
         const val OP_DELETE_PARK = "50000000-0000-4000-8000-000000000003"
         const val REMOTE_DELETE = "50000000-0000-4000-8000-000000000004"
+        const val OP_PROJECT_ORDER_B = "50000000-0000-4000-8000-000000000005"
+        const val OP_ADD_PARK = "50000000-0000-4000-8000-000000000006"
+        const val OP_ADD_PARK_B = "50000000-0000-4000-8000-000000000007"
+        const val OP_DELETE_LOCAL_PARK = "50000000-0000-4000-8000-000000000008"
+        const val REMOTE_ORDER = "50000000-0000-4000-8000-000000000009"
+        const val OP_LINK_ORDER_B = "50000000-0000-4000-8000-00000000000a"
+        const val OP_DELETE_PARK_B = "50000000-0000-4000-8000-00000000000b"
+        const val OP_ARCHIVE = "50000000-0000-4000-8000-00000000000c"
+        const val OP_REOPEN = "50000000-0000-4000-8000-00000000000d"
+        const val OP_CREATE = "50000000-0000-4000-8000-00000000000e"
+        const val FOREIGN_CLIENT = "f0000000-0000-4000-8000-000000000001"
         const val NOW = "2026-10-01T10:00:00Z"
         const val LATER = "2026-10-01T10:01:00Z"
         val SESSION_A = Session(TENANT_A, "token-a")

@@ -579,18 +579,19 @@ class AndroidNormalizedSyncStateStoreTest {
         val operation = InteractionMutation(
             operationId = "delete-parking-09",
             type = InteractionMutationType.DELETE_PARKING,
-            aggregateId = "parking:$parkingId",
+            aggregateId = parkingId,
             projectId = PROJECT,
             targetId = parkingId,
-            baseVersion = 0,
+            baseVersion = 1,
             createdAt = NOW,
+            preparedForDelivery = true,
         )
         val updated = base.copy(
             projectUiPreferences = ProjectUiPreferences(dashboardOrderMode = DashboardOrderMode.CUSTOM),
             projectCache = base.projectCache.copy(
                 projectOrder = ProjectOrderState(listOf(PROJECT), 1, NOW),
                 linkOrders = listOf(LinkOrderState(PROJECT, listOf(LINK_ID), 1, NOW)),
-                parkingTombstones = listOf(ParkingTombstone(parkingId, PROJECT, 1, NOW, operation.operationId)),
+                parkingTombstones = listOf(ParkingTombstone(parkingId, PROJECT, 2, NOW, operation.operationId)),
                 interactionOperations = listOf(operation),
             ),
         )

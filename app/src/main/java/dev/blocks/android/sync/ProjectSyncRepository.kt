@@ -2025,7 +2025,7 @@ class ProjectSyncRepository(
         initial: TenantSyncState,
         operation: InteractionMutation,
     ): PreparedInteraction {
-        if (operation.deliveryUncertain || operation.aggregateId.isUuid() && operation.baseVersion > 0) {
+        if (operation.deliveryUncertain || operation.preparedForDelivery) {
             return PreparedInteraction(initial, operation)
         }
         var state = initial
@@ -2041,6 +2041,7 @@ class ProjectSyncRepository(
                     aggregateId = authoritative.aggregateId,
                     baseVersion = authoritative.version,
                     orderedClientIds = ordered,
+                    preparedForDelivery = true,
                 )
             }
             InteractionMutationType.REORDER_LINKS -> {
@@ -2055,6 +2056,7 @@ class ProjectSyncRepository(
                     aggregateId = authoritative.aggregateId,
                     baseVersion = authoritative.version,
                     orderedClientIds = ordered,
+                    preparedForDelivery = true,
                 )
             }
             InteractionMutationType.DELETE_PARKING -> {
@@ -2082,6 +2084,7 @@ class ProjectSyncRepository(
                 operation.copy(
                     aggregateId = targetId,
                     baseVersion = authoritative.rowVersion,
+                    preparedForDelivery = true,
                 )
             }
         }
@@ -2726,7 +2729,15 @@ class ProjectSyncRepository(
             }
         }
         if (authoritative.projectId == null) {
-            val localIds = authoritative.orderedClientIds.map { cache.projectIdForClient(it) }
+            val localIds = authoritative.orderedClientIds.mapNotNull { cache.projectIdForClientOrNull(it) }
+            if (localIds.size != authoritative.orderedClientIds.size) {
+                return copy(
+                    projectCache = cache.copy(
+                        activeProjectsLoaded = false,
+                        archivedProjectsLoaded = false,
+                    ),
+                )
+            }
             cache = cache.copy(
                 projectOrder = cache.projectOrder.copy(
                     orderedProjectIds = localIds,
@@ -2962,7 +2973,30 @@ class ProjectSyncRepository(
         val withoutProvisional = projectCache.parkingRecords.filterNot {
             it.id == clientId || clientId != null && it.clientId == clientId
         }
-        return copy(projectCache = projectCache.copy(parkingRecords = withoutProvisional))
+        val remappedTombstones = projectCache.parkingTombstones.map { tombstone ->
+            if (clientId != null && tombstone.parkingId == clientId) {
+                tombstone.copy(parkingId = acknowledged.id, projectId = acknowledged.projectId)
+            } else tombstone
+        }.distinctBy { it.projectId to it.parkingId }
+        val remappedOperations = projectCache.interactionOperations.map { operation ->
+            if (
+                clientId != null && operation.type == InteractionMutationType.DELETE_PARKING &&
+                operation.targetId == clientId
+            ) {
+                operation.copy(
+                    aggregateId = acknowledged.id,
+                    projectId = acknowledged.projectId,
+                    targetId = acknowledged.id,
+                )
+            } else operation
+        }
+        return copy(
+            projectCache = projectCache.copy(
+                parkingRecords = withoutProvisional,
+                parkingTombstones = remappedTombstones,
+                interactionOperations = remappedOperations,
+            ),
+        )
             .withParkingRecord(acknowledged)
     }
 
@@ -3444,6 +3478,65 @@ class ProjectSyncRepository(
             }
         }
 
+        val parkingIdentityMappings = proposed.projectCache.parkingRecords.mapNotNull { record ->
+            record.clientId?.takeIf { it != record.id }?.let { it to record.id }
+        }.toMap()
+        fun remapInteractionOperation(operation: InteractionMutation): InteractionMutation {
+            val projectMapped = mappings.fold(operation) { mapped, identity ->
+                mapped.copy(
+                    aggregateId = if (mapped.aggregateId == "links:${identity.provisionalId}") {
+                        "links:${identity.serverId}"
+                    } else mapped.aggregateId,
+                    projectId = if (mapped.projectId == identity.provisionalId) identity.serverId else mapped.projectId,
+                    dependsOnOperationIds = mapped.dependsOnOperationIds.filterNot {
+                        it in acknowledgedCreateOperations[identity.provisionalId].orEmpty()
+                    },
+                )
+            }
+            val serverParkingId = projectMapped.targetId?.let(parkingIdentityMappings::get)
+            return if (serverParkingId != null && projectMapped.type == InteractionMutationType.DELETE_PARKING) {
+                projectMapped.copy(aggregateId = serverParkingId, targetId = serverParkingId)
+            } else projectMapped
+        }
+        val baselineInteractionOperations = baseline.projectCache.interactionOperations.associateBy { it.operationId }
+        val currentInteractionOperations = current.projectCache.interactionOperations.associateBy { it.operationId }
+        val locallyRemovedInteractionIds = baselineInteractionOperations.keys - currentInteractionOperations.keys
+        val locallyChangedInteractionOperations = current.projectCache.interactionOperations.filter {
+            baselineInteractionOperations[it.operationId]?.let { baselineOperation -> baselineOperation != it } == true
+        }.associateBy { it.operationId }
+        val locallyAddedInteractionOperations = current.projectCache.interactionOperations.filter {
+            it.operationId !in baselineInteractionOperations
+        }
+        val proposedRetiredInteractionIds = proposed.projectCache.retiredInteractionOperationIds.toSet()
+        val proposedInteractionIds = proposed.projectCache.interactionOperations.mapTo(mutableSetOf()) { it.operationId }
+        val interactionOperations = proposed.projectCache.interactionOperations
+            .filterNot { it.operationId in locallyRemovedInteractionIds }
+            .map { operation ->
+                locallyChangedInteractionOperations[operation.operationId]
+                    ?.takeUnless { it.operationId in proposedRetiredInteractionIds }
+                    ?.let(::remapInteractionOperation)
+                    ?: operation
+            } + locallyAddedInteractionOperations
+            .filterNot { it.operationId in proposedInteractionIds || it.operationId in proposedRetiredInteractionIds }
+            .map(::remapInteractionOperation)
+
+        val baselineTombstones = baseline.projectCache.parkingTombstones.associateBy { it.projectId to it.parkingId }
+        val localTombstoneDeltas = current.projectCache.parkingTombstones.filter { tombstone ->
+            baselineTombstones[tombstone.projectId to tombstone.parkingId] != tombstone
+        }.map { tombstone ->
+            val mappedProjectId = mappings.firstOrNull { it.provisionalId == tombstone.projectId }?.serverId
+                ?: tombstone.projectId
+            val mappedParkingId = parkingIdentityMappings[tombstone.parkingId] ?: tombstone.parkingId
+            tombstone.copy(projectId = mappedProjectId, parkingId = mappedParkingId)
+        }
+        val parkingTombstones = (
+            proposed.projectCache.parkingTombstones + localTombstoneDeltas.filter { local ->
+                proposed.projectCache.parkingTombstones.none {
+                    it.projectId == local.projectId && it.parkingId == local.parkingId
+                }
+            }
+            ).distinctBy { it.projectId to it.parkingId }
+
         var merged = proposed.copy(
             projectDrafts = if (current.projectDrafts != baseline.projectDrafts) {
                 mappings.fold(current.projectDrafts) { drafts, identity ->
@@ -3474,63 +3567,10 @@ class ProjectSyncRepository(
                 },
                 noteItems = noteItems.distinctBy { it.id },
                 resourceLinks = resourceLinks.distinctBy { it.id },
-                projectOrder = if (current.projectCache.projectOrder != baseline.projectCache.projectOrder) {
-                    mappings.fold(current.projectCache.projectOrder) { order, identity ->
-                        order.copy(
-                            orderedProjectIds = order.orderedProjectIds.map {
-                                if (it == identity.provisionalId) identity.serverId else it
-                            }.distinct(),
-                        )
-                    }
-                } else {
-                    proposed.projectCache.projectOrder
-                },
-                linkOrders = if (current.projectCache.linkOrders != baseline.projectCache.linkOrders) {
-                    current.projectCache.linkOrders.map { order ->
-                        mappings.fold(order) { mapped, identity ->
-                            if (mapped.projectId == identity.provisionalId) {
-                                mapped.copy(projectId = identity.serverId)
-                            } else mapped
-                        }
-                    }.distinctBy { it.projectId }
-                } else {
-                    proposed.projectCache.linkOrders
-                },
-                parkingTombstones = if (
-                    current.projectCache.parkingTombstones != baseline.projectCache.parkingTombstones
-                ) {
-                    current.projectCache.parkingTombstones.map { tombstone ->
-                        mappings.fold(tombstone) { mapped, identity ->
-                            if (mapped.projectId == identity.provisionalId) {
-                                mapped.copy(projectId = identity.serverId)
-                            } else mapped
-                        }
-                    }
-                } else {
-                    proposed.projectCache.parkingTombstones
-                },
-                interactionOperations = if (
-                    current.projectCache.interactionOperations != baseline.projectCache.interactionOperations
-                ) {
-                    current.projectCache.interactionOperations.map { operation ->
-                        mappings.fold(operation) { mapped, identity ->
-                            mapped.copy(
-                                aggregateId = if (mapped.aggregateId == "links:${identity.provisionalId}") {
-                                    "links:${identity.serverId}"
-                                } else mapped.aggregateId,
-                                projectId = if (mapped.projectId == identity.provisionalId) {
-                                    identity.serverId
-                                } else mapped.projectId,
-                                orderedClientIds = mapped.orderedClientIds,
-                                dependsOnOperationIds = mapped.dependsOnOperationIds.filterNot {
-                                    it in acknowledgedCreateOperations[identity.provisionalId].orEmpty()
-                                },
-                            )
-                        }
-                    }
-                } else {
-                    proposed.projectCache.interactionOperations
-                },
+                projectOrder = proposed.projectCache.projectOrder,
+                linkOrders = proposed.projectCache.linkOrders,
+                parkingTombstones = parkingTombstones,
+                interactionOperations = interactionOperations,
                 retiredInteractionOperationIds = (
                     proposed.projectCache.retiredInteractionOperationIds +
                         (current.projectCache.retiredInteractionOperationIds -
@@ -3597,7 +3637,7 @@ class ProjectSyncRepository(
         merged.projectCache.itemOperations.map { it.targetId }.distinct().forEach { itemId ->
             merged = merged.reapplyPendingItemProjection(itemId)
         }
-        return merged
+        return merged.reapplyPendingInteractionProjection()
     }
 
     private fun ProjectMutation.remapProject(provisionalId: String, serverId: String) = copy(

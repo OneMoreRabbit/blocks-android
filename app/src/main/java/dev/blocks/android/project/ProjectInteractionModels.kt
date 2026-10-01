@@ -54,6 +54,8 @@ data class InteractionMutation(
     val createdAt: String,
     val status: ProjectMutationStatus = ProjectMutationStatus.PENDING,
     val deliveryUncertain: Boolean = false,
+    /** True only after the exact wire envelope has been durably bound before its first send. */
+    val preparedForDelivery: Boolean = false,
     val contractVersion: String = "0.7",
 )
 
