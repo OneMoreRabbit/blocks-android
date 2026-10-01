@@ -193,6 +193,17 @@ class LocalActionPerformanceTest {
                 )
             }
 
+            scenario.onActivity { activity -> activity.findViewById<Button>(ProjectUiIds.PARK).performClick() }
+            waitFor(scenario) { it.findViewById<View>(ProjectUiIds.SAVE_PARKING) != null }
+            scenario.onActivity { activity ->
+                activity.findViewById<EditText>(ProjectUiIds.PARKING_LOCATION).setText("Delete warmup")
+                activity.findViewById<EditText>(ProjectUiIds.PARKING_NEXT_ACTION).setText("Prepare deletion")
+                activity.findViewById<EditText>(ProjectUiIds.PARKING_MUST_NOT_FORGET).setText("Keep current summary")
+                activity.findViewById<Button>(ProjectUiIds.SAVE_PARKING).performClick()
+            }
+            waitFor(scenario) {
+                it.findViewById<View>(ProjectUiIds.PARK) != null && it.hasVisibleText("Delete warmup")
+            }
             stabilizePerformancePhase()
             val parkDeleteTimings = (1..25).map { index ->
                 lateinit var deleteButton: Button
