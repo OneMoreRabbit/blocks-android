@@ -194,9 +194,20 @@ class LocalActionPerformanceTest {
             }
 
             stabilizePerformancePhase()
-            val parkDeleteTimings = (1..25).map {
+            val parkDeleteTimings = (1..25).map { index ->
                 lateinit var deleteButton: Button
-                ensureHistoricalParkingVisible(scenario)
+                val setupLocation = "Delete setup $index"
+                scenario.onActivity { activity -> activity.findViewById<Button>(ProjectUiIds.PARK).performClick() }
+                waitFor(scenario) { it.findViewById<View>(ProjectUiIds.SAVE_PARKING) != null }
+                scenario.onActivity { activity ->
+                    activity.findViewById<EditText>(ProjectUiIds.PARKING_LOCATION).setText(setupLocation)
+                    activity.findViewById<EditText>(ProjectUiIds.PARKING_NEXT_ACTION).setText("Prepare delete $index")
+                    activity.findViewById<EditText>(ProjectUiIds.PARKING_MUST_NOT_FORGET).setText("Keep boundary $index")
+                    activity.findViewById<Button>(ProjectUiIds.SAVE_PARKING).performClick()
+                }
+                waitFor(scenario) {
+                    it.findViewById<View>(ProjectUiIds.PARK) != null && it.hasVisibleText(setupLocation)
+                }
                 scenario.onActivity { activity ->
                     deleteButton = activity.historicalParkingDeleteButton()
                     deleteButton.performClick()
@@ -327,21 +338,6 @@ class LocalActionPerformanceTest {
         findViewById<ViewGroup>(ProjectUiIds.PROJECT_ACTIVITY).descendants()
             .filterIsInstance<Button>()
             .firstOrNull { it.contentDescription?.toString() == "Delete park message" }
-
-    private fun ensureHistoricalParkingVisible(scenario: ActivityScenario<MainActivity>) {
-        repeat(8) {
-            var visible = false
-            scenario.onActivity { activity ->
-                visible = activity.historicalParkingDeleteButtonOrNull() != null
-                if (!visible) {
-                    activity.findViewById<Button>(ProjectUiIds.LOAD_OLDER_PARKING)?.performClick()
-                }
-            }
-            if (visible) return
-            InstrumentationRegistry.getInstrumentation().waitForIdleSync()
-        }
-        error("No historical Park delete action became visible")
-    }
 
     private fun Activity.newestParkingSignature(): String =
         findViewById<ViewGroup>(ProjectUiIds.NEWEST_PARKING).descendants()
