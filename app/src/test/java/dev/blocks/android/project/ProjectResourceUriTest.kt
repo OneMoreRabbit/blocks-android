@@ -1,5 +1,6 @@
 package dev.blocks.android.project
 
+import com.google.gson.Gson
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -26,6 +27,7 @@ class ProjectResourceUriTest {
             "content://provider/private",
             "javascript:alert(1)",
             "https://user:password@example.com/private",
+            "onenote://user:password@example.com/private",
             "/relative/path",
             "https:///missing-host",
             "obsidian:",
@@ -56,4 +58,25 @@ class ProjectResourceUriTest {
             "obsidian://open\t?vault=Blocks",
         ).forEach { value -> assertFalse("Unexpectedly accepted $value", ProjectResourceUri.canLaunch(value)) }
     }
+
+    @Test
+    fun matchesTheSharedVersionedAcceptanceCorpusIncludingOrdinaryOneNoteUris() {
+        val corpus = requireNotNull(javaClass.classLoader)
+            .getResourceAsStream("project-resource-uri-validation-v0_3.json")
+            .use { input -> Gson().fromJson(input.reader(), UriCorpus::class.java) }
+        assertEquals("0.3", corpus.version)
+        corpus.accepted.forEach { value ->
+            assertEquals(value, ProjectResourceUri.validate(value))
+            assertTrue(ProjectResourceUri.canLaunch(value))
+        }
+        corpus.refused.forEach { value ->
+            assertFalse("Unexpectedly accepted $value", ProjectResourceUri.canLaunch(value))
+        }
+    }
+
+    private data class UriCorpus(
+        val version: String,
+        val accepted: List<String>,
+        val refused: List<String>,
+    )
 }

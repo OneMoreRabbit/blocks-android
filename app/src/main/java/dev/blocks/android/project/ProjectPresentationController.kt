@@ -53,6 +53,7 @@ data class ProjectPresentationState(
     val showLinkForm: Boolean = false,
     val editingLinkId: String? = null,
     val dashboardView: DashboardView = DashboardView.TILES,
+    val dashboardOrderMode: DashboardOrderMode = DashboardOrderMode.NAME,
     val archiveMode: Boolean = false,
     val pendingChanges: Boolean = false,
     val syncing: Boolean = false,
@@ -115,6 +116,7 @@ class ProjectPresentationController(
             state.copy(
                 drafts = workspace.projectDrafts(authenticated),
                 dashboardView = preferences.dashboardView,
+                dashboardOrderMode = preferences.dashboardOrderMode,
                 archiveMode = preferences.archiveMode,
                 authenticationRequired = false,
                 sessionConfirmationRequired = false,
@@ -125,6 +127,7 @@ class ProjectPresentationController(
                 screen = ProjectScreen.DASHBOARD,
                 drafts = workspace.projectDrafts(authenticated),
                 dashboardView = preferences.dashboardView,
+                dashboardOrderMode = preferences.dashboardOrderMode,
                 archiveMode = preferences.archiveMode,
             )
         }
@@ -144,6 +147,7 @@ class ProjectPresentationController(
             screen = ProjectScreen.DASHBOARD,
             drafts = workspace.projectDrafts(cachedSession),
             dashboardView = preferences.dashboardView,
+            dashboardOrderMode = preferences.dashboardOrderMode,
             archiveMode = preferences.archiveMode,
             sessionConfirmationRequired = true,
         )
@@ -290,6 +294,27 @@ class ProjectPresentationController(
             )
         }
         state = state.copy(dashboardView = preferences.dashboardView, error = null)
+    }
+
+    @Synchronized
+    fun setDashboardOrderMode(mode: DashboardOrderMode) {
+        val active = activeSession()
+        val preferences = workspace.updateUiPreferences(active) { it.copy(dashboardOrderMode = mode) }
+        state = state.copy(dashboardOrderMode = preferences.dashboardOrderMode, error = null)
+        applyResult(workspace.snapshot(active))
+    }
+
+    @Synchronized
+    fun moveActiveProject(draggedProjectId: String, targetProjectId: String) {
+        require(state.dashboardOrderMode == DashboardOrderMode.CUSTOM) {
+            "Projects can be rearranged only in Custom order"
+        }
+        val ids = state.activeProjects.map { it.id }.toMutableList()
+        val from = ids.indexOf(draggedProjectId)
+        val to = ids.indexOf(targetProjectId)
+        if (from < 0 || to < 0 || from == to) return
+        ids.add(to, ids.removeAt(from))
+        applyResult(workspace.reorderActiveProjects(activeSession(), ids))
     }
 
     @Synchronized
@@ -440,6 +465,18 @@ class ProjectPresentationController(
     fun deleteResourceLink(linkId: String) {
         activeProjectPage()
         applyResult(workspace.deleteResourceLink(activeSession(), linkId))
+    }
+
+    @Synchronized
+    fun moveResourceLink(linkId: String, delta: Int) {
+        activeProjectPage()
+        applyResult(workspace.moveResourceLink(activeSession(), linkId, delta))
+    }
+
+    @Synchronized
+    fun deleteParking(parkingId: String) {
+        activeProjectPage()
+        applyResult(workspace.deleteParking(activeSession(), parkingId))
     }
 
     @Synchronized
@@ -867,10 +904,11 @@ class ProjectPresentationController(
             result.pendingProjectOperations +
             result.pendingBlockOperations +
             result.pendingItemOperations +
-            result.pendingNavigationAliases
+            result.pendingNavigationAliases +
+            result.pendingInteractionOperations
         val preferences = workspace.uiPreferences(active)
         state = state.copy(
-            activeProjects = result.cache.activeProjects.sortedBy { it.name.lowercase() },
+            activeProjects = result.cache.dashboardProjects(preferences.dashboardOrderMode),
             archivedProjects = result.cache.archivedProjects.sortedBy { it.name.lowercase() },
             projectPage = updatedPage,
             parkingHistory = history?.records.orEmpty(),
@@ -881,6 +919,7 @@ class ProjectPresentationController(
             resourceLinks = resolvedSelectedId?.let(result.cache::resourceLinksFor).orEmpty(),
             drafts = drafts,
             dashboardView = preferences.dashboardView,
+            dashboardOrderMode = preferences.dashboardOrderMode,
             archiveMode = preferences.archiveMode,
             pendingChanges = pending > 0,
             invalidField = null,
@@ -988,6 +1027,5 @@ private fun ProjectCacheState.noteItemsFor(projectId: String): List<ProjectNoteI
     .filter { it.projectId == projectId && it.deletedAt == null }
     .sortedWith(compareByDescending<ProjectNoteItem> { it.pinned }.thenByDescending { it.updatedAt })
 
-private fun ProjectCacheState.resourceLinksFor(projectId: String): List<ProjectResourceLink> = resourceLinks
-    .filter { it.projectId == projectId && it.deletedAt == null }
-    .sortedByDescending { it.updatedAt }
+private fun ProjectCacheState.resourceLinksFor(projectId: String): List<ProjectResourceLink> =
+    orderedResourceLinks(projectId)

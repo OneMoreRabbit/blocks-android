@@ -90,6 +90,13 @@ interface SyncStateStore {
         state: TenantSyncState,
         type: ProjectItemMutationType,
     ) = saveSyncState(tenantId, previous, state)
+    fun saveInteractionMutation(
+        tenantId: String,
+        previous: TenantSyncState,
+        state: TenantSyncState,
+        projectMutationType: ProjectMutationType? = null,
+        itemMutationType: ProjectItemMutationType? = null,
+    ) = saveSyncState(tenantId, previous, state)
     fun clearSyncState(tenantId: String)
 }
 

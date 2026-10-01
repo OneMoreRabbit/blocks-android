@@ -236,6 +236,7 @@ enum class DashboardView { LIST, TILES }
 data class ProjectUiPreferences(
     val dashboardView: DashboardView = DashboardView.TILES,
     val archiveMode: Boolean = false,
+    val dashboardOrderMode: DashboardOrderMode = DashboardOrderMode.NAME,
 )
 
 /** A complete, immutable retry description for one Android-owned synchronization operation. */
@@ -290,6 +291,11 @@ data class ProjectCacheState(
     val provisionalProjectIds: List<String> = emptyList(),
     val projectIdMappings: List<ProjectIdentityMapping> = emptyList(),
     val projectsAwaitingNotesBaseline: List<String> = emptyList(),
+    val projectOrder: ProjectOrderState = ProjectOrderState(),
+    val linkOrders: List<LinkOrderState> = emptyList(),
+    val parkingTombstones: List<ParkingTombstone> = emptyList(),
+    val interactionOperations: List<InteractionMutation> = emptyList(),
+    val retiredInteractionOperationIds: List<String> = emptyList(),
 )
 
 data class BackgroundSyncResult(
@@ -302,6 +308,7 @@ data class BackgroundSyncResult(
     val pendingBlockOperations: Int = 0,
     val pendingItemOperations: Int = 0,
     val pendingNavigationAliases: Int = 0,
+    val pendingInteractionOperations: Int = 0,
 )
 
 data class ProjectConflict(
@@ -565,6 +572,22 @@ interface ProjectWorkspace {
         linkId: String,
         operationId: String = newOperationIdentity(),
     ): BackgroundSyncResult = throw UnsupportedOperationException("Project resource links are unavailable")
+    fun moveResourceLink(
+        session: Session,
+        linkId: String,
+        delta: Int,
+        operationId: String = newOperationIdentity(),
+    ): BackgroundSyncResult = throw UnsupportedOperationException("Project resource ordering is unavailable")
+    fun reorderActiveProjects(
+        session: Session,
+        orderedProjectIds: List<String>,
+        operationId: String = newOperationIdentity(),
+    ): BackgroundSyncResult = throw UnsupportedOperationException("Project ordering is unavailable")
+    fun deleteParking(
+        session: Session,
+        parkingId: String,
+        operationId: String = newOperationIdentity(),
+    ): BackgroundSyncResult = throw UnsupportedOperationException("Parking removal is unavailable")
     fun acknowledgeProjectItem(
         session: Session,
         acknowledgement: ProjectItemAcknowledgement,
@@ -602,9 +625,10 @@ internal fun ProjectCacheState.ensureProjectLinks(
     if (knownProjects.isEmpty()) return this
 
     val links = projectLinks.toMutableList()
+    val linkedProjectIds = links.mapTo(mutableSetOf()) { it.projectId }
     val usedKeys = links.map { it.key }.toMutableSet()
     knownProjects.forEach { project ->
-        if (links.any { it.projectId == project.id }) return@forEach
+        if (!linkedProjectIds.add(project.id)) return@forEach
         val preferred = project.navigationKey?.let(ProjectKey::parse)?.takeIf(usedKeys::add)
             ?: project.clientId?.let(ProjectKey::parse)?.takeIf(usedKeys::add)
         val key = preferred ?: generateSequence(keyFactory::create).first(usedKeys::add)
