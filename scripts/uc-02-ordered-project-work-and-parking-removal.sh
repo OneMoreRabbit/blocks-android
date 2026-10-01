@@ -76,5 +76,5 @@ else
 fi
 echo "VERDICT visual review: $visual_verdict"
 
-echo 'VERDICT far-end convergence: blocked:blocks.component.blocks-service'
-echo 'EXPECTED: API 0.6 remains byte-compatible; proposed 0.7 operations stay durable and pending until a separately accepted Service contract exists.'
+echo 'VERDICT far-end convergence: covered by UC-03 physical two-device pauses'
+echo 'EXPECTED: API 0.6 remains byte-compatible; active API 0.7 operations use their durable original identities and authoritative aggregates.'

@@ -7,6 +7,7 @@ data class ProjectOrderState(
     val orderedProjectIds: List<String> = emptyList(),
     val version: Int = 0,
     val updatedAt: String = "",
+    val aggregateId: String? = null,
 )
 
 data class LinkOrderState(
@@ -14,6 +15,7 @@ data class LinkOrderState(
     val orderedLinkIds: List<String> = emptyList(),
     val version: Int = 0,
     val updatedAt: String = "",
+    val aggregateId: String? = null,
 )
 
 /** Visibility metadata only. The immutable [ProjectParking] row remains untouched. */
@@ -25,13 +27,21 @@ data class ParkingTombstone(
     val lastOperationId: String,
 )
 
+data class AuthoritativeOrder(
+    val aggregateId: String,
+    val projectId: String?,
+    val orderedClientIds: List<String>,
+    val version: Int,
+    val operationId: String?,
+)
+
 enum class InteractionMutationType {
     REORDER_PROJECTS,
     REORDER_LINKS,
     DELETE_PARKING,
 }
 
-/** Proposed API 0.7 envelope. API 0.6 never sends or retires these operations. */
+/** Durable API 0.7 envelope. Preparation binds the local intent to the authoritative aggregate before first send. */
 data class InteractionMutation(
     val operationId: String,
     val type: InteractionMutationType,
@@ -44,8 +54,34 @@ data class InteractionMutation(
     val createdAt: String,
     val status: ProjectMutationStatus = ProjectMutationStatus.PENDING,
     val deliveryUncertain: Boolean = false,
+    /** True only after the exact wire envelope has been durably bound before its first send. */
+    val preparedForDelivery: Boolean = false,
     val contractVersion: String = "0.7",
 )
+
+sealed interface InteractionAcknowledgement {
+    val operationId: String
+    val aggregateId: String
+    val version: Int
+
+    data class Order(
+        override val operationId: String,
+        override val aggregateId: String,
+        override val version: Int,
+        val projectId: String?,
+        val orderedClientIds: List<String>,
+    ) : InteractionAcknowledgement
+
+    data class Parking(
+        override val operationId: String,
+        override val aggregateId: String,
+        override val version: Int,
+        val projectId: String,
+        val targetId: String,
+        val deletedAt: String?,
+        val changed: Boolean,
+    ) : InteractionAcknowledgement
+}
 
 internal fun ProjectCacheState.ensureInteractionState(): ProjectCacheState {
     val activeIds = activeProjects.map { it.id }

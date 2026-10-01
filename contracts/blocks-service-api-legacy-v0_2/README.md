@@ -6,8 +6,9 @@ original endpoint, body, concurrency value, and idempotency identity; new produc
 must never enter the legacy queue.
 
 This directory is frozen for the compatibility window. Do not refresh it from the active
-edge. The active API 0.6 artifacts live in `../blocks-service-api/`; frozen API 0.4 artifacts
-live in `../blocks-service-api-legacy-v0_4/`.
+edge. The active API 0.7 artifacts live in `../blocks-service-api/`; frozen API 0.6 and 0.4
+artifacts live in `../blocks-service-api-legacy-v0_6/` and
+`../blocks-service-api-legacy-v0_4/`.
 
 Run `sha256sum --check contracts/blocks-service-api-legacy-v0_2/SHA256SUMS` before
 building the generated compatibility model set.

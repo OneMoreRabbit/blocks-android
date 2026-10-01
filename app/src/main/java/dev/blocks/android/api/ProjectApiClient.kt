@@ -6,7 +6,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 
-/** Active API 0.6 transport. It intentionally exposes no retired session or map route. */
+/** Active API 0.7 transport. It intentionally exposes no retired session or map route. */
 interface ProjectTransport {
     fun listProjects(identityToken: String, tenantId: String, status: String): ApiResponse
     fun createProject(
@@ -114,11 +114,28 @@ interface ProjectTransport {
     ): ApiResponse = throw UnsupportedOperationException("API 0.6 navigation aliases are unavailable")
     fun resolveNavigationAlias(identityToken: String, tenantId: String, body: String): ApiResponse =
         throw UnsupportedOperationException("API 0.6 navigation aliases are unavailable")
+    fun projectOrder(identityToken: String, tenantId: String): ApiResponse =
+        throw UnsupportedOperationException("API 0.7 Project order is unavailable")
+    fun reorderProjects(identityToken: String, tenantId: String, body: String): ApiResponse =
+        throw UnsupportedOperationException("API 0.7 Project ordering is unavailable")
+    fun linkOrder(identityToken: String, tenantId: String, projectId: String): ApiResponse =
+        throw UnsupportedOperationException("API 0.7 Link order is unavailable")
+    fun reorderLinks(identityToken: String, tenantId: String, projectId: String, body: String): ApiResponse =
+        throw UnsupportedOperationException("API 0.7 Link ordering is unavailable")
+    fun parkingTombstones(identityToken: String, tenantId: String, projectId: String): ApiResponse =
+        throw UnsupportedOperationException("API 0.7 Park tombstones are unavailable")
+    fun deleteParking(
+        identityToken: String,
+        tenantId: String,
+        projectId: String,
+        parkingId: String,
+        body: String,
+    ): ApiResponse = throw UnsupportedOperationException("API 0.7 Park deletion is unavailable")
 }
 
 class ProjectApiClient(
     private val baseUri: URI,
-    private val clientVersion: String = "0.6",
+    private val clientVersion: String = "0.7",
     private val httpClient: OkHttpClient = OkHttpClient(),
 ) : ProjectTransport {
     override fun listProjects(identityToken: String, tenantId: String, status: String) = request(
@@ -306,6 +323,7 @@ class ProjectApiClient(
         itemPath(tenantId, projectId, "links"),
         identityToken,
         body,
+        mapOf(API_VERSION_HEADER to API_VERSION_07),
     )
 
     override fun readLink(identityToken: String, tenantId: String, projectId: String, itemId: String) = request(
@@ -321,7 +339,18 @@ class ProjectApiClient(
         itemId: String,
         rowVersion: Int,
         body: String,
-    ) = itemMutation("PATCH", "links", null, identityToken, tenantId, projectId, itemId, rowVersion, body)
+    ) = itemMutation(
+        "PATCH",
+        "links",
+        null,
+        identityToken,
+        tenantId,
+        projectId,
+        itemId,
+        rowVersion,
+        body,
+        mapOf(API_VERSION_HEADER to API_VERSION_07),
+    )
 
     override fun deleteLink(
         identityToken: String,
@@ -351,6 +380,51 @@ class ProjectApiClient(
         body,
     )
 
+    override fun projectOrder(identityToken: String, tenantId: String) = request(
+        "GET",
+        projectOrderPath(tenantId),
+        identityToken,
+    )
+
+    override fun reorderProjects(identityToken: String, tenantId: String, body: String) = request(
+        "PUT",
+        projectOrderPath(tenantId),
+        identityToken,
+        body,
+    )
+
+    override fun linkOrder(identityToken: String, tenantId: String, projectId: String) = request(
+        "GET",
+        "${projectPath(tenantId, projectId)}/interaction/link-order",
+        identityToken,
+    )
+
+    override fun reorderLinks(identityToken: String, tenantId: String, projectId: String, body: String) = request(
+        "PUT",
+        "${projectPath(tenantId, projectId)}/interaction/link-order",
+        identityToken,
+        body,
+    )
+
+    override fun parkingTombstones(identityToken: String, tenantId: String, projectId: String) = request(
+        "GET",
+        "${projectPath(tenantId, projectId)}/interaction/parking-tombstones",
+        identityToken,
+    )
+
+    override fun deleteParking(
+        identityToken: String,
+        tenantId: String,
+        projectId: String,
+        parkingId: String,
+        body: String,
+    ) = request(
+        "POST",
+        "${projectPath(tenantId, projectId)}/parking/${encoded(parkingId)}/delete",
+        identityToken,
+        body,
+    )
+
     private fun itemMutation(
         method: String,
         kind: String,
@@ -361,6 +435,7 @@ class ProjectApiClient(
         itemId: String,
         rowVersion: Int,
         body: String,
+        extraHeaders: Map<String, String> = emptyMap(),
     ): ApiResponse {
         val suffix = action?.let { "/$it" }.orEmpty()
         return request(
@@ -368,7 +443,7 @@ class ProjectApiClient(
             "${itemPath(tenantId, projectId, kind)}/${encoded(itemId)}$suffix",
             identityToken,
             body,
-            mapOf("If-Match" to rowVersion.toString()),
+            mapOf("If-Match" to rowVersion.toString()) + extraHeaders,
         )
     }
 
@@ -387,6 +462,9 @@ class ProjectApiClient(
 
     private fun projectPath(tenantId: String, projectId: String) =
         "/v1/tenants/${encoded(tenantId)}/projects/${encoded(projectId)}"
+
+    private fun projectOrderPath(tenantId: String) =
+        "/v1/tenants/${encoded(tenantId)}/interaction/project-order"
 
     private fun itemPath(tenantId: String, projectId: String, kind: String) =
         "${projectPath(tenantId, projectId)}/items/$kind"
@@ -427,6 +505,8 @@ class ProjectApiClient(
         java.net.URLEncoder.encode(value, Charsets.UTF_8.name()).replace("+", "%20")
 
     private companion object {
+        const val API_VERSION_HEADER = "X-Blocks-API-Version"
+        const val API_VERSION_07 = "0.7"
         val METHODS_REQUIRING_BODY = setOf("POST", "PUT", "PATCH")
     }
 }

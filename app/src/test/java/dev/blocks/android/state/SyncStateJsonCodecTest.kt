@@ -35,10 +35,39 @@ import dev.blocks.android.tag.OpaqueTagToken
 import dev.blocks.android.tag.TagActivationMedium
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SyncStateStorageCodecTest {
+    @Test
+    fun persistedInteractionWithoutPreparationMarkerRemainsNeverSent() {
+        val operation = InteractionMutation(
+            operationId = "50000000-0000-4000-8000-000000000001",
+            type = InteractionMutationType.REORDER_PROJECTS,
+            aggregateId = "40000000-0000-4000-8000-000000000001",
+            orderedClientIds = emptyList(),
+            baseVersion = 7,
+            createdAt = "2026-10-01T10:00:00Z",
+            preparedForDelivery = true,
+        )
+        val state = TenantSyncState(
+            projectCache = ProjectCacheState(interactionOperations = listOf(operation)),
+        )
+        val encoded = SyncStateRowCodec().encode(state)
+        val releasedRows = encoded.copy(
+            interactionOperations = encoded.interactionOperations.map {
+                it.replace(",\"preparedForDelivery\":true", "")
+            },
+        )
+
+        val migrated = SyncStateRowCodec().decode(releasedRows)
+
+        assertFalse(migrated.projectCache.interactionOperations.single().preparedForDelivery)
+        assertEquals(operation.operationId, migrated.projectCache.interactionOperations.single().operationId)
+        assertEquals(7, migrated.projectCache.interactionOperations.single().baseVersion)
+    }
+
     @Test
     fun schemaTenAddsNameOrderingWithoutTrustingAMissingEnumField() {
         val rows = SyncStateRowCodec().encode(TenantSyncState()).copy(
