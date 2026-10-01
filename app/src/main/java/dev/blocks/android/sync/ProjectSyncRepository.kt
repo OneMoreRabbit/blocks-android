@@ -2728,6 +2728,16 @@ class ProjectSyncRepository(
                     }
             }
         }
+        if (matching != null) {
+            cache = cache.copy(
+                interactionOperations = cache.interactionOperations.filterNot {
+                    it.operationId == matching.operationId
+                },
+                retiredInteractionOperationIds = (
+                    cache.retiredInteractionOperationIds + matching.operationId
+                    ).distinct(),
+            )
+        }
         if (authoritative.projectId == null) {
             val localIds = authoritative.orderedClientIds.mapNotNull { cache.projectIdForClientOrNull(it) }
             if (localIds.size != authoritative.orderedClientIds.size) {
@@ -2756,16 +2766,6 @@ class ProjectSyncRepository(
                     updatedAt = now(),
                     aggregateId = authoritative.aggregateId,
                 ),
-            )
-        }
-        if (matching != null) {
-            cache = cache.copy(
-                interactionOperations = cache.interactionOperations.filterNot {
-                    it.operationId == matching.operationId
-                },
-                retiredInteractionOperationIds = (
-                    cache.retiredInteractionOperationIds + matching.operationId
-                    ).distinct(),
             )
         }
         return copy(projectCache = cache).reapplyPendingInteractionProjection()

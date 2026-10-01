@@ -18,6 +18,8 @@ import dev.blocks.android.project.InteractionMutation
 import dev.blocks.android.project.LinkOrderState
 import dev.blocks.android.project.ParkingTombstone
 import dev.blocks.android.project.ProjectCacheState
+import dev.blocks.android.project.ProjectItemAcknowledgement
+import dev.blocks.android.project.ProjectItemMutation
 import dev.blocks.android.project.ProjectLifecycle
 import dev.blocks.android.project.ProjectNotes
 import dev.blocks.android.project.ProjectPage
@@ -197,6 +199,55 @@ class Api07InteractionSyncTest {
     }
 
     @Test
+    fun acceptedOrderWithUnknownProjectRetiresOnceThenHydratesAcrossRestart() {
+        val initial = state().let { state ->
+            state.copy(
+                projectCache = state.projectCache.copy(
+                    projectOrder = dev.blocks.android.project.ProjectOrderState(
+                        listOf(PROJECT_A, PROJECT_B),
+                        1,
+                        NOW,
+                        PROJECT_AGGREGATE,
+                    ),
+                ),
+            )
+        }
+        val store = MemoryStore().apply { saveSyncState(TENANT_A, initial) }
+        val farEnd = FarEnd().apply {
+            projects += project(PROJECT_C, CLIENT_C, TENANT_A)
+            projectOrder = AuthoritativeOrder(
+                PROJECT_AGGREGATE,
+                null,
+                listOf(CLIENT_A, CLIENT_B, CLIENT_C),
+                2,
+                REMOTE_ORDER,
+            )
+            maxProjectOrderCallsPerOperation = 2
+        }
+        var repository = repository(store, farEnd.service())
+        repository.activate(SESSION_A)
+        repository.reorderActiveProjects(SESSION_A, listOf(PROJECT_B, PROJECT_A), OP_PROJECT_ORDER)
+
+        repository.backgroundSync(SESSION_A)
+
+        val awaitingHydration = store.loadSyncState(TENANT_A).projectCache
+        assertEquals(1, farEnd.projectReorders.count { it.operationId == OP_PROJECT_ORDER })
+        assertTrue(awaitingHydration.interactionOperations.isEmpty())
+        assertTrue(OP_PROJECT_ORDER in awaitingHydration.retiredInteractionOperationIds)
+        assertFalse(awaitingHydration.activeProjectsLoaded)
+
+        repository.deactivate(SESSION_A)
+        repository = repository(store, farEnd.service())
+        repository.activate(SESSION_A)
+        repository.backgroundSync(SESSION_A)
+
+        val converged = store.loadSyncState(TENANT_A).projectCache
+        assertEquals(1, farEnd.projectReorders.count { it.operationId == OP_PROJECT_ORDER })
+        assertEquals(listOf(PROJECT_B, PROJECT_A, PROJECT_C), converged.projectOrder.orderedProjectIds)
+        assertTrue(converged.activeProjects.any { it.id == PROJECT_C })
+    }
+
+    @Test
     fun lifecycleTriggeredOrdersPrepareAfterServiceMembershipVersionChanges() {
         val initial = state().copy(
             projectCache = state().projectCache.copy(
@@ -223,6 +274,47 @@ class Api07InteractionSyncTest {
 
         assertEquals(listOf(2, 4, 6), farEnd.projectReorders.map { it.baseVersion })
         assertEquals(listOf(CLIENT_B, CLIENT_A, CLIENT_C), farEnd.projectOrder.orderedClientIds)
+        assertTrue(repository.snapshot(SESSION_A).cache.interactionOperations.isEmpty())
+    }
+
+    @Test
+    fun linkCreateAndDeleteOrdersPrepareAfterMembershipVersionChanges() {
+        val initial = state().let { state ->
+            state.copy(
+                projectCache = state.projectCache.copy(
+                    linkOrders = listOf(
+                        LinkOrderState(PROJECT_A, listOf(LINK_A, LINK_B), 1, NOW, LINK_AGGREGATE_A),
+                    ),
+                ),
+            )
+        }
+        val store = MemoryStore().apply { saveSyncState(TENANT_A, initial) }
+        val farEnd = FarEnd()
+        val repository = repository(store, farEnd.service())
+        repository.activate(SESSION_A)
+
+        repository.addResourceLink(
+            SESSION_A,
+            PROJECT_A,
+            "third",
+            "https://example.com/third",
+            OP_CREATE_LINK,
+            LINK_C,
+        )
+        repository.backgroundSync(SESSION_A)
+        repository.deleteResourceLink(SESSION_A, LINK_C, OP_DELETE_LINK)
+        repository.backgroundSync(SESSION_A)
+
+        assertEquals(listOf(2, 4), farEnd.linkReorders.map { it.baseVersion })
+        assertEquals(listOf(LINK_A, LINK_B), farEnd.linkOrders.getValue(PROJECT_A).orderedClientIds)
+        assertEquals(
+            listOf(
+                listOf(LINK_A, LINK_B, LINK_C),
+                listOf(LINK_A, LINK_B),
+            ),
+            farEnd.linkReorders.map { it.orderedClientIds },
+        )
+        assertTrue(repository.snapshot(SESSION_A).cache.itemOperations.isEmpty())
         assertTrue(repository.snapshot(SESSION_A).cache.interactionOperations.isEmpty())
     }
 
@@ -456,6 +548,41 @@ class Api07InteractionSyncTest {
     }
 
     @Test
+    fun preparedEnvelopeReplaysUnchangedAfterRestartWhenAggregateCannotRetireIt() {
+        val store = MemoryStore().apply { saveSyncState(TENANT_A, state()) }
+        val farEnd = FarEnd().apply {
+            loseNextProjectOrderResponse = true
+            hideAcceptedProjectOperationFromAggregate = true
+        }
+        var repository = repository(store, farEnd.service())
+        repository.activate(SESSION_A)
+        repository.reorderActiveProjects(SESSION_A, listOf(PROJECT_B, PROJECT_A), OP_PROJECT_ORDER)
+
+        repository.backgroundSync(SESSION_A)
+        val prepared = store.loadSyncState(TENANT_A).projectCache.interactionOperations.single()
+        assertTrue(prepared.preparedForDelivery)
+        assertTrue(prepared.deliveryUncertain)
+
+        repository.deactivate(SESSION_A)
+        repository = repository(store, farEnd.service())
+        repository.activate(SESSION_A)
+        repository.backgroundSync(SESSION_A)
+
+        assertEquals(2, farEnd.projectReorders.size)
+        assertEquals(
+            farEnd.projectReorders.first().copy(deliveryUncertain = false),
+            farEnd.projectReorders.last().copy(deliveryUncertain = false),
+        )
+        assertEquals(
+            prepared.copy(deliveryUncertain = false),
+            farEnd.projectReorders.last().copy(deliveryUncertain = false),
+        )
+        val converged = store.loadSyncState(TENANT_A).projectCache
+        assertTrue(converged.interactionOperations.isEmpty())
+        assertTrue(OP_PROJECT_ORDER in converged.retiredInteractionOperationIds)
+    }
+
+    @Test
     fun staleOrderConflictKeepsTheLocalProjectionAndCompleteEnvelopeAcrossRestart() {
         val store = MemoryStore().apply { saveSyncState(TENANT_A, state()) }
         val farEnd = FarEnd().apply { conflictNextProjectOrder = true }
@@ -666,6 +793,9 @@ class Api07InteractionSyncTest {
             projectStatic(PROJECT_B, CLIENT_B),
         )
         val parkingRecords = mutableMapOf(PROJECT_A to mutableListOf(parkingStatic()))
+        val resourceLinks = mutableMapOf(
+            PROJECT_A to mutableListOf(linkStatic(LINK_A), linkStatic(LINK_B)),
+        )
         var projectOrder = AuthoritativeOrder(PROJECT_AGGREGATE, null, listOf(CLIENT_A, CLIENT_B), 1, null)
         val linkOrders = mutableMapOf(
             PROJECT_A to AuthoritativeOrder(LINK_AGGREGATE_A, PROJECT_A, listOf(LINK_A, LINK_B), 1, null),
@@ -681,7 +811,23 @@ class Api07InteractionSyncTest {
         val projectReorders = mutableListOf<InteractionMutation>()
         val linkReorders = mutableListOf<InteractionMutation>()
         val parkDeletes = mutableListOf<InteractionMutation>()
+        val createdLinks = mutableListOf<ProjectItemMutation>()
+        val deletedLinks = mutableListOf<ProjectItemMutation>()
         var loseNextProjectOrderResponse = false
+        var hideAcceptedProjectOperationFromAggregate = false
+        var maxProjectOrderCallsPerOperation = Int.MAX_VALUE
+        private val projectOrderReceipts = mutableMapOf<
+            String,
+            Pair<InteractionMutation, InteractionAcknowledgement.Order>,
+            >()
+        private val linkOrderReceipts = mutableMapOf<
+            String,
+            Pair<InteractionMutation, InteractionAcknowledgement.Order>,
+            >()
+        private val parkDeleteReceipts = mutableMapOf<
+            String,
+            Pair<InteractionMutation, InteractionAcknowledgement.Parking>,
+            >()
         var conflictNextProjectOrder = false
         var blockFirstProjectReorder = false
         val projectReorderEntered = CountDownLatch(1)
@@ -773,6 +919,46 @@ class Api07InteractionSyncTest {
                         rowVersion = 1,
                     ).also { parkingRecords.getOrPut(projectId, ::mutableListOf).add(it) }
                 }
+                "createLink" -> {
+                    val operation = args[1] as ProjectItemMutation
+                    createdLinks += operation
+                    val link = ProjectResourceLink(
+                        operation.targetId,
+                        operation.projectId,
+                        requireNotNull(operation.linkTitle),
+                        requireNotNull(operation.linkUri),
+                        NOW,
+                        NOW,
+                        rowVersion = 1,
+                        lastOperationId = operation.operationId,
+                    )
+                    resourceLinks.getOrPut(operation.projectId, ::mutableListOf).add(link)
+                    val current = linkOrders.getValue(operation.projectId)
+                    linkOrders[operation.projectId] = current.copy(
+                        orderedClientIds = current.orderedClientIds + operation.targetId,
+                        version = current.version + 1,
+                    )
+                    ProjectItemAcknowledgement.Link(operation.operationId, link)
+                }
+                "deleteLink" -> {
+                    val operation = args[1] as ProjectItemMutation
+                    deletedLinks += operation
+                    val links = resourceLinks.getValue(operation.projectId)
+                    val index = links.indexOfFirst { it.id == operation.targetId }
+                    val deleted = links[index].copy(
+                        updatedAt = LATER,
+                        rowVersion = links[index].rowVersion + 1,
+                        deletedAt = LATER,
+                        lastOperationId = operation.operationId,
+                    )
+                    links[index] = deleted
+                    val current = linkOrders.getValue(operation.projectId)
+                    linkOrders[operation.projectId] = current.copy(
+                        orderedClientIds = current.orderedClientIds - operation.targetId,
+                        version = current.version + 1,
+                    )
+                    ProjectItemAcknowledgement.Link(operation.operationId, deleted)
+                }
                 "changes" -> if (changes.isEmpty()) ChangePage(emptyList(), null, false) else changes.removeFirst()
                 "projectOrder" -> projectOrder
                 "linkOrder" -> linkOrders.getValue(args[1] as String)
@@ -789,35 +975,51 @@ class Api07InteractionSyncTest {
                 "reorderProjects" -> {
                     val operation = args[1] as InteractionMutation
                     projectReorders += operation
+                    if (projectReorders.count { it.operationId == operation.operationId } > maxProjectOrderCallsPerOperation) {
+                        throw AssertionError("Project order operation replay exceeded its bounded request count")
+                    }
                     if (blockFirstProjectReorder && projectReorders.size == 1) {
                         projectReorderEntered.countDown()
                         check(releaseProjectReorder.await(5, TimeUnit.SECONDS))
                     }
-                    if (conflictNextProjectOrder) {
-                        conflictNextProjectOrder = false
-                        throw ServiceException(409, ApiError(ApiErrorCode.CONFLICT, "stale order"))
+                    val receipt = projectOrderReceipts[operation.operationId]
+                    if (receipt != null) {
+                        if (receipt.first.copy(deliveryUncertain = false) != operation.copy(deliveryUncertain = false)) {
+                            throw ServiceException(409, ApiError(ApiErrorCode.CONFLICT, "operation identity reused"))
+                        }
+                        receipt.second
+                    } else {
+                        if (conflictNextProjectOrder) {
+                            conflictNextProjectOrder = false
+                            throw ServiceException(409, ApiError(ApiErrorCode.CONFLICT, "stale order"))
+                        }
+                        if (operation.aggregateId != projectOrder.aggregateId || operation.baseVersion != projectOrder.version) {
+                            throw ServiceException(409, ApiError(ApiErrorCode.CONFLICT, "stale order"))
+                        }
+                        projectOrder = AuthoritativeOrder(
+                            operation.aggregateId,
+                            null,
+                            operation.orderedClientIds,
+                            projectOrder.version + 1,
+                            operation.operationId,
+                        )
+                        val acknowledgement = InteractionAcknowledgement.Order(
+                            operation.operationId,
+                            operation.aggregateId,
+                            projectOrder.version,
+                            null,
+                            operation.orderedClientIds,
+                        )
+                        projectOrderReceipts[operation.operationId] = operation to acknowledgement
+                        if (loseNextProjectOrderResponse) {
+                            loseNextProjectOrderResponse = false
+                            if (hideAcceptedProjectOperationFromAggregate) {
+                                projectOrder = projectOrder.copy(operationId = REMOTE_ORDER)
+                            }
+                            throw ServiceException(503, ApiError(ApiErrorCode.UNKNOWN, "response lost"))
+                        }
+                        acknowledgement
                     }
-                    if (operation.aggregateId != projectOrder.aggregateId || operation.baseVersion != projectOrder.version) {
-                        throw ServiceException(409, ApiError(ApiErrorCode.CONFLICT, "stale order"))
-                    }
-                    projectOrder = AuthoritativeOrder(
-                        operation.aggregateId,
-                        null,
-                        operation.orderedClientIds,
-                        projectOrder.version + 1,
-                        operation.operationId,
-                    )
-                    if (loseNextProjectOrderResponse) {
-                        loseNextProjectOrderResponse = false
-                        throw ServiceException(503, ApiError(ApiErrorCode.UNKNOWN, "response lost"))
-                    }
-                    InteractionAcknowledgement.Order(
-                        operation.operationId,
-                        operation.aggregateId,
-                        projectOrder.version,
-                        null,
-                        operation.orderedClientIds,
-                    )
                 }
                 "reorderLinks" -> {
                     val operation = args[1] as InteractionMutation
@@ -826,52 +1028,68 @@ class Api07InteractionSyncTest {
                         linkReorderEntered.countDown()
                         check(releaseLinkReorder.await(5, TimeUnit.SECONDS))
                     }
-                    val projectId = requireNotNull(operation.projectId)
-                    if (
-                        operation.aggregateId != linkOrders.getValue(projectId).aggregateId ||
-                        operation.baseVersion != linkOrders.getValue(projectId).version
-                    ) throw ServiceException(409, ApiError(ApiErrorCode.CONFLICT, "stale link order"))
-                    val next = AuthoritativeOrder(
-                        operation.aggregateId,
-                        projectId,
-                        operation.orderedClientIds,
-                        linkOrders.getValue(projectId).version + 1,
-                        operation.operationId,
-                    )
-                    linkOrders[projectId] = next
-                    InteractionAcknowledgement.Order(
-                        operation.operationId,
-                        operation.aggregateId,
-                        next.version,
-                        projectId,
-                        operation.orderedClientIds,
-                    )
+                    val receipt = linkOrderReceipts[operation.operationId]
+                    if (receipt != null) {
+                        if (receipt.first.copy(deliveryUncertain = false) != operation.copy(deliveryUncertain = false)) {
+                            throw ServiceException(409, ApiError(ApiErrorCode.CONFLICT, "operation identity reused"))
+                        }
+                        receipt.second
+                    } else {
+                        val projectId = requireNotNull(operation.projectId)
+                        if (
+                            operation.aggregateId != linkOrders.getValue(projectId).aggregateId ||
+                            operation.baseVersion != linkOrders.getValue(projectId).version
+                        ) throw ServiceException(409, ApiError(ApiErrorCode.CONFLICT, "stale link order"))
+                        val next = AuthoritativeOrder(
+                            operation.aggregateId,
+                            projectId,
+                            operation.orderedClientIds,
+                            linkOrders.getValue(projectId).version + 1,
+                            operation.operationId,
+                        )
+                        linkOrders[projectId] = next
+                        InteractionAcknowledgement.Order(
+                            operation.operationId,
+                            operation.aggregateId,
+                            next.version,
+                            projectId,
+                            operation.orderedClientIds,
+                        ).also { linkOrderReceipts[operation.operationId] = operation to it }
+                    }
                 }
                 "deleteParking" -> {
                     val operation = args[1] as InteractionMutation
                     parkDeletes += operation
-                    val authoritative = parkingRecords[requireNotNull(operation.projectId)]
-                        .orEmpty().single { it.id == operation.targetId }
-                    if (operation.baseVersion != authoritative.rowVersion) {
-                        throw ServiceException(409, ApiError(ApiErrorCode.CONFLICT, "stale Park"))
+                    val receipt = parkDeleteReceipts[operation.operationId]
+                    if (receipt != null) {
+                        if (receipt.first.copy(deliveryUncertain = false) != operation.copy(deliveryUncertain = false)) {
+                            throw ServiceException(409, ApiError(ApiErrorCode.CONFLICT, "operation identity reused"))
+                        }
+                        receipt.second
+                    } else {
+                        val authoritative = parkingRecords[requireNotNull(operation.projectId)]
+                            .orEmpty().single { it.id == operation.targetId }
+                        if (operation.baseVersion != authoritative.rowVersion) {
+                            throw ServiceException(409, ApiError(ApiErrorCode.CONFLICT, "stale Park"))
+                        }
+                        val tombstone = ParkingTombstone(
+                            requireNotNull(operation.targetId),
+                            requireNotNull(operation.projectId),
+                            operation.baseVersion + 1,
+                            LATER,
+                            operation.operationId,
+                        )
+                        tombstones[requireNotNull(operation.projectId)] = listOf(tombstone)
+                        InteractionAcknowledgement.Parking(
+                            operation.operationId,
+                            operation.aggregateId,
+                            tombstone.version,
+                            tombstone.projectId,
+                            tombstone.parkingId,
+                            tombstone.deletedAt,
+                            true,
+                        ).also { parkDeleteReceipts[operation.operationId] = operation to it }
                     }
-                    val tombstone = ParkingTombstone(
-                        requireNotNull(operation.targetId),
-                        requireNotNull(operation.projectId),
-                        operation.baseVersion + 1,
-                        LATER,
-                        operation.operationId,
-                    )
-                    tombstones[requireNotNull(operation.projectId)] = listOf(tombstone)
-                    InteractionAcknowledgement.Parking(
-                        operation.operationId,
-                        operation.aggregateId,
-                        tombstone.version,
-                        tombstone.projectId,
-                        tombstone.parkingId,
-                        tombstone.deletedAt,
-                        true,
-                    )
                 }
                 else -> error("Unexpected Service call ${method.name}")
             }
@@ -887,6 +1105,10 @@ class Api07InteractionSyncTest {
             private fun parkingStatic() = ProjectParking(
                 PARK_A, PROJECT_A, "authored location", "authored next action", "authored reminder",
                 USER_A, NOW, NOW, PARK_A, rowVersion = 1,
+            )
+
+            private fun linkStatic(id: String) = ProjectResourceLink(
+                id, PROJECT_A, id.takeLast(4), "https://example.com", NOW, NOW, rowVersion = 1,
             )
         }
     }
@@ -928,6 +1150,8 @@ class Api07InteractionSyncTest {
         const val OP_ARCHIVE = "50000000-0000-4000-8000-00000000000c"
         const val OP_REOPEN = "50000000-0000-4000-8000-00000000000d"
         const val OP_CREATE = "50000000-0000-4000-8000-00000000000e"
+        const val OP_CREATE_LINK = "50000000-0000-4000-8000-00000000000f"
+        const val OP_DELETE_LINK = "50000000-0000-4000-8000-000000000010"
         const val FOREIGN_CLIENT = "f0000000-0000-4000-8000-000000000001"
         const val NOW = "2026-10-01T10:00:00Z"
         const val LATER = "2026-10-01T10:01:00Z"

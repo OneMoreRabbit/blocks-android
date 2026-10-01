@@ -4,7 +4,11 @@ import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import dev.blocks.android.api.ApiError
+import dev.blocks.android.api.ApiErrorCode
+import dev.blocks.android.api.ServiceException
 import dev.blocks.android.mvp.FormDrafts
+import dev.blocks.android.mvp.ChangePage
 import dev.blocks.android.mvp.NoteItemDraft
 import dev.blocks.android.mvp.NoOpDraftStore
 import dev.blocks.android.mvp.ParkingDraft
@@ -12,6 +16,8 @@ import dev.blocks.android.mvp.ProjectResourceLinkDraft
 import dev.blocks.android.mvp.Session
 import dev.blocks.android.mvp.TenantSyncState
 import dev.blocks.android.project.ProjectCacheState
+import dev.blocks.android.project.AuthoritativeOrder
+import dev.blocks.android.project.InteractionAcknowledgement
 import dev.blocks.android.project.ProjectCover
 import dev.blocks.android.project.DashboardOrderMode
 import dev.blocks.android.project.InteractionMutation
@@ -49,6 +55,7 @@ import dev.blocks.android.tag.ProjectLinkIdentity
 import dev.blocks.android.tag.TagActivationMedium
 import java.security.KeyStore
 import java.security.MessageDigest
+import java.lang.reflect.Proxy
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -675,6 +682,203 @@ class AndroidNormalizedSyncStateStoreTest {
         assertEquals(updated, AndroidSyncStateStore(context).loadSyncState(TENANT))
     }
 
+    @Test
+    fun realDatabaseRestartsAfterProjectAndParkRemapBeforeDeliveringDeleteOnce() {
+        val base = state(TENANT).withoutCommands()
+        store.saveSyncState(TENANT, base)
+        val session = Session(TENANT, "test-token")
+        val farEnd = PersistentRemapFarEnd()
+        var repository = ProjectSyncRepository(
+            farEnd.service(),
+            NoOpLegacyQueueReplay,
+            NoOpDraftStore,
+            AndroidSyncStateStore(context),
+            now = { NOW },
+            coverMediaStore = InMemoryProjectCoverMediaStore(),
+        )
+        repository.activate(session)
+        repository.queueCreateProject(session, "Offline project", OP_CREATE_PROJECT, LOCAL_PROJECT)
+        repository.queueParking(
+            session,
+            LOCAL_PROJECT,
+            ParkingDraft("Local Park", "Continue", "Keep this"),
+            operationId = OP_ADD_PARKING,
+            clientId = LOCAL_PARKING,
+        )
+        repository.deleteParking(session, LOCAL_PARKING, OP_DELETE_PARKING)
+
+        repository.backgroundSync(session)
+
+        val interrupted = AndroidSyncStateStore(context).loadSyncState(TENANT).projectCache
+        assertTrue(interrupted.commands.isEmpty())
+        assertTrue(ProjectIdentityMapping(LOCAL_PROJECT, SERVER_PROJECT) in interrupted.projectIdMappings)
+        assertTrue(interrupted.parkingRecords.any {
+            it.id == SERVER_PARKING && it.clientId == LOCAL_PARKING && it.projectId == SERVER_PROJECT
+        })
+        val pendingDelete = interrupted.interactionOperations.single {
+            it.operationId == OP_DELETE_PARKING
+        }
+        assertEquals(SERVER_PROJECT, pendingDelete.projectId)
+        assertEquals(SERVER_PARKING, pendingDelete.targetId)
+        assertEquals(SERVER_PARKING, pendingDelete.aggregateId)
+        assertEquals(0, farEnd.deleteCalls)
+        assertEquals(base.projectCache.noteItems, interrupted.noteItems)
+        assertEquals(base.projectCache.resourceLinks, interrupted.resourceLinks.filter { it.projectId == PROJECT })
+        assertEquals(
+            base.projectCache.parkingRecords,
+            interrupted.parkingRecords.filter { it.projectId == PROJECT },
+        )
+
+        repository.deactivate(session)
+        farEnd.parkingReadsOffline = false
+        repository = ProjectSyncRepository(
+            farEnd.service(),
+            NoOpLegacyQueueReplay,
+            NoOpDraftStore,
+            AndroidSyncStateStore(context),
+            now = { NOW },
+            coverMediaStore = InMemoryProjectCoverMediaStore(),
+        )
+        repository.activate(session)
+        repository.backgroundSync(session)
+
+        val converged = AndroidSyncStateStore(context).loadSyncState(TENANT).projectCache
+        assertEquals(1, farEnd.deleteCalls)
+        assertTrue(converged.interactionOperations.none { it.operationId == OP_DELETE_PARKING })
+        assertTrue(OP_DELETE_PARKING in converged.retiredInteractionOperationIds)
+        assertTrue(converged.parkingTombstones.any {
+            it.projectId == SERVER_PROJECT &&
+                it.parkingId == SERVER_PARKING &&
+                it.lastOperationId == OP_DELETE_PARKING
+        })
+        assertTrue(converged.parkingRecords.any {
+            it.id == SERVER_PARKING && it.location == "Local Park"
+        })
+        assertEquals(base.projectCache.noteItems, converged.noteItems)
+        assertEquals(base.projectCache.resourceLinks, converged.resourceLinks.filter { it.projectId == PROJECT })
+        assertEquals(
+            base.projectCache.parkingRecords,
+            converged.parkingRecords.filter { it.projectId == PROJECT },
+        )
+    }
+
+    private class PersistentRemapFarEnd {
+        var parkingReadsOffline = true
+        var deleteCalls = 0
+        private val existing = ProjectSummary(
+            PROJECT,
+            TENANT,
+            "Workshop shelves",
+            ProjectLifecycle.ACTIVE,
+            3,
+            NOW,
+            NOW,
+            clientId = PROJECT,
+        )
+        private val projects = mutableListOf(existing)
+        private val parking = mutableMapOf<String, MutableList<ProjectParking>>()
+        private val tombstones = mutableMapOf<String, List<ParkingTombstone>>()
+        private var projectOrder = AuthoritativeOrder(PROJECT_ORDER_AGGREGATE, null, listOf(PROJECT), 1, null)
+        private val linkOrders = mutableMapOf(
+            PROJECT to AuthoritativeOrder(LINK_ORDER_AGGREGATE, PROJECT, listOf(LINK_ID), 1, null),
+        )
+
+        @Suppress("UNCHECKED_CAST")
+        fun service(): ProjectService = Proxy.newProxyInstance(
+            ProjectService::class.java.classLoader,
+            arrayOf(ProjectService::class.java),
+        ) { _, method, arguments ->
+            val args = arguments.orEmpty()
+            when (method.name) {
+                "createProject" -> {
+                    val clientId = requireNotNull(args[2] as String?)
+                    ProjectSummary(
+                        SERVER_PROJECT,
+                        TENANT,
+                        args[1] as String,
+                        ProjectLifecycle.ACTIVE,
+                        1,
+                        NOW,
+                        NOW,
+                        clientId = clientId,
+                    ).also { created ->
+                        projects += created
+                        linkOrders[created.id] = AuthoritativeOrder(
+                            SERVER_LINK_ORDER_AGGREGATE,
+                            created.id,
+                            emptyList(),
+                            1,
+                            null,
+                        )
+                        projectOrder = projectOrder.copy(
+                            orderedClientIds = projectOrder.orderedClientIds + clientId,
+                            version = projectOrder.version + 1,
+                        )
+                    }
+                }
+                "addParking" -> {
+                    val projectId = args[1] as String
+                    val draft = args[2] as ParkingDraft
+                    val clientId = requireNotNull(args[4] as String?)
+                    ProjectParking(
+                        SERVER_PARKING,
+                        projectId,
+                        draft.location,
+                        draft.nextAction,
+                        draft.mustNotForget,
+                        "service-user",
+                        NOW,
+                        NOW,
+                        clientId,
+                        rowVersion = 1,
+                    ).also { parking.getOrPut(projectId, ::mutableListOf).add(it) }
+                }
+                "changes" -> ChangePage(emptyList(), null, false)
+                "projectOrder" -> projectOrder
+                "linkOrder" -> linkOrders.getValue(args[1] as String)
+                "parkingTombstones" -> {
+                    if (parkingReadsOffline) {
+                        throw ServiceException(503, ApiError(ApiErrorCode.UNKNOWN, "offline at acknowledgement boundary"))
+                    }
+                    tombstones[args[1] as String].orEmpty()
+                }
+                "parking" -> parking[args[1] as String].orEmpty()
+                "deleteParking" -> {
+                    val operation = args[1] as InteractionMutation
+                    deleteCalls += 1
+                    check(operation.projectId == SERVER_PROJECT)
+                    check(operation.targetId == SERVER_PARKING)
+                    check(operation.aggregateId == SERVER_PARKING)
+                    val tombstone = ParkingTombstone(
+                        SERVER_PARKING,
+                        SERVER_PROJECT,
+                        2,
+                        NOW,
+                        operation.operationId,
+                    )
+                    tombstones[SERVER_PROJECT] = listOf(tombstone)
+                    InteractionAcknowledgement.Parking(
+                        operation.operationId,
+                        operation.aggregateId,
+                        tombstone.version,
+                        tombstone.projectId,
+                        tombstone.parkingId,
+                        tombstone.deletedAt,
+                        true,
+                    )
+                }
+                "attachNavigationKey" -> args[2]
+                "listProjects" -> projects.filter { it.lifecycle == args[1] }
+                "projectPage" -> {
+                    val project = projects.single { it.id == args[1] }
+                    ProjectPage(project, ProjectNotes(project.id, "", 1, NOW), parking[project.id].orEmpty().lastOrNull())
+                }
+                "blocks" -> emptyList<Any>()
+                else -> error("Unexpected Service call ${method.name}")
+            }
+        } as ProjectService
+    }
+
     private fun state(tenantId: String, projectId: String = PROJECT): TenantSyncState {
         val project = ProjectSummary(
             id = projectId,
@@ -1053,6 +1257,16 @@ class AndroidNormalizedSyncStateStoreTest {
         const val CREATED_PARKING = "423e4567-e89b-12d3-a456-426614174075"
         const val NOTE_ID = "523e4567-e89b-42d3-a456-426614174075"
         const val LINK_ID = "623e4567-e89b-42d3-a456-426614174075"
+        const val LOCAL_PROJECT = "723e4567-e89b-42d3-a456-426614174075"
+        const val SERVER_PROJECT = "823e4567-e89b-42d3-a456-426614174075"
+        const val LOCAL_PARKING = "923e4567-e89b-42d3-a456-426614174075"
+        const val SERVER_PARKING = "a23e4567-e89b-42d3-a456-426614174075"
+        const val OP_CREATE_PROJECT = "b23e4567-e89b-42d3-a456-426614174075"
+        const val OP_ADD_PARKING = "c23e4567-e89b-42d3-a456-426614174075"
+        const val OP_DELETE_PARKING = "d23e4567-e89b-42d3-a456-426614174075"
+        const val PROJECT_ORDER_AGGREGATE = "e23e4567-e89b-42d3-a456-426614174075"
+        const val LINK_ORDER_AGGREGATE = "f23e4567-e89b-42d3-a456-426614174075"
+        const val SERVER_LINK_ORDER_AGGREGATE = "023e4567-e89b-42d3-a456-426614174075"
         const val NOW = "2026-09-15T12:00:00Z"
         val TAG_TOKEN = OpaqueTagToken.fromBytes(ByteArray(32) { (it + 41).toByte() })
     }

@@ -16,7 +16,7 @@ cd "$ROOT"
 echo 'CASE UC-04 — Interaction synchronization across upgrade, identities and concurrent work'
 echo '$ ./gradlew --no-daemon clean testDebugUnitTest lintDebug assembleDebug assembleRelease assembleDebugAndroidTest connectedDebugAndroidTest'
 ./gradlew --no-daemon clean testDebugUnitTest lintDebug assembleDebug assembleRelease assembleDebugAndroidTest connectedDebugAndroidTest
-echo 'EXPECTED: BUILD SUCCESSFUL; zero skipped tests; unknown Project hydration, version-aware preparation, Project/Link response races, Park tombstone races, canonical Park remap, restart and real SQLite/Keystore cases pass.'
+echo 'EXPECTED: BUILD SUCCESSFUL; zero skipped tests; receipt-faithful bounded replay, unknown Project hydration, version-aware Project/Link preparation, response races, Park tombstones, canonical identity remap, prepared-envelope restart replay and real SQLite/Keystore restart cases pass.'
 
 echo '$ sha256sum app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk'
 sha256sum \
@@ -26,7 +26,7 @@ sha256sum \
 echo 'EXPECTED: two SHA-256 lines identify this one local test build; no credential, tenant identifier or authored content is printed.'
 
 echo 'AUTOMATED CASE 1 — lagging Project identity and cursor progress'
-echo 'ACTUAL: the version-aware far end delivers create/order on one or several pages and a newer aggregate; Android hydrates authorized Projects, advances the cursor atomically and retains the result across restart. Foreign identities are never materialized.'
+echo 'ACTUAL: the version-aware far end delivers create/order on one or several pages and a newer aggregate; Android hydrates authorized Projects, advances the cursor atomically and retains the result across restart. A receipt-faithful exact replay is checked before stale-version rejection: the accepted operation retires after one delivery, list hydration follows, and the request bound prevents an acknowledgement loop. Foreign identities are never materialized.'
 echo 'VERDICT UC-04 case 1: pass'
 
 echo 'AUTOMATED CASE 2 — foreground work during acknowledgement'
@@ -34,11 +34,11 @@ echo 'ACTUAL: network barriers hold Project/Link acknowledgements and Park aggre
 echo 'VERDICT UC-04 case 2: pass'
 
 echo 'AUTOMATED CASE 3 — explicit delivery preparation'
-echo 'ACTUAL: never-sent lifecycle and membership-dependent orders bind to the current authoritative version after prerequisites. A persisted prepared/lost-response envelope retains its original operation identity and bytes; genuine stale edits still conflict safely.'
+echo 'ACTUAL: never-sent Project and Link create/delete membership-dependent orders bind to the current authoritative version after prerequisites. When aggregate discovery cannot retire a lost response, a process restart replays the persisted prepared envelope with the original wire fields and operation identity; exact receipt replay succeeds before version checking. Genuine stale edits still conflict safely.'
 echo 'VERDICT UC-04 case 3: pass'
 
 echo 'AUTOMATED CASE 4 — provisional Park identity reconciliation'
-echo 'ACTUAL: released-state local Park creation followed by deletion is remapped atomically to the distinct Service Park ID. The original delete operation identity and authored Park row survive acknowledgement and restart without resurrection.'
+echo 'ACTUAL: a real encrypted SQLite/Android-Keystore store starts with released-0.9.0-shaped state and local Project/Park/delete operations. Sync is interrupted after distinct canonical Project and Park acknowledgements but before delete delivery; a new repository reopens storage and delivers the remapped delete once. The original operation identity, authored Park row and unrelated Note/Link/Park rows survive without resurrection.'
 echo 'VERDICT UC-04 case 4: pass'
 
 echo 'PAUSE signed in-place 0.9.0 to 0.9.1 upgrade'
