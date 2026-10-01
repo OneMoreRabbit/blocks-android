@@ -172,17 +172,17 @@ class LocalActionPerformanceTest {
             }
 
             stabilizePerformancePhase()
-            val linkReorderTimings = (1..25).map {
+            val linkReorderTimings = (1..25).map { sample ->
                 var before = emptyList<String>()
                 scenario.onActivity { activity -> before = activity.visibleLinkOrder() }
                 measureUntilVisible(
                     scenario,
                     activate = { activity ->
-                        val move = activity.buttonsWithDescriptionPrefix("Reorder ").first { button ->
+                        val move = activity.buttonsWithDescriptionPrefix("Reorder ").firstOrNull { button ->
                             button.createAccessibilityNodeInfo().actionList.any {
                                 it.label?.toString() == "Move link later"
                             }
-                        }
+                        } ?: error("No visible Link can move later at performance sample $sample")
                         move.performAccessibilityActionNamed("Move link later")
                     },
                     visible = { activity -> activity.visibleLinkOrder() != before },
@@ -304,7 +304,8 @@ class LocalActionPerformanceTest {
             .toList()
 
     private fun Button.performAccessibilityActionNamed(label: String) {
-        val action = createAccessibilityNodeInfo().actionList.single { it.label?.toString() == label }
+        val action = createAccessibilityNodeInfo().actionList.singleOrNull { it.label?.toString() == label }
+            ?: error("Accessibility action '$label' is missing from $contentDescription")
         check(performAccessibilityAction(action.id, null))
     }
 
