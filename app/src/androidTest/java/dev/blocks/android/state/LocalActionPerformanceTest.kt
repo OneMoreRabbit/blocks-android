@@ -178,11 +178,15 @@ class LocalActionPerformanceTest {
                 measureUntilVisible(
                     scenario,
                     activate = { activity ->
-                        val move = activity.buttonsWithDescriptionPrefix("Reorder ").firstOrNull { button ->
+                        val candidates = activity.buttonsWithDescriptionPrefix("Reorder ")
+                        val move = candidates.firstOrNull { button ->
                             button.createAccessibilityNodeInfo().actionList.any {
                                 it.label?.toString() == "Move link later"
                             }
-                        } ?: error("No visible Link can move later at performance sample $sample")
+                        } ?: error(
+                            "No visible Link can move later at performance sample $sample; " +
+                                "handles=${candidates.map { it.contentDescription to it.createAccessibilityNodeInfo().actionList.map { action -> action.label } }}",
+                        )
                         move.performAccessibilityActionNamed("Move link later")
                     },
                     visible = { activity -> activity.visibleLinkOrder() != before },

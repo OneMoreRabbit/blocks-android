@@ -1126,6 +1126,17 @@ class MainActivity : ComponentActivity() {
         container.removeAllViews()
         desired.forEach { link ->
             val row = existing.getValue(link.id)
+            if (row is ViewGroup) {
+                val handleIndex = (0 until row.childCount).firstOrNull { index ->
+                    row.getChildAt(index).contentDescription?.toString()?.startsWith("Reorder ") == true
+                }
+                if (handleIndex != null) {
+                    val oldHandle = row.getChildAt(handleIndex)
+                    val params = oldHandle.layoutParams
+                    row.removeViewAt(handleIndex)
+                    row.addView(resourceLinkDragHandle(link), handleIndex, params)
+                }
+            }
             container.addView(row)
         }
         return true
