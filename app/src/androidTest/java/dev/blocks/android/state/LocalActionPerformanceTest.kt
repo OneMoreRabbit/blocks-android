@@ -192,6 +192,7 @@ class LocalActionPerformanceTest {
             stabilizePerformancePhase()
             val parkDeleteTimings = (1..25).map {
                 lateinit var deleteButton: Button
+                ensureHistoricalParkingVisible(scenario)
                 scenario.onActivity { activity ->
                     deleteButton = activity.historicalParkingDeleteButton()
                     deleteButton.performClick()
@@ -315,9 +316,27 @@ class LocalActionPerformanceTest {
         .toList()
 
     private fun Activity.historicalParkingDeleteButton(): Button =
+        requireNotNull(historicalParkingDeleteButtonOrNull())
+
+    private fun Activity.historicalParkingDeleteButtonOrNull(): Button? =
         findViewById<ViewGroup>(ProjectUiIds.PROJECT_ACTIVITY).descendants()
             .filterIsInstance<Button>()
-            .first { it.contentDescription?.toString() == "Delete park message" }
+            .firstOrNull { it.contentDescription?.toString() == "Delete park message" }
+
+    private fun ensureHistoricalParkingVisible(scenario: ActivityScenario<MainActivity>) {
+        repeat(8) {
+            var visible = false
+            scenario.onActivity { activity ->
+                visible = activity.historicalParkingDeleteButtonOrNull() != null
+                if (!visible) {
+                    activity.findViewById<Button>(ProjectUiIds.LOAD_OLDER_PARKING)?.performClick()
+                }
+            }
+            if (visible) return
+            InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+        }
+        error("No historical Park delete action became visible")
+    }
 
     private fun Activity.newestParkingSignature(): String =
         findViewById<ViewGroup>(ProjectUiIds.NEWEST_PARKING).descendants()
