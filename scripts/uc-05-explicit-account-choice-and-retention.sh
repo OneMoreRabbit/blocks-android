@@ -58,6 +58,11 @@ mkdir -p "$RESULTS/non-performance"
 find app/build/outputs/androidTest-results/connected/debug -type f -name 'TEST-*.xml' \
     -exec cp {} "$RESULTS/non-performance/" \;
 
+echo '$ adb install -r app-debug.apk; adb install -r -t app-debug-androidTest.apk'
+"$ANDROID_HOME/platform-tools/adb" install -r app/build/outputs/apk/debug/app-debug.apk >/dev/null
+"$ANDROID_HOME/platform-tools/adb" install -r -t app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk >/dev/null
+echo 'EXPECTED: the exact already-built debug and instrumentation APKs are installed on the disposable test emulator; no owner device or data is involved.'
+
 echo '$ adb shell am instrument -w -r -e class dev.blocks.android.state.LocalActionPerformanceTest#realButtonsRenderSeededCreateAndParkResultsWithinBudget dev.blocks.android.test/androidx.test.runner.AndroidJUnitRunner'
 "$ANDROID_HOME/platform-tools/adb" shell am instrument -w -r \
     -e class 'dev.blocks.android.state.LocalActionPerformanceTest#realButtonsRenderSeededCreateAndParkResultsWithinBudget' \
