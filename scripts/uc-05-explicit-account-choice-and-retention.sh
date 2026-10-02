@@ -72,6 +72,7 @@ done
 "$ANDROID_HOME/platform-tools/adb" shell settings put global window_animation_scale 0
 "$ANDROID_HOME/platform-tools/adb" shell settings put global transition_animation_scale 0
 "$ANDROID_HOME/platform-tools/adb" shell settings put global animator_duration_scale 0
+sleep 30
 echo 'EXPECTED: the disposable emulator is settled after build load; installed APKs remain in place and no owner device or data is involved.'
 
 echo '$ adb shell am instrument -w -r -e class dev.blocks.android.state.LocalActionPerformanceTest#realButtonsRenderSeededCreateAndParkResultsWithinBudget dev.blocks.android.test/androidx.test.runner.AndroidJUnitRunner'
