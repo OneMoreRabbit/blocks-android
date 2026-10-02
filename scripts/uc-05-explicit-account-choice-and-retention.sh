@@ -63,6 +63,17 @@ echo '$ adb install -r app-debug.apk; adb install -r -t app-debug-androidTest.ap
 "$ANDROID_HOME/platform-tools/adb" install -r -t app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk >/dev/null
 echo 'EXPECTED: the exact already-built debug and instrumentation APKs are installed on the disposable test emulator; no owner device or data is involved.'
 
+echo '$ adb reboot; wait for sys.boot_completed; disable emulator animations'
+"$ANDROID_HOME/platform-tools/adb" reboot
+"$ANDROID_HOME/platform-tools/adb" wait-for-device
+while [ "$("$ANDROID_HOME/platform-tools/adb" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" != 1 ]; do
+    sleep 2
+done
+"$ANDROID_HOME/platform-tools/adb" shell settings put global window_animation_scale 0
+"$ANDROID_HOME/platform-tools/adb" shell settings put global transition_animation_scale 0
+"$ANDROID_HOME/platform-tools/adb" shell settings put global animator_duration_scale 0
+echo 'EXPECTED: the disposable emulator is settled after build load; installed APKs remain in place and no owner device or data is involved.'
+
 echo '$ adb shell am instrument -w -r -e class dev.blocks.android.state.LocalActionPerformanceTest#realButtonsRenderSeededCreateAndParkResultsWithinBudget dev.blocks.android.test/androidx.test.runner.AndroidJUnitRunner'
 "$ANDROID_HOME/platform-tools/adb" shell am instrument -w -r \
     -e class 'dev.blocks.android.state.LocalActionPerformanceTest#realButtonsRenderSeededCreateAndParkResultsWithinBudget' \
