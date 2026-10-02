@@ -31,7 +31,13 @@ git worktree add --detach "$BASELINE" v0.9.1 >/dev/null
     cd "$BASELINE"
     ./gradlew --no-daemon :app:compileDebugKotlin >/dev/null
 )
-BASELINE_CLASS="$BASELINE/app/build/tmp/kotlin-classes/debug/dev/blocks/android/auth/GoogleIdentityClient.class"
+BASELINE_CLASS=$(find "$BASELINE/app/build" -type f \
+    -path '*/dev/blocks/android/auth/GoogleIdentityClient.class' -print -quit)
+if [ -z "$BASELINE_CLASS" ]; then
+    echo 'ACTUAL: released GoogleIdentityClient.class was not produced; baseline proof is invalid.'
+    echo 'VERDICT released request-selection regression: fail'
+    exit 1
+fi
 if strings "$BASELINE_CLASS" | grep -Fq 'GetSignInWithGoogleOption'; then
     echo 'ACTUAL: released v0.9.1 unexpectedly contains the explicit Google option.'
     echo 'VERDICT released request-selection regression: fail'
