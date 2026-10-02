@@ -9,7 +9,9 @@ import androidx.credentials.exceptions.GetCredentialCancellationException
 import androidx.credentials.exceptions.GetCredentialException
 import androidx.credentials.exceptions.NoCredentialException
 import com.google.android.libraries.identity.googleid.GetGoogleIdOption
+import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
+import kotlinx.coroutines.CancellationException
 
 sealed interface ReturningAccountCredential {
     data class Available(val identityToken: String) : ReturningAccountCredential
@@ -24,49 +26,13 @@ interface IdentityProvider {
     suspend fun clear(activity: Activity)
 }
 
-class GoogleIdentityClient(private val serverClientId: String) : IdentityProvider {
-    override suspend fun signIn(activity: Activity): String {
-        return try {
-            credential(activity, request(filterByAuthorizedAccounts = true, immediatelyAvailable = false))
-        } catch (_: NoCredentialException) {
-            credential(activity, request(filterByAuthorizedAccounts = false, immediatelyAvailable = false))
-        }
-    }
+internal interface GoogleCredentialGateway {
+    suspend fun credential(activity: Activity, request: GetCredentialRequest): String
+    suspend fun clear(activity: Activity)
+}
 
-    override suspend fun returningAccount(activity: Activity): ReturningAccountCredential {
-        return try {
-            ReturningAccountCredential.Available(
-                credential(activity, request(filterByAuthorizedAccounts = true, immediatelyAvailable = true)),
-            )
-        } catch (_: GetCredentialCancellationException) {
-            ReturningAccountCredential.Cancelled
-        } catch (_: NoCredentialException) {
-            ReturningAccountCredential.Unavailable
-        } catch (_: GetCredentialException) {
-            ReturningAccountCredential.Unavailable
-        }
-    }
-
-    private fun request(
-        filterByAuthorizedAccounts: Boolean,
-        immediatelyAvailable: Boolean,
-    ): GetCredentialRequest {
-        val option = GetGoogleIdOption.Builder()
-            .setServerClientId(serverClientId)
-            .setFilterByAuthorizedAccounts(filterByAuthorizedAccounts)
-            .setAutoSelectEnabled(true)
-            .build()
-        return GetCredentialRequest.Builder()
-            .addCredentialOption(option)
-            .setPreferImmediatelyAvailableCredentials(immediatelyAvailable)
-            .build()
-    }
-
-    override suspend fun clear(activity: Activity) {
-        CredentialManager.create(activity).clearCredentialState(ClearCredentialStateRequest())
-    }
-
-    private suspend fun credential(activity: Activity, request: GetCredentialRequest): String {
+private object AndroidGoogleCredentialGateway : GoogleCredentialGateway {
+    override suspend fun credential(activity: Activity, request: GetCredentialRequest): String {
         val credential = CredentialManager.create(activity)
             .getCredential(activity, request)
             .credential
@@ -77,5 +43,61 @@ class GoogleIdentityClient(private val serverClientId: String) : IdentityProvide
         ) { "Google returned an unsupported credential type." }
 
         return GoogleIdTokenCredential.createFrom(credential.data).idToken
+    }
+
+    override suspend fun clear(activity: Activity) {
+        CredentialManager.create(activity).clearCredentialState(ClearCredentialStateRequest())
+    }
+}
+
+class GoogleIdentityClient internal constructor(
+    private val serverClientId: String,
+    private val gateway: GoogleCredentialGateway,
+) : IdentityProvider {
+    constructor(serverClientId: String) : this(serverClientId, AndroidGoogleCredentialGateway)
+
+    override suspend fun signIn(activity: Activity): String {
+        return try {
+            gateway.credential(activity, explicitSignInRequest())
+        } catch (error: GetCredentialCancellationException) {
+            throw CancellationException("Google sign-in was cancelled").apply { initCause(error) }
+        }
+    }
+
+    override suspend fun returningAccount(activity: Activity): ReturningAccountCredential {
+        return try {
+            ReturningAccountCredential.Available(
+                gateway.credential(activity, returningAccountRequest()),
+            )
+        } catch (_: GetCredentialCancellationException) {
+            ReturningAccountCredential.Cancelled
+        } catch (_: NoCredentialException) {
+            ReturningAccountCredential.Unavailable
+        } catch (_: GetCredentialException) {
+            ReturningAccountCredential.Unavailable
+        }
+    }
+
+    private fun explicitSignInRequest(): GetCredentialRequest {
+        val option = GetSignInWithGoogleOption.Builder(serverClientId).build()
+        return GetCredentialRequest.Builder()
+            .addCredentialOption(option)
+            .build()
+    }
+
+    private fun returningAccountRequest(): GetCredentialRequest {
+        val option = GetGoogleIdOption.Builder()
+            .setServerClientId(serverClientId)
+            .setFilterByAuthorizedAccounts(true)
+            .setAutoSelectEnabled(true)
+            .build()
+        return GetCredentialRequest.Builder()
+            .addCredentialOption(option)
+            .setPreferImmediatelyAvailableCredentials(true)
+            .build()
+    }
+
+    override suspend fun clear(activity: Activity) {
+        gateway.clear(activity)
     }
 }
