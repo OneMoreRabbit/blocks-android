@@ -960,6 +960,44 @@ class MainActivityPresentationTest {
     }
 
     @Test
+    fun cancelledAccountSwitchRetainsPendingWorkAcrossProcessStyleRestart() {
+        val retainedOperation = ProjectMutation(
+            operationId = "retained-operation",
+            type = ProjectMutationType.RENAME_PROJECT,
+            targetId = PROJECT_ID,
+            projectName = "Retained project name",
+        )
+        workspace.cache = workspace.cache.copy(commands = listOf(retainedOperation))
+        workspace.offline = true
+        identity.signInFailure = kotlinx.coroutines.CancellationException("cancelled")
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                activity.selectDialogItem("Switch account")
+            }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_LOGIN }
+
+            assertEquals(1, identity.signInCalls)
+            assertEquals(null, acceptedTenant.load())
+            assertEquals(AcceptedTenantContinuity(TENANT_ID, ACCOUNT_A), acceptedTenant.find(ACCOUNT_A))
+            assertEquals(listOf(retainedOperation), workspace.cacheFor(TENANT_ID).commands)
+            assertTrue(workspace.clearedTenants.isEmpty())
+
+            scenario.recreate()
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_LOGIN }
+            assertEquals(listOf(retainedOperation), workspace.cacheFor(TENANT_ID).commands)
+
+            identity.signInFailure = null
+            scenario.onActivity { it.button("Sign in with Google").performClick() }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            assertEquals(listOf(retainedOperation), workspace.cacheFor(TENANT_ID).commands)
+            assertTrue(workspace.clearedTenants.isEmpty())
+        }
+    }
+
+    @Test
     fun dashboardUsesContainedArchiveActionAndOneAccountSettingsEntry() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
