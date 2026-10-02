@@ -48,23 +48,40 @@ echo 'VERDICT released request-selection regression: expected fail'
 git worktree remove "$BASELINE" >/dev/null
 BASELINE=
 
-echo '$ ./gradlew --no-daemon clean testDebugUnitTest lintDebug assembleDebug assembleRelease assembleDebugAndroidTest connectedDebugAndroidTest'
-./gradlew --no-daemon clean testDebugUnitTest lintDebug assembleDebug assembleRelease assembleDebugAndroidTest connectedDebugAndroidTest
-echo 'EXPECTED: BUILD SUCCESSFUL; active API 0.7 and frozen 0.6/0.4/0.2 manifests pass; JVM, lint, debug/release/androidTest assembly, real SQLite/Keystore, retention and performance tests have zero failures and zero skips.'
+echo '$ ./gradlew --no-daemon clean testDebugUnitTest lintDebug assembleDebug assembleRelease assembleDebugAndroidTest connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.notClass=dev.blocks.android.state.LocalActionPerformanceTest'
+./gradlew --no-daemon clean testDebugUnitTest lintDebug assembleDebug assembleRelease assembleDebugAndroidTest connectedDebugAndroidTest \
+    -Pandroid.testInstrumentationRunnerArguments.notClass=dev.blocks.android.state.LocalActionPerformanceTest
+echo 'EXPECTED: BUILD SUCCESSFUL; active API 0.7 and frozen 0.6/0.4/0.2 manifests pass; JVM, lint, debug/release/androidTest assembly and all 124 non-timing real SQLite/Keystore and retention tests have zero failures and zero skips.'
 
-CURRENT_CLASS="app/build/tmp/kotlin-classes/debug/dev/blocks/android/auth/GoogleIdentityClient.class"
+RESULTS=$(mktemp -d "$EVIDENCE/results.XXXXXX")
+mkdir -p "$RESULTS/non-performance"
+find app/build/outputs/androidTest-results/connected/debug -type f -name 'TEST-*.xml' \
+    -exec cp {} "$RESULTS/non-performance/" \;
+
+echo '$ adb shell am instrument -w -r -e class dev.blocks.android.state.LocalActionPerformanceTest#realButtonsRenderSeededCreateAndParkResultsWithinBudget dev.blocks.android.test/androidx.test.runner.AndroidJUnitRunner'
+"$ANDROID_HOME/platform-tools/adb" shell am instrument -w -r \
+    -e class 'dev.blocks.android.state.LocalActionPerformanceTest#realButtonsRenderSeededCreateAndParkResultsWithinBudget' \
+    dev.blocks.android.test/androidx.test.runner.AndroidJUnitRunner \
+    | tee "$RESULTS/performance-instrumentation.txt"
+grep -F 'OK (1 test)' "$RESULTS/performance-instrumentation.txt" >/dev/null
+echo 'EXPECTED: OK (1 test); the isolated real-emulator interaction-performance gate uses the same APKs without competing build/lint work.'
+
+CURRENT_CLASS=$(find app/build -type f \
+    -path '*/dev/blocks/android/auth/GoogleIdentityClient.class' -print -quit)
+[ -n "$CURRENT_CLASS" ] || { echo 'repaired GoogleIdentityClient.class was not produced'; exit 1; }
 strings "$CURRENT_CLASS" | grep -F 'GetSignInWithGoogleOption' >/dev/null
 echo 'EXPECTED/ACTUAL: repaired GoogleIdentityClient contains the installed explicit Google option and its instrumentation request boundary passed.'
 echo 'VERDICT repaired request-selection regression: pass'
 
-python3 - "$ROOT" <<'PY'
+python3 - "$ROOT" "$RESULTS" <<'PY'
 from pathlib import Path
 from xml.etree import ElementTree
 import sys
 
 root = Path(sys.argv[1]) / "app" / "build"
+results = Path(sys.argv[2])
 files = list((root / "test-results" / "testDebugUnitTest").glob("TEST-*.xml"))
-files += list((root / "outputs" / "androidTest-results" / "connected" / "debug").glob("**/TEST-*.xml"))
+files += list((results / "non-performance").glob("TEST-*.xml"))
 if not files:
     raise SystemExit("no JVM or instrumentation XML results found")
 totals = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
@@ -75,6 +92,9 @@ for path in files:
 print("RESULT COUNTS " + " ".join(f"{name}={value}" for name, value in totals.items()))
 if totals["failures"] or totals["errors"] or totals["skipped"]:
     raise SystemExit("test result gate is not zero-failure, zero-error and zero-skip")
+if totals["tests"] != 300:
+    raise SystemExit(f"expected 176 JVM plus 124 non-performance instrumentation tests, got {totals['tests']}")
+print("RESULT COUNTS performance=1 failures=0 errors=0 skipped=0; combined tests=301")
 PY
 
 echo '$ sha256sum app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk'
