@@ -81,7 +81,7 @@ done
 "$ADB" -s "$SERIAL" shell settings put global transition_animation_scale 0
 "$ADB" -s "$SERIAL" shell settings put global animator_duration_scale 0
 "$ADB" -s "$SERIAL" shell cmd connectivity airplane-mode enable
-sleep 30
+sleep 60
 "$ADB" -s "$SERIAL" shell am instrument -w -r \
     -e class 'dev.blocks.android.state.LocalActionPerformanceTest#realButtonsRenderSeededCreateAndParkResultsWithinBudget' \
     dev.blocks.android.test/androidx.test.runner.AndroidJUnitRunner \
