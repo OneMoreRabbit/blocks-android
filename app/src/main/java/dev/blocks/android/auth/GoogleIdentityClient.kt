@@ -6,23 +6,12 @@ import androidx.credentials.CustomCredential
 import androidx.credentials.GetCredentialRequest
 import androidx.credentials.ClearCredentialStateRequest
 import androidx.credentials.exceptions.GetCredentialCancellationException
-import androidx.credentials.exceptions.GetCredentialException
-import androidx.credentials.exceptions.NoCredentialException
-import com.google.android.libraries.identity.googleid.GetGoogleIdOption
 import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
 import kotlinx.coroutines.CancellationException
 
-sealed interface ReturningAccountCredential {
-    data class Available(val identityToken: String) : ReturningAccountCredential
-    data object Unavailable : ReturningAccountCredential
-    data object Cancelled : ReturningAccountCredential
-}
-
 interface IdentityProvider {
     suspend fun signIn(activity: Activity): String
-    suspend fun returningAccount(activity: Activity): ReturningAccountCredential =
-        ReturningAccountCredential.Unavailable
     suspend fun clear(activity: Activity)
 }
 
@@ -64,36 +53,10 @@ class GoogleIdentityClient internal constructor(
         }
     }
 
-    override suspend fun returningAccount(activity: Activity): ReturningAccountCredential {
-        return try {
-            ReturningAccountCredential.Available(
-                gateway.credential(activity, returningAccountRequest()),
-            )
-        } catch (_: GetCredentialCancellationException) {
-            ReturningAccountCredential.Cancelled
-        } catch (_: NoCredentialException) {
-            ReturningAccountCredential.Unavailable
-        } catch (_: GetCredentialException) {
-            ReturningAccountCredential.Unavailable
-        }
-    }
-
     private fun explicitSignInRequest(): GetCredentialRequest {
         val option = GetSignInWithGoogleOption.Builder(serverClientId).build()
         return GetCredentialRequest.Builder()
             .addCredentialOption(option)
-            .build()
-    }
-
-    private fun returningAccountRequest(): GetCredentialRequest {
-        val option = GetGoogleIdOption.Builder()
-            .setServerClientId(serverClientId)
-            .setFilterByAuthorizedAccounts(true)
-            .setAutoSelectEnabled(true)
-            .build()
-        return GetCredentialRequest.Builder()
-            .addCredentialOption(option)
-            .setPreferImmediatelyAvailableCredentials(true)
             .build()
     }
 

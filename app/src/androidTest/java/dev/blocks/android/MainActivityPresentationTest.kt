@@ -33,7 +33,6 @@ import dev.blocks.android.auth.AcceptedTenantContinuity
 import dev.blocks.android.auth.AcceptedTenantContinuityStore
 import dev.blocks.android.auth.AndroidEncryptedAcceptedTenantContinuityStore
 import dev.blocks.android.auth.IdentityProvider
-import dev.blocks.android.auth.ReturningAccountCredential
 import dev.blocks.android.cover.ProjectCoverImporter
 import dev.blocks.android.cover.CoverCropSelection
 import dev.blocks.android.cover.AndroidEncryptedProjectCoverMediaStore
@@ -212,71 +211,82 @@ class MainActivityPresentationTest {
             assertEquals(0, workspace.syncCalls)
             assertEquals(0, sessionExchanges.get())
             assertEquals(0, identity.signInCalls)
-            assertEquals(1, identity.returningAccountCalls)
         }
     }
 
     @Test
-    fun authorizedReturningAccountValidatesBindingThenSynchronizesInBackground() {
-        identity.returningAccountResult = ReturningAccountCredential.Available("returning-token")
-
-        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
-            waitUntil { workspace.syncCalls > 0 }
-
-            scenario.onActivity { activity -> assertTrue(activity.hasButton("Active project")) }
-            assertEquals(1, identity.returningAccountCalls)
-            assertEquals(0, identity.signInCalls)
-            assertEquals(1, sessionExchanges.get())
-            assertFalse(presentationController.state.sessionConfirmationRequired)
+    fun appLinkQrAndNfcColdStartsOpenCachedProjectWithoutIdentityCalls() {
+        val appLink = Intent(context, MainActivity::class.java).apply {
+            action = Intent.ACTION_VIEW
+            data = Uri.parse(PROJECT_LINK.encoded)
         }
+        val qr = Intent(context, MainActivity::class.java).apply {
+            action = Intent.ACTION_VIEW
+            data = Uri.parse(PROJECT_LINK.encoded)
+        }
+        val nfc = Intent(context, MainActivity::class.java).apply {
+            action = NfcAdapter.ACTION_NDEF_DISCOVERED
+            data = Uri.parse(PROJECT_LINK.encoded)
+            putExtra(NfcAdapter.EXTRA_NDEF_MESSAGES, arrayOf(NdefLocatorCodec.message(PROJECT_LINK)))
+        }
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+
+        listOf(appLink, qr, nfc).forEach { launchIntent ->
+            launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+            val activity = instrumentation.startActivitySync(launchIntent) as MainActivity
+            try {
+                waitUntilOnActivity(activity) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+                instrumentation.runOnMainSync { assertTrue(activity.texts().contains("Active project")) }
+            } finally {
+                instrumentation.runOnMainSync { activity.finishAndRemoveTask() }
+            }
+        }
+
+        val projectsBeforeInvalid = workspace.cache.activeProjects
+        val invalidIntent = Intent(context, MainActivity::class.java).apply {
+            action = Intent.ACTION_VIEW
+            data = Uri.parse("blocks://tag/v2/not-supported")
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+        }
+        val invalid = instrumentation.startActivitySync(invalidIntent) as MainActivity
+        try {
+            waitUntilOnActivity(invalid) { it.dialogTexts().contains("Link not recognized") }
+            instrumentation.runOnMainSync {
+                assertEquals(ProjectUiIds.SCREEN_DASHBOARD, invalid.screenTag())
+            }
+        } finally {
+            instrumentation.runOnMainSync { invalid.finishAndRemoveTask() }
+        }
+
+        assertEquals(0, identity.signInCalls)
+        assertEquals(0, sessionExchanges.get())
+        assertEquals(0, workspace.syncCalls)
+        assertEquals(projectsBeforeInvalid, workspace.cache.activeProjects)
     }
 
     @Test
-    fun cancelledReturningAccountCheckKeepsCachedWorkUsableAndContained() {
-        identity.returningAccountResult = ReturningAccountCredential.Cancelled
-
-        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
-            scenario.onActivity { activity ->
+    fun repeatedCachedStartsAndLifecycleResumeRemainLocalUntilDeliberateReconnect() {
+        ActivityScenario.launch(MainActivity::class.java).use { first ->
+            waitFor(first) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            first.moveToState(Lifecycle.State.CREATED)
+            first.moveToState(Lifecycle.State.RESUMED)
+            first.onActivity { activity ->
                 assertTrue(activity.hasButton("Active project"))
                 assertTrue(activity.hasDescription("Saved on this device. Reconnect in Settings to synchronize."))
             }
-            assertEquals(1, identity.returningAccountCalls)
-            assertEquals(0, sessionExchanges.get())
-            assertTrue(presentationController.state.sessionConfirmationRequired)
         }
+        ActivityScenario.launch(MainActivity::class.java).use { restarted ->
+            waitFor(restarted) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            restarted.onActivity { assertTrue(it.hasButton("Active project")) }
+        }
+        assertEquals(0, identity.signInCalls)
+        assertEquals(0, sessionExchanges.get())
+        assertEquals(0, workspace.syncCalls)
+        assertTrue(presentationController.state.sessionConfirmationRequired)
     }
 
     @Test
-    fun unavailableOrNonAutoSelectableReturningAccountsNeverFallBackToNewAccount() {
-        identity.returningAccountResult = ReturningAccountCredential.Unavailable
-
-        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
-            scenario.onActivity { assertTrue(it.hasButton("Active project")) }
-            assertEquals(1, identity.returningAccountCalls)
-            assertEquals(0, identity.signInCalls)
-            assertEquals(0, sessionExchanges.get())
-        }
-    }
-
-    @Test
-    fun returningAccountWithWrongServiceBindingFailsClosed() {
-        identity.returningAccountResult = ReturningAccountCredential.Available("wrong-binding")
-        authenticatedTenant = OTHER_TENANT_ID
-
-        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_LOGIN }
-            assertFalse(continuity.shouldRestore)
-            assertEquals(1, identity.returningAccountCalls)
-            assertEquals(1, sessionExchanges.get())
-            assertEquals(null, acceptedTenant.load())
-        }
-    }
-
-    @Test
-    fun explicitSignOutSuppressesReturningAccountAttemptsAcrossRestart() {
+    fun explicitSignOutSuppressesAutomaticIdentityCallsAcrossRestart() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             scenario.onActivity { activity ->
@@ -286,34 +296,23 @@ class MainActivityPresentationTest {
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_LOGIN }
             scenario.recreate()
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_LOGIN }
-            assertEquals(1, identity.returningAccountCalls)
             assertEquals(0, identity.signInCalls)
         }
     }
 
     @Test
-    fun eachProcessStyleRestartMakesOnlyOneBoundedReturningAttempt() {
-        ActivityScenario.launch(MainActivity::class.java).use { first ->
-            waitFor(first) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
-        }
-        ActivityScenario.launch(MainActivity::class.java).use { restarted ->
-            waitFor(restarted) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
-        }
-        assertEquals(2, identity.returningAccountCalls)
-        assertEquals(0, identity.signInCalls)
-    }
-
-    @Test
-    fun validatedReturningSessionResynchronizesAfterLifecycleConnectivityOpportunity() {
-        identity.returningAccountResult = ReturningAccountCredential.Available("returning-token")
-
+    fun deliberateReconnectValidatesTheRetainedIdentityThenSynchronizes() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            assertEquals(0, workspace.syncCalls)
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                activity.selectDialogItem("Reconnect Google account")
+            }
             waitUntil { workspace.syncCalls > 0 }
-            val initialSyncs = workspace.syncCalls
-            scenario.moveToState(Lifecycle.State.CREATED)
-            scenario.moveToState(Lifecycle.State.RESUMED)
-            waitUntil { workspace.syncCalls > initialSyncs }
-            assertEquals(1, identity.returningAccountCalls)
+            assertEquals(1, identity.signInCalls)
+            assertEquals(1, sessionExchanges.get())
+            assertFalse(presentationController.state.sessionConfirmationRequired)
         }
     }
 
@@ -1300,7 +1299,7 @@ class MainActivityPresentationTest {
                 activity.selectDialogItem("About")
                 val about = activity.dialogTexts().joinToString("\n")
                 assertTrue(about.contains("Blocks Android"))
-                assertTrue(about.contains("Version 0.9.2 (19)"))
+                assertTrue(about.contains("Version 0.9.3 (20)"))
                 assertTrue(about.contains("dev.blocks.android/debug"))
                 assertFalse(about.contains("tenant", ignoreCase = true))
                 assertFalse(about.contains("token", ignoreCase = true))
@@ -1544,7 +1543,7 @@ class MainActivityPresentationTest {
         )
         val realContinuity = AndroidEncryptedAcceptedTenantContinuityStore(context)
         realContinuity.clear()
-        realContinuity.save(AcceptedTenantContinuity(TENANT_ID))
+        realContinuity.save(AcceptedTenantContinuity(TENANT_ID, ACCOUNT_A))
         val service = CacheProjectService()
         val exchangeOnline = java.util.concurrent.atomic.AtomicBoolean(false)
         val exchanges = AtomicInteger()
@@ -1603,7 +1602,7 @@ class MainActivityPresentationTest {
         AndroidEncryptedDraftStore(context).clear(TENANT_ID)
         val realAccepted = AndroidEncryptedAcceptedTenantContinuityStore(context).apply {
             clear()
-            save(AcceptedTenantContinuity(TENANT_ID))
+            save(AcceptedTenantContinuity(TENANT_ID, ACCOUNT_A))
         }
         val service = CacheProjectService().apply { offline = true }
         MainActivity.dependencyFactory = { activity ->
@@ -3033,18 +3032,12 @@ class MainActivityPresentationTest {
 
     private class FakeIdentity : IdentityProvider {
         var signInCalls = 0
-        var returningAccountCalls = 0
         var clearCalls = 0
         var signInFailure: Exception? = null
-        var returningAccountResult: ReturningAccountCredential = ReturningAccountCredential.Unavailable
         override suspend fun signIn(activity: Activity): String {
             signInCalls += 1
             signInFailure?.let { throw it }
             return "identity-token"
-        }
-        override suspend fun returningAccount(activity: Activity): ReturningAccountCredential {
-            returningAccountCalls += 1
-            return returningAccountResult
         }
         override suspend fun clear(activity: Activity) {
             clearCalls += 1
