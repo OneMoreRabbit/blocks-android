@@ -5,12 +5,10 @@ import androidx.credentials.GetCredentialRequest
 import androidx.credentials.exceptions.GetCredentialCancellationException
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
-import com.google.android.libraries.identity.googleid.GetGoogleIdOption
 import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -27,19 +25,6 @@ class GoogleIdentityClientTest {
         assertEquals(1, gateway.requests.size)
         val option = gateway.requests.single().credentialOptions.single()
         assertTrue(option is GetSignInWithGoogleOption)
-        assertFalse(option is GetGoogleIdOption)
-    }
-
-    @Test
-    fun quietReturningAccountKeepsOneAuthorizedAutoSelectRequest() = runBlocking {
-        val gateway = RecordingGateway()
-        val result = GoogleIdentityClient(SERVER_CLIENT_ID, gateway).returningAccount(activity())
-
-        assertEquals(ReturningAccountCredential.Available("selected-token"), result)
-        assertEquals(1, gateway.requests.size)
-        val option = gateway.requests.single().credentialOptions.single() as GetGoogleIdOption
-        assertTrue(option.filterByAuthorizedAccounts)
-        assertTrue(option.autoSelectEnabled)
     }
 
     @Test

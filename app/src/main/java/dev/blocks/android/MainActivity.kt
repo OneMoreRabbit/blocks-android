@@ -50,7 +50,6 @@ import dev.blocks.android.auth.AcceptedTenantContinuityStore
 import dev.blocks.android.auth.AndroidEncryptedAcceptedTenantContinuityStore
 import dev.blocks.android.auth.GoogleIdentityClient
 import dev.blocks.android.auth.IdentityProvider
-import dev.blocks.android.auth.ReturningAccountCredential
 import dev.blocks.android.cover.AndroidProjectCoverImporter
 import dev.blocks.android.cover.AndroidProjectCoverCropper
 import dev.blocks.android.cover.AndroidEncryptedProjectCoverMediaStore
@@ -2613,7 +2612,6 @@ class MainActivity : ComponentActivity() {
                     }
                     render()
                     resolvePendingTagLocator()
-                    revalidateReturningAccount(acceptedTenant)
                 }
             } catch (_: CancellationException) {
                 return@launch
@@ -2626,41 +2624,6 @@ class MainActivity : ComponentActivity() {
                 }
                 render()
             }
-        }
-    }
-
-    private suspend fun revalidateReturningAccount(acceptedTenant: AcceptedTenantContinuity) {
-        if (acceptedTenant.accountIdentity == null) return
-        val result = try {
-            identity.returningAccount(this@MainActivity)
-        } catch (_: CancellationException) {
-            return
-        } catch (_: Exception) {
-            ReturningAccountCredential.Unavailable
-        }
-        if (result !is ReturningAccountCredential.Available) return
-        try {
-            val authenticated = withContext(Dispatchers.IO) {
-                controller.authenticate(result.identityToken)
-            }
-            if (
-                authenticated.tenantId != acceptedTenant.tenantId ||
-                authenticated.accountIdentity != acceptedTenant.accountIdentity
-            ) {
-                throw AcceptedAccountBindingException()
-            }
-            withContext(localStateDispatcher) {
-                controller.activateAuthenticated(authenticated)
-                restoreTransientDraftsIfReady()
-            }
-            render()
-            resolvePendingTagLocator()
-            synchronizeAutomatically()
-        } catch (_: AcceptedAccountBindingException) {
-            failClosedAccountBinding()
-        } catch (_: Exception) {
-            // Local continuity is already open. A failed automatic check remains a quiet,
-            // contained reconnect state and never becomes a foreground error.
         }
     }
 
