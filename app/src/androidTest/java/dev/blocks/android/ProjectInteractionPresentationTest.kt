@@ -51,6 +51,7 @@ import java.io.FileOutputStream
 import java.lang.reflect.Proxy
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.abs
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -250,7 +251,7 @@ class ProjectInteractionPresentationTest {
                 val expectedLine = activity.getColor(R.color.blocks_line)
                 separators.forEach { divider ->
                     val rendered = (divider.background as ColorDrawable).color
-                    assertEquals(51, Color.alpha(rendered))
+                    assertEquals(204, Color.alpha(rendered))
                     assertEquals(Color.red(expectedLine), Color.red(rendered))
                     assertEquals(Color.green(expectedLine), Color.green(rendered))
                     assertEquals(Color.blue(expectedLine), Color.blue(rendered))
@@ -278,6 +279,74 @@ class ProjectInteractionPresentationTest {
                     assertEquals(
                         "Delete park message",
                         footer.descendants().filterIsInstance<Button>().single().contentDescription.toString(),
+                    )
+                }
+                activity.historicalParkDeleteButton().performClick()
+            }
+            waitFor(scenario) { it.activeDialog != null }
+            scenario.onActivity { it.dialogButton("Cancel").performClick() }
+            assertTrue(store.loadSyncState(TENANT).projectCache.parkingTombstones.isEmpty())
+        }
+    }
+
+    @Test
+    fun uc09HistorySeparatorsAreTwentyPercentTransparent() {
+        val fixture = populatedState(parkingCount = 4).let { state ->
+            state.copy(projectCache = state.projectCache.copy(noteItems = state.projectCache.noteItems.take(3)))
+        }
+        store.saveSyncState(TENANT, fixture)
+        installDependencies()
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            scenario.openProject()
+            scenario.onActivity { activity ->
+                val noteList = activity.findViewById<ViewGroup>(ProjectUiIds.PROJECT_NOTES)
+                val parkList = activity.findViewById<ViewGroup>(ProjectUiIds.PARKING_HISTORY)
+                val separators = noteList.directChildren().filter {
+                    it.id == ProjectUiIds.NOTE_HISTORY_DIVIDER
+                } + parkList.directChildren().filter {
+                    it.id == ProjectUiIds.PARKING_HISTORY_DIVIDER
+                }
+                assertEquals(4, separators.size)
+                val expectedLine = activity.getColor(R.color.blocks_line)
+                separators.forEach { divider ->
+                    val rendered = (divider.background as ColorDrawable).color
+                    assertEquals(204, Color.alpha(rendered))
+                    assertEquals(Color.red(expectedLine), Color.red(rendered))
+                    assertEquals(Color.green(expectedLine), Color.green(rendered))
+                    assertEquals(Color.blue(expectedLine), Color.blue(rendered))
+                    assertEquals((1 * activity.resources.displayMetrics.density).toInt(), divider.height)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun uc09ParkFooterIsFortyEightDpAndRenderedCentresAlignWithinOnePixel() {
+        store.saveSyncState(TENANT, populatedState(parkingCount = 4))
+        installDependencies()
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            scenario.openProject()
+            scenario.onActivity { activity ->
+                val expectedHeight = (48 * activity.resources.displayMetrics.density).toInt()
+                val parkRows = activity.findViewById<ViewGroup>(ProjectUiIds.PARKING_HISTORY)
+                    .directChildren().filter { it.tag?.toString()?.startsWith("park:") == true }
+                assertEquals(3, parkRows.size)
+                parkRows.forEach { row ->
+                    val group = row as ViewGroup
+                    val footer = group.getChildAt(group.childCount - 1) as ViewGroup
+                    val date = footer.getChildAt(0) as TextView
+                    val delete = footer.descendants().filterIsInstance<Button>()
+                        .single { it.contentDescription?.toString() == "Delete park message" }
+                    assertEquals(expectedHeight, footer.height)
+                    assertEquals(expectedHeight, date.height)
+                    assertEquals(expectedHeight, delete.height)
+                    val dateCentre = date.renderedContentCentreOnScreen()
+                    val deleteCentre = delete.renderedContentCentreOnScreen()
+                    assertTrue(
+                        "date centre=$dateCentre delete centre=$deleteCentre",
+                        abs(dateCentre - deleteCentre) <= 1f,
                     )
                 }
                 activity.historicalParkDeleteButton().performClick()
@@ -353,6 +422,31 @@ class ProjectInteractionPresentationTest {
                 assertTrue(file.isFile && file.length() > 0)
                 Log.i(TAG, "uc08-screenshot=$file")
             }
+        }
+    }
+
+    @Test
+    fun writesUc09MultipleParkFooterReviewPngOutsideTheAppRepository() {
+        val output = requireNotNull(context.getExternalFilesDir("review-0.9.6"))
+        output.mkdirs()
+        store.saveSyncState(TENANT, populatedState(parkingCount = 4))
+        installDependencies()
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            scenario.openProject()
+            scenario.onActivity { activity -> activity.scrollProjectToExactText("Park History") }
+            InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+            val file = File(output, "project-multiple-park-footers.png")
+            scenario.onActivity { activity ->
+                val decor = activity.window.decorView
+                val bitmap = Bitmap.createBitmap(decor.width, decor.height, Bitmap.Config.ARGB_8888)
+                decor.draw(Canvas(bitmap))
+                FileOutputStream(file).use { stream ->
+                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)
+                }
+            }
+            assertTrue(file.isFile && file.length() > 0)
+            Log.i(TAG, "uc09-screenshot=$file")
         }
     }
 
@@ -725,6 +819,22 @@ class ProjectInteractionPresentationTest {
         drawable.draw(Canvas(bitmap))
         return IntArray(size * size).also { bitmap.getPixels(it, 0, size, 0, 0, size, size) }
             .map { Color.alpha(it) }.toIntArray().also { bitmap.recycle() }
+    }
+
+    private fun View.renderedContentCentreOnScreen(): Float {
+        check(width > 0 && height > 0)
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        draw(Canvas(bitmap))
+        val pixels = IntArray(width * height)
+        bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+        bitmap.recycle()
+        val occupiedRows = (0 until height).filter { y ->
+            (0 until width).any { x -> Color.alpha(pixels[y * width + x]) > 0 }
+        }
+        check(occupiedRows.isNotEmpty())
+        val location = IntArray(2)
+        getLocationOnScreen(location)
+        return location[1] + (occupiedRows.first() + occupiedRows.last()) / 2f
     }
 
     private fun MainActivity.dialogButton(text: String): Button = requireNotNull(activeDialog)
