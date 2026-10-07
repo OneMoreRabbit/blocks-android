@@ -122,19 +122,23 @@ class ProjectInteractionPresentationTest {
                         button.minimumWidth >= minimumTouch && button.minimumHeight >= minimumTouch &&
                         button.isEnabled && button.hasOnClickListeners()
                 })
-                val historicalPark = activity.findViewById<ViewGroup>(ProjectUiIds.PROJECT_ACTIVITY)
+                val historicalPark = activity.findViewById<ViewGroup>(ProjectUiIds.PARKING_HISTORY)
                     .descendants().filterIsInstance<LinearLayout>()
                     .single { it.tag?.toString()?.startsWith("park:") == true }
-                val inlineHeader = historicalPark.getChildAt(0) as LinearLayout
-                assertTrue(
-                    inlineHeader.descendants().filterIsInstance<Button>()
-                        .single().contentDescription.toString() == "Delete park message",
-                )
-                assertEquals(0, historicalPark.paddingBottom)
-                val divider = historicalPark.getChildAt(historicalPark.childCount - 1)
+                val divider = historicalPark.getChildAt(0)
                 val dividerMargins = divider.layoutParams as ViewGroup.MarginLayoutParams
                 assertEquals(0, dividerMargins.topMargin)
                 assertEquals(0, dividerMargins.bottomMargin)
+                val firstFieldAndDate = historicalPark.getChildAt(1) as LinearLayout
+                assertTrue(
+                    firstFieldAndDate.descendants().filterIsInstance<Button>().none(),
+                )
+                val lowerAction = historicalPark.getChildAt(historicalPark.childCount - 1) as LinearLayout
+                assertEquals(
+                    "Delete park message",
+                    lowerAction.descendants().filterIsInstance<Button>().single().contentDescription.toString(),
+                )
+                assertEquals(0, historicalPark.paddingBottom)
                 activity.historicalParkDeleteButton().performClick()
             }
             waitFor(first) { it.activeDialog != null }
@@ -272,6 +276,56 @@ class ProjectInteractionPresentationTest {
         }
     }
 
+    @Test
+    fun writesUc07NotesAndMultilineParkReviewPngsOutsideTheAppRepository() {
+        val output = requireNotNull(context.getExternalFilesDir("review-0.9.4"))
+        output.mkdirs()
+        val fixture = populatedState(parkingCount = 4).let { state ->
+            val records = state.projectCache.parkingRecords.map { record ->
+                if (record.location == "Older bench") {
+                    record.copy(
+                        location = "Workshop shelving beside the north wall",
+                        nextAction = "Measure the remaining bay\nCut the two uprights\nDry-fit before drilling",
+                        mustNotForget = "Bring the long level\nKeep the labelled fixings together",
+                    )
+                } else {
+                    record
+                }
+            }
+            state.copy(
+                projectCache = state.projectCache.copy(
+                    parkingRecords = records,
+                    noteItems = state.projectCache.noteItems.take(3),
+                ),
+            )
+        }
+
+        listOf(
+            "project-notes-populated" to "Notes",
+            "project-park-history-multiline" to "Park History",
+        ).forEach { (name, targetText) ->
+            store.clearSyncState(TENANT)
+            store.saveSyncState(TENANT, fixture)
+            installDependencies()
+            ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                scenario.openProject()
+                scenario.onActivity { activity -> activity.scrollProjectToExactText(targetText) }
+                InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+                val file = File(output, "$name.png")
+                scenario.onActivity { activity ->
+                    val decor = activity.window.decorView
+                    val bitmap = Bitmap.createBitmap(decor.width, decor.height, Bitmap.Config.ARGB_8888)
+                    decor.draw(Canvas(bitmap))
+                    FileOutputStream(file).use { stream ->
+                        bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)
+                    }
+                }
+                assertTrue(file.isFile && file.length() > 0)
+                Log.i(TAG, "uc07-screenshot=$file")
+            }
+        }
+    }
+
     private fun installDependencies() {
         MainActivity.dependencyFactory = { activity ->
             val repository = ProjectSyncRepository(
@@ -401,6 +455,18 @@ class ProjectInteractionPresentationTest {
 
     private fun MainActivity.screenTag() = findViewById<ViewGroup>(ProjectUiIds.CONTENT).tag as? Int
 
+    private fun MainActivity.scrollProjectToExactText(text: String) {
+        val root = findViewById<ScrollView>(ProjectUiIds.ROOT_SCROLL)
+        val target = findViewById<ViewGroup>(ProjectUiIds.CONTENT).descendants()
+            .filterIsInstance<TextView>()
+            .single { it.text.toString() == text }
+        val bounds = Rect()
+        target.getDrawingRect(bounds)
+        root.offsetDescendantRectToMyCoords(target, bounds)
+        val inset = (16 * resources.displayMetrics.density).toInt()
+        root.scrollTo(0, (bounds.top - inset).coerceAtLeast(0))
+    }
+
     private fun Activity.viewWithDescription(description: String): View =
         findViewById<ViewGroup>(android.R.id.content).descendants().single {
             it.contentDescription?.toString() == description && it.isShown
@@ -421,7 +487,7 @@ class ProjectInteractionPresentationTest {
             .toList()
 
     private fun Activity.historicalParkDeleteButton(): Button =
-        findViewById<ViewGroup>(ProjectUiIds.PROJECT_ACTIVITY).descendants()
+        findViewById<ViewGroup>(ProjectUiIds.PARKING_HISTORY).descendants()
             .filterIsInstance<Button>()
             .first { it.contentDescription?.toString() == "Delete park message" }
 

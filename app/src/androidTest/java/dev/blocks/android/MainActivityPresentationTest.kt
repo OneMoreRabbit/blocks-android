@@ -1049,7 +1049,7 @@ class MainActivityPresentationTest {
     }
 
     @Test
-    fun mixedHistoryUsesNoteLastEditAndParkCreationWithStableIdentity() {
+    fun notesAndParkHistoryHaveDistinctSemanticSectionsAndOrdering() {
         workspace.cache = workspace.cache.copy(
             noteItems = listOf(
                 ProjectNoteItem(
@@ -1088,10 +1088,19 @@ class MainActivityPresentationTest {
             scenario.onActivity { it.button("Active project").performClick() }
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
             scenario.onActivity { activity ->
-                val activityRows = activity.findViewById<LinearLayout>(ProjectUiIds.PROJECT_ACTIVITY)
-                assertTrue(descendantText(activityRows.getChildAt(0)).contains("Older note edited later"))
-                assertTrue(descendantText(activityRows.getChildAt(1)).contains("Newest note"))
-                assertTrue(descendantText(activityRows.getChildAt(2)).contains("Middle parking record"))
+                val content = activity.findViewById<ViewGroup>(ProjectUiIds.CONTENT)
+                val notesHeading = content.descendants().filterIsInstance<android.widget.TextView>()
+                    .single { it.text.toString() == "Notes" }
+                val parkHeading = content.descendants().filterIsInstance<android.widget.TextView>()
+                    .single { it.text.toString() == "Park History" }
+                val notesSection = notesHeading.parent as ViewGroup
+                val parkSection = parkHeading.parent as ViewGroup
+                assertTrue(descendantText(notesSection).contains("Older note edited later"))
+                assertTrue(descendantText(notesSection).contains("Newest note"))
+                assertFalse(descendantText(notesSection).contains("Middle parking record"))
+                assertTrue(descendantText(parkSection).contains("Middle parking record"))
+                assertFalse(descendantText(parkSection).contains("Older note edited later"))
+                assertTrue(content.indexOfChild(notesSection) < content.indexOfChild(parkSection))
             }
         }
     }
@@ -1157,32 +1166,36 @@ class MainActivityPresentationTest {
                     ProjectUiIds.PROJECT_COVER,
                     ProjectUiIds.NEWEST_PARKING,
                     ProjectUiIds.LINKS_SECTION,
-                    ProjectUiIds.PINNED_SECTION,
-                    ProjectUiIds.HISTORY_SECTION,
+                    ProjectUiIds.NOTES_SECTION,
+                    ProjectUiIds.PARK_HISTORY_SECTION,
                 ).map { id -> content.indexOfChild(activity.findViewById(id)) }
                 assertEquals((0..5).toList(), hierarchy)
 
                 val newest = activity.findViewById<ViewGroup>(ProjectUiIds.NEWEST_PARKING)
-                val pinned = activity.findViewById<ViewGroup>(ProjectUiIds.PINNED_NOTES)
-                val history = activity.findViewById<ViewGroup>(ProjectUiIds.PROJECT_ACTIVITY)
+                val notes = activity.findViewById<ViewGroup>(ProjectUiIds.PROJECT_NOTES)
+                val history = activity.findViewById<ViewGroup>(ProjectUiIds.PARKING_HISTORY)
                 assertTrue(newest.background == null)
                 assertFalse(descendantText(newest).contains("Where you left off"))
                 assertTrue(descendantText(newest).contains("Newest park"))
                 assertTrue(descendantText(newest).contains("17/09/26 16:00"))
-                assertTrue(descendantText(pinned).contains("Pinned context"))
-                assertTrue(descendantText(pinned).contains("17/09/26 17:00"))
+                assertTrue(descendantText(notes).contains("Pinned context"))
+                assertTrue(descendantText(notes).contains("Later edited note"))
+                assertTrue(descendantText(notes).contains("Earlier note"))
+                assertTrue(descendantText(notes).contains("17/09/26 17:00"))
                 assertFalse(descendantText(history).contains("Newest park"))
                 assertFalse(descendantText(history).contains("Pinned context"))
-                assertTrue(descendantText(history.getChildAt(0)).contains("Later edited note"))
-                assertTrue(descendantText(history.getChildAt(0)).contains("17/09/26 15:00"))
-                assertTrue(descendantText(history.getChildAt(1)).contains("Older park"))
-                assertTrue(descendantText(history.getChildAt(1)).contains("Park · 17/09/26 14:00"))
-                assertTrue(descendantText(history.getChildAt(2)).contains("Earlier note"))
+                assertEquals(3, notes.childCount)
+                assertTrue(descendantText(notes.getChildAt(0)).contains("Pinned context"))
+                assertTrue(descendantText(notes.getChildAt(1)).contains("Later edited note"))
+                assertTrue(descendantText(notes.getChildAt(2)).contains("Earlier note"))
+                assertEquals(1, history.childCount)
+                assertTrue(descendantText(history.getChildAt(0)).contains("Older park"))
+                assertTrue(descendantText(history.getChildAt(0)).contains("17/09/26 14:00"))
                 assertFalse(descendantText(content).contains("2026-09-17T"))
 
                 val newestDate = newest.descendants().filterIsInstance<android.widget.TextView>()
                     .single { it.text.toString() == "17/09/26 16:00" }
-                val pinnedDate = pinned.descendants().filterIsInstance<android.widget.TextView>()
+                val pinnedDate = notes.descendants().filterIsInstance<android.widget.TextView>()
                     .single { it.text.toString() == "17/09/26 17:00" }
                 val compactDatePadding = (4 * activity.resources.displayMetrics.density).toInt()
                 assertEquals(0, newestDate.paddingTop)
@@ -1240,8 +1253,8 @@ class MainActivityPresentationTest {
                 waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
                 scenario.onActivity { activity ->
                     assertTrue(descendantText(activity.findViewById(ProjectUiIds.NEWEST_PARKING)).contains("Newest park"))
-                    assertFalse(descendantText(activity.findViewById(ProjectUiIds.PROJECT_ACTIVITY)).contains("Newest park"))
-                    assertTrue(descendantText(activity.findViewById(ProjectUiIds.PINNED_NOTES)).contains("Pinned context"))
+                    assertFalse(descendantText(activity.findViewById(ProjectUiIds.PARKING_HISTORY)).contains("Newest park"))
+                    assertTrue(descendantText(activity.findViewById(ProjectUiIds.PROJECT_NOTES)).contains("Pinned context"))
                 }
             }
         } finally {
@@ -1262,18 +1275,68 @@ class MainActivityPresentationTest {
                     .contains("Where you left off"))
                 assertTrue(activity.findViewById<View>(ProjectUiIds.LINKS_SECTION) == null)
                 assertTrue(activity.findViewById<View>(ProjectUiIds.PROJECT_LINKS) == null)
-                assertTrue(activity.findViewById<View>(ProjectUiIds.PINNED_SECTION) == null)
-                assertTrue(activity.findViewById<View>(ProjectUiIds.PINNED_NOTES) == null)
-                assertTrue(descendantText(activity.findViewById(ProjectUiIds.PROJECT_ACTIVITY))
-                    .contains("No older notes or park messages."))
+                assertTrue(activity.findViewById<View>(ProjectUiIds.NOTES_SECTION) == null)
+                assertTrue(activity.findViewById<View>(ProjectUiIds.PROJECT_NOTES) == null)
+                assertTrue(activity.findViewById<View>(ProjectUiIds.PARK_HISTORY_SECTION) == null)
+                assertTrue(activity.findViewById<View>(ProjectUiIds.PARKING_HISTORY) == null)
+                assertFalse(activity.texts().contains("Notes"))
+                assertFalse(activity.texts().contains("Park History"))
                 val content = activity.findViewById<LinearLayout>(ProjectUiIds.CONTENT)
                 val visibleHierarchy = listOf(
                     ProjectUiIds.PROJECT_TITLE,
                     ProjectUiIds.PROJECT_COVER,
                     ProjectUiIds.NEWEST_PARKING,
-                    ProjectUiIds.HISTORY_SECTION,
                 ).map { id -> content.indexOfChild(activity.findViewById(id)) }
-                assertEquals((0..3).toList(), visibleHierarchy)
+                assertEquals((0..2).toList(), visibleHierarchy)
+            }
+        }
+    }
+
+    @Test
+    fun notesOnlyAndParksOnlyProjectsHideTheUnusedSection() {
+        workspace.cache = workspace.cache.copy(
+            noteItems = listOf(
+                ProjectNoteItem(
+                    "note-only",
+                    PROJECT_ID,
+                    "Only note",
+                    false,
+                    "local",
+                    NOW,
+                    NOW,
+                ),
+            ),
+        )
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { it.button("Active project").performClick() }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            scenario.onActivity { activity ->
+                assertTrue(activity.findViewById<View>(ProjectUiIds.NOTES_SECTION) != null)
+                assertTrue(activity.findViewById<View>(ProjectUiIds.PARK_HISTORY_SECTION) == null)
+                assertTrue(activity.texts().contains("Notes"))
+                assertFalse(activity.texts().contains("Park History"))
+            }
+        }
+
+        val older = parking(1)
+        val newest = parking(2)
+        workspace.cache = workspace.cache.copy(
+            pages = listOf(page().copy(newestParking = newest)),
+            noteItems = emptyList(),
+            parkingRecords = listOf(older, newest),
+        )
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { it.button("Active project").performClick() }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            scenario.onActivity { activity ->
+                assertTrue(activity.findViewById<View>(ProjectUiIds.NOTES_SECTION) == null)
+                assertTrue(activity.findViewById<View>(ProjectUiIds.PARK_HISTORY_SECTION) != null)
+                assertFalse(activity.texts().contains("Notes"))
+                assertTrue(activity.texts().contains("Park History"))
+                assertTrue(descendantText(activity.findViewById(ProjectUiIds.PARKING_HISTORY)).contains("Place 1"))
+                assertFalse(descendantText(activity.findViewById(ProjectUiIds.PARKING_HISTORY)).contains("Place 2"))
             }
         }
     }
@@ -1299,7 +1362,7 @@ class MainActivityPresentationTest {
                 activity.selectDialogItem("About")
                 val about = activity.dialogTexts().joinToString("\n")
                 assertTrue(about.contains("Blocks Android"))
-                assertTrue(about.contains("Version 0.9.3 (20)"))
+                assertTrue(about.contains("Version 0.9.4 (21)"))
                 assertTrue(about.contains("dev.blocks.android/debug"))
                 assertFalse(about.contains("tenant", ignoreCase = true))
                 assertFalse(about.contains("token", ignoreCase = true))
@@ -2032,7 +2095,7 @@ class MainActivityPresentationTest {
             scenario.onActivity { it.buttonWithDescription("Pin note").performClick() }
             waitUntil { workspace.cache.noteItems.single().pinned }
             scenario.onActivity { activity ->
-                assertTrue(activity.findViewById<View>(ProjectUiIds.PINNED_NOTES) != null)
+                assertTrue(activity.findViewById<View>(ProjectUiIds.PROJECT_NOTES) != null)
                 activity.buttonWithDescription("Edit note").performClick()
             }
             waitFor(scenario) { it.findViewById<EditText>(ProjectUiIds.NOTE_BODY) != null }
@@ -2228,7 +2291,7 @@ class MainActivityPresentationTest {
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
             scenario.onActivity { activity ->
                 val newest = activity.findViewById<ViewGroup>(ProjectUiIds.NEWEST_PARKING)
-                val history = activity.findViewById<ViewGroup>(ProjectUiIds.PROJECT_ACTIVITY)
+                val history = activity.findViewById<ViewGroup>(ProjectUiIds.PARKING_HISTORY)
                 assertTrue(descendantText(newest).contains("Place 22"))
                 assertFalse(descendantText(history).contains("Place 22"))
                 assertTrue(descendantText(history).contains("Place 21"))
@@ -2238,23 +2301,23 @@ class MainActivityPresentationTest {
                 activity.findViewById<Button>(ProjectUiIds.LOAD_OLDER_PARKING).performClick()
             }
             waitFor(scenario) {
-                it.findViewById<View>(ProjectUiIds.PROJECT_ACTIVITY).hasDescendantTextExactly("Place 3")
+                it.findViewById<View>(ProjectUiIds.PARKING_HISTORY).hasDescendantTextExactly("Place 3")
             }
             scenario.onActivity { activity ->
                 assertFalse(
-                    activity.findViewById<View>(ProjectUiIds.PROJECT_ACTIVITY)
+                    activity.findViewById<View>(ProjectUiIds.PARKING_HISTORY)
                         .hasDescendantTextExactly("Place 2"),
                 )
                 activity.findViewById<Button>(ProjectUiIds.LOAD_OLDER_PARKING).performClick()
             }
             waitFor(scenario) {
-                it.findViewById<View>(ProjectUiIds.PROJECT_ACTIVITY).hasDescendantTextExactly("Place 0")
+                it.findViewById<View>(ProjectUiIds.PARKING_HISTORY).hasDescendantTextExactly("Place 0")
             }
             scenario.onActivity { activity ->
                 assertTrue(activity.findViewById<Button>(ProjectUiIds.LOAD_OLDER_PARKING) == null)
                 assertEquals(
                     22,
-                    activity.findViewById<ViewGroup>(ProjectUiIds.PROJECT_ACTIVITY).childCount,
+                    activity.findViewById<ViewGroup>(ProjectUiIds.PARKING_HISTORY).childCount,
                 )
             }
 
@@ -2262,7 +2325,7 @@ class MainActivityPresentationTest {
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
             scenario.onActivity { activity ->
                 assertTrue(descendantText(activity.findViewById(ProjectUiIds.NEWEST_PARKING)).contains("Place 22"))
-                assertFalse(descendantText(activity.findViewById(ProjectUiIds.PROJECT_ACTIVITY)).contains("Place 22"))
+                assertFalse(descendantText(activity.findViewById(ProjectUiIds.PARKING_HISTORY)).contains("Place 22"))
                 assertTrue(activity.findViewById<Button>(ProjectUiIds.LOAD_OLDER_PARKING) != null)
                 assertEquals(0, identity.signInCalls)
             }

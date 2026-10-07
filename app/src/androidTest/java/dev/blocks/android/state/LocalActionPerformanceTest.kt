@@ -346,7 +346,7 @@ class LocalActionPerformanceTest {
         requireNotNull(historicalParkingDeleteButtonOrNull())
 
     private fun Activity.historicalParkingDeleteButtonOrNull(): Button? =
-        findViewById<ViewGroup>(ProjectUiIds.PROJECT_ACTIVITY).descendants()
+        findViewById<ViewGroup>(ProjectUiIds.PARKING_HISTORY).descendants()
             .filterIsInstance<Button>()
             .firstOrNull { it.contentDescription?.toString() == "Delete park message" }
 
