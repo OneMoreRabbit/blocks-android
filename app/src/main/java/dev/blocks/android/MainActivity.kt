@@ -215,16 +215,15 @@ internal object ProjectUiIds {
     const val LINK_TITLE = 1086
     const val LINK_URI = 1087
     const val SAVE_LINK = 1088
-    const val PINNED_NOTES = 1089
-    const val PROJECT_ACTIVITY = 1090
     const val PROJECT_LINKS = 1091
     const val LOAD_MORE_LINKS = 1092
     const val PROJECT_TITLE = 1093
     const val NEWEST_PARKING = 1094
     const val LINKS_SECTION = 1095
-    const val PINNED_SECTION = 1096
-    const val HISTORY_SECTION = 1097
     const val DASHBOARD_ORDER = 1098
+    const val NOTES_SECTION = 1099
+    const val PROJECT_NOTES = 1100
+    const val PARK_HISTORY_SECTION = 1101
 }
 
 class MainActivity : ComponentActivity() {
@@ -1052,67 +1051,81 @@ class MainActivity : ComponentActivity() {
             })
         }
 
-        val pinned = controller.state.noteItems.filter { it.pinned }
-            .sortedWith(compareByDescending<ProjectNoteItem> { it.updatedAt }.thenByDescending { it.id })
-        if (pinned.isNotEmpty()) {
-            content.addView(LinearLayout(this).apply {
-                id = ProjectUiIds.PINNED_SECTION
-                orientation = LinearLayout.VERTICAL
-                addView(heading("Pinned notes", 20f).apply { setPadding(0, dp(12), 0, dp(4)) })
-                addView(LinearLayout(this@MainActivity).apply {
-                    id = ProjectUiIds.PINNED_NOTES
-                    orientation = LinearLayout.VERTICAL
-                    pinned.forEach { addView(noteTimelineRow(it, archived)) }
-                })
-            })
-        }
-
-        content.addView(projectHistorySection(archived))
+        projectNotesSection(archived)?.let(content::addView)
+        projectParkHistorySection(archived)?.let(content::addView)
     }
 
-    private fun projectHistorySection(archived: Boolean): View {
-        val activity = projectActivityEntries(archived)
+    private fun projectNotesSection(archived: Boolean): View? {
+        val notes = controller.state.noteItems.sortedWith(
+            compareByDescending<ProjectNoteItem> { it.pinned }
+                .thenByDescending { it.updatedAt }
+                .thenByDescending { it.id },
+        )
+        if (notes.isEmpty()) return null
         return LinearLayout(this).apply {
-            id = ProjectUiIds.HISTORY_SECTION
+            id = ProjectUiIds.NOTES_SECTION
             orientation = LinearLayout.VERTICAL
-            addView(heading("History", 20f).apply { setPadding(0, dp(12), 0, dp(4)) })
-            addView(LinearLayout(this@MainActivity).apply {
-                id = ProjectUiIds.PROJECT_ACTIVITY
-                orientation = LinearLayout.VERTICAL
-                if (activity.isEmpty()) {
-                    addView(label("No older notes or park messages.", 14f, brandColor(R.color.blocks_muted)))
-                } else {
-                    activity.take(visibleActivityItemCount).forEach { addView(it.third()) }
-                }
-            })
-            if (activity.size > visibleActivityItemCount) {
-                addView(button("Show older activity") {
-                    visibleActivityItemCount += PROJECT_ITEM_PAGE_SIZE
-                    render()
-                }.apply { id = ProjectUiIds.LOAD_OLDER_PARKING })
-            } else if (controller.state.parkingHistoryHasMore) {
-                addView(button("Show older park messages") { source ->
-                    visibleActivityItemCount += PROJECT_ITEM_PAGE_SIZE
-                    runRepositoryAction(source = source) { controller.loadOlderParking() }
-                }.apply { id = ProjectUiIds.LOAD_OLDER_PARKING })
-            }
+            populateProjectNotesSection(this, notes, archived)
         }
     }
 
-    private fun projectActivityEntries(archived: Boolean): List<Triple<String, String, () -> View>> {
+    private fun populateProjectNotesSection(
+        section: LinearLayout,
+        notes: List<ProjectNoteItem>,
+        archived: Boolean,
+    ) {
+        section.removeAllViews()
+        section.addView(heading("Notes", 20f).apply { setPadding(0, dp(12), 0, dp(4)) })
+        section.addView(LinearLayout(this).apply {
+            id = ProjectUiIds.PROJECT_NOTES
+            orientation = LinearLayout.VERTICAL
+            notes.forEach { addView(noteTimelineRow(it, archived)) }
+        })
+    }
+
+    private fun projectParkHistorySection(archived: Boolean): View? {
+        val records = projectParkHistoryRecords()
+        if (records.isEmpty() && !controller.state.parkingHistoryHasMore) return null
+        return LinearLayout(this).apply {
+            id = ProjectUiIds.PARK_HISTORY_SECTION
+            orientation = LinearLayout.VERTICAL
+            populateParkHistorySection(this, records, archived)
+        }
+    }
+
+    private fun populateParkHistorySection(
+        section: LinearLayout,
+        records: List<ProjectParking>,
+        archived: Boolean,
+    ) {
+        section.removeAllViews()
+        section.addView(heading("Park History", 20f).apply { setPadding(0, dp(12), 0, dp(4)) })
+        section.addView(LinearLayout(this).apply {
+            id = ProjectUiIds.PARKING_HISTORY
+            orientation = LinearLayout.VERTICAL
+            records.take(visibleActivityItemCount).forEach { addView(parkingHistoryRow(it, archived)) }
+        })
+        if (records.size > visibleActivityItemCount) {
+            section.addView(button("Show older park messages") {
+                visibleActivityItemCount += PROJECT_ITEM_PAGE_SIZE
+                render()
+            }.apply { id = ProjectUiIds.LOAD_OLDER_PARKING })
+        } else if (controller.state.parkingHistoryHasMore) {
+            section.addView(button("Show older park messages") { source ->
+                visibleActivityItemCount += PROJECT_ITEM_PAGE_SIZE
+                runRepositoryAction(source = source) { controller.loadOlderParking() }
+            }.apply { id = ProjectUiIds.LOAD_OLDER_PARKING })
+        }
+    }
+
+    private fun projectParkHistoryRecords(): List<ProjectParking> {
         val newestParking = controller.state.projectPage?.newestParking
-        return buildList {
-            controller.state.noteItems.filterNot { it.pinned }
-                .forEach { note -> add(Triple(note.updatedAt, "note:${note.id}") { noteTimelineRow(note, archived) }) }
-            controller.state.parkingHistory
-                .filterNot { record -> newestParking?.let { record.sameIdentityAs(it) } == true }
-                .forEach { record ->
-                    add(Triple(record.createdAt.ifBlank { record.occurredAt }, "park:${record.id}") {
-                        parkingHistoryRow(record, archived)
-                    })
-                }
-        }.sortedWith(compareByDescending<Triple<String, String, () -> View>> { it.first }
-            .thenByDescending { it.second })
+        return controller.state.parkingHistory
+            .filterNot { record -> newestParking?.let { record.sameIdentityAs(it) } == true }
+            .sortedWith(
+                compareByDescending<ProjectParking> { it.createdAt.ifBlank { it.occurredAt } }
+                    .thenByDescending { it.id },
+            )
     }
 
     /** Reuses the existing Link rows after one atomic local drag reorder. */
@@ -1141,30 +1154,25 @@ class MainActivity : ComponentActivity() {
         return true
     }
 
-    /** Reuses History rows and replaces only Park-derived projections after the atomic tombstone commit. */
+    /** Replaces only Park-derived projections after the atomic tombstone commit. */
     private fun renderParkingProjection(): Boolean {
         if (controller.state.screen != ProjectScreen.PROJECT) return false
         val page = controller.state.projectPage ?: return false
         val archived = page.project.lifecycle == dev.blocks.android.project.ProjectLifecycle.ARCHIVED
         val newest = content.findViewById<View>(ProjectUiIds.NEWEST_PARKING) ?: return false
-        val history = content.findViewById<ViewGroup>(ProjectUiIds.HISTORY_SECTION) ?: return false
-        val activity = history.findViewById<LinearLayout>(ProjectUiIds.PROJECT_ACTIVITY) ?: return false
         val newestIndex = content.indexOfChild(newest)
         if (newestIndex < 0) return false
-        val allEntries = projectActivityEntries(archived)
-        val desired = allEntries.take(visibleActivityItemCount)
-        val desiredHasMore = allEntries.size > visibleActivityItemCount || controller.state.parkingHistoryHasMore
-        val existingHasMore = history.findViewById<View>(ProjectUiIds.LOAD_OLDER_PARKING) != null
-        if (desiredHasMore != existingHasMore) return false
-        val existing = (0 until activity.childCount).map(activity::getChildAt).associateBy { it.tag as? String }
-        activity.removeAllViews()
-        if (desired.isEmpty()) {
-            activity.addView(label("No older notes or park messages.", 14f, brandColor(R.color.blocks_muted)))
-        } else {
-            desired.forEach { entry -> activity.addView(existing[entry.second] ?: entry.third()) }
-        }
         content.removeViewAt(newestIndex)
         content.addView(newestParkingBlock(page.newestParking), newestIndex)
+        val records = projectParkHistoryRecords()
+        val section = content.findViewById<LinearLayout>(ProjectUiIds.PARK_HISTORY_SECTION)
+        if (records.isEmpty() && !controller.state.parkingHistoryHasMore) {
+            if (section != null) content.removeView(section)
+        } else if (section == null) {
+            content.addView(requireNotNull(projectParkHistorySection(archived)))
+        } else {
+            populateParkHistorySection(section, records, archived)
+        }
         return true
     }
 
@@ -1222,26 +1230,29 @@ class MainActivity : ComponentActivity() {
         )
     }
 
-    private fun noteCard(note: ProjectNoteItem, archived: Boolean) = noteTimelineRow(note, archived)
-
     private fun parkingHistoryRow(record: ProjectParking, archived: Boolean) = LinearLayout(this).apply {
         tag = "park:${record.id}"
         orientation = LinearLayout.VERTICAL
         setPadding(0, 0, 0, 0)
+        addView(compactDivider())
         addView(LinearLayout(this@MainActivity).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            addView(label("Park · ${formatProjectTimestamp(record.occurredAt)}", 12f,
-                brandColor(R.color.blocks_muted)).apply { setPadding(0, 0, 0, 0) },
+            gravity = Gravity.TOP
+            addView(historyFieldValue("Where I was", record.location),
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(label(formatProjectTimestamp(record.occurredAt), 12f,
+                brandColor(R.color.blocks_muted)).apply { setPadding(dp(8), dp(1), 0, 0) })
+        })
+        addView(historyFieldValue("Next physical action", record.nextAction))
+        addView(LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.BOTTOM
+            addView(historyFieldValue("Must not forget", record.mustNotForget),
                 LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
             if (!archived) addView(destructiveIconButton(R.drawable.ic_delete, "Delete park message") {
                 confirmDeleteParking(record)
             }, LinearLayout.LayoutParams(dp(48), dp(48)))
-        }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)))
-        addView(historyFieldValue("Where I was", record.location))
-        addView(historyFieldValue("Next physical action", record.nextAction))
-        addView(historyFieldValue("Must not forget", record.mustNotForget))
-        addView(compactDivider())
+        })
     }.also {
         it.layoutParams = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
@@ -1438,10 +1449,14 @@ class MainActivity : ComponentActivity() {
                     source = source,
                     renderCommitted = {
                         val added = controller.state.noteItems.singleOrNull { it.id !in priorIds }
-                        (added != null && restoreProjectView {
-                            val activity = findViewById<LinearLayout>(ProjectUiIds.PROJECT_ACTIVITY)
-                            if (activity.childCount == 1 && activity.getChildAt(0) is TextView) activity.removeAllViews()
-                            activity.addView(noteCard(added, archived = false), 0)
+                        (added != null && priorIds.isNotEmpty() && restoreProjectView {
+                            val section = findViewById<LinearLayout>(ProjectUiIds.NOTES_SECTION)
+                            val notes = controller.state.noteItems.sortedWith(
+                                compareByDescending<ProjectNoteItem> { it.pinned }
+                                    .thenByDescending { it.updatedAt }
+                                    .thenByDescending { it.id },
+                            )
+                            populateProjectNotesSection(section, notes, archived = false)
                         })
                     },
                 ) { controller.saveNoteItem(submittedBody) }
