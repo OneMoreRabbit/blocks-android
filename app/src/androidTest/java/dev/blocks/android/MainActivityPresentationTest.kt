@@ -1184,13 +1184,17 @@ class MainActivityPresentationTest {
                 assertTrue(descendantText(notes).contains("17/09/26 17:00"))
                 assertFalse(descendantText(history).contains("Newest park"))
                 assertFalse(descendantText(history).contains("Pinned context"))
-                assertEquals(3, notes.childCount)
-                assertTrue(descendantText(notes.getChildAt(0)).contains("Pinned context"))
-                assertTrue(descendantText(notes.getChildAt(1)).contains("Later edited note"))
-                assertTrue(descendantText(notes.getChildAt(2)).contains("Earlier note"))
-                assertEquals(1, history.childCount)
-                assertTrue(descendantText(history.getChildAt(0)).contains("Older park"))
-                assertTrue(descendantText(history.getChildAt(0)).contains("17/09/26 14:00"))
+                val noteRows = (0 until notes.childCount).map(notes::getChildAt)
+                    .filter { it.tag?.toString()?.startsWith("note:") == true }
+                assertEquals(3, noteRows.size)
+                assertTrue(descendantText(noteRows[0]).contains("Pinned context"))
+                assertTrue(descendantText(noteRows[1]).contains("Later edited note"))
+                assertTrue(descendantText(noteRows[2]).contains("Earlier note"))
+                val historyRows = (0 until history.childCount).map(history::getChildAt)
+                    .filter { it.tag?.toString()?.startsWith("park:") == true }
+                assertEquals(1, historyRows.size)
+                assertTrue(descendantText(historyRows.single()).contains("Older park"))
+                assertTrue(descendantText(historyRows.single()).contains("17/09/26 14:00"))
                 assertFalse(descendantText(content).contains("2026-09-17T"))
 
                 val newestDate = newest.descendants().filterIsInstance<android.widget.TextView>()
@@ -2297,7 +2301,11 @@ class MainActivityPresentationTest {
                 assertTrue(descendantText(history).contains("Place 21"))
                 assertTrue(descendantText(history).contains("Place 13"))
                 assertFalse(descendantText(history).contains("Place 12"))
-                assertEquals(9, history.childCount)
+                assertEquals(
+                    9,
+                    (0 until history.childCount).map(history::getChildAt)
+                        .count { it.tag?.toString()?.startsWith("park:") == true },
+                )
                 activity.findViewById<Button>(ProjectUiIds.LOAD_OLDER_PARKING).performClick()
             }
             waitFor(scenario) {
@@ -2317,7 +2325,10 @@ class MainActivityPresentationTest {
                 assertTrue(activity.findViewById<Button>(ProjectUiIds.LOAD_OLDER_PARKING) == null)
                 assertEquals(
                     22,
-                    activity.findViewById<ViewGroup>(ProjectUiIds.PARKING_HISTORY).childCount,
+                    activity.findViewById<ViewGroup>(ProjectUiIds.PARKING_HISTORY).let { history ->
+                        (0 until history.childCount).map(history::getChildAt)
+                            .count { it.tag?.toString()?.startsWith("park:") == true }
+                    },
                 )
             }
 
