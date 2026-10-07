@@ -1246,12 +1246,16 @@ class MainActivity : ComponentActivity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             addView(label(formatProjectTimestamp(record.occurredAt), 12f,
-                brandColor(R.color.blocks_muted)),
-                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                brandColor(R.color.blocks_muted)).apply {
+                includeFontPadding = false
+                gravity = Gravity.CENTER_VERTICAL
+                // Two physical pixels move the rendered glyph centre up by one pixel.
+                setPadding(0, 0, 0, 2)
+            }, LinearLayout.LayoutParams(0, dp(48), 1f))
             if (!archived) addView(destructiveIconButton(R.drawable.ic_delete, "Delete park message") {
                 confirmDeleteParking(record)
             }, LinearLayout.LayoutParams(dp(48), dp(48)))
-        })
+        }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)))
     }.also {
         it.layoutParams = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
@@ -1358,7 +1362,7 @@ class MainActivity : ComponentActivity() {
     private fun compactDivider(dividerId: Int) = View(this).apply {
         id = dividerId
         val line = brandColor(R.color.blocks_line)
-        setBackgroundColor(Color.argb(51, Color.red(line), Color.green(line), Color.blue(line)))
+        setBackgroundColor(Color.argb(204, Color.red(line), Color.green(line), Color.blue(line)))
         layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1)).apply {
             topMargin = 0
             bottomMargin = 0
