@@ -272,7 +272,7 @@ class MainActivityPresentationTest {
             first.moveToState(Lifecycle.State.RESUMED)
             first.onActivity { activity ->
                 assertTrue(activity.hasButton("Active project"))
-                assertTrue(activity.hasDescription("Saved on this device. Reconnect in Settings to synchronize."))
+                assertFalse(activity.hasDescription("Saved on this device. Reconnect in Settings to synchronize."))
             }
         }
         ActivityScenario.launch(MainActivity::class.java).use { restarted ->
@@ -1362,7 +1362,7 @@ class MainActivityPresentationTest {
                 activity.selectDialogItem("About")
                 val about = activity.dialogTexts().joinToString("\n")
                 assertTrue(about.contains("Blocks Android"))
-                assertTrue(about.contains("Version 0.9.4 (21)"))
+                assertTrue(about.contains("Version 0.9.5 (22)"))
                 assertTrue(about.contains("dev.blocks.android/debug"))
                 assertFalse(about.contains("tenant", ignoreCase = true))
                 assertFalse(about.contains("token", ignoreCase = true))

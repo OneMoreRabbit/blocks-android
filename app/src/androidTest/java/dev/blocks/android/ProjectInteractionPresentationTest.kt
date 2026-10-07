@@ -6,6 +6,7 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Rect
+import android.graphics.drawable.ColorDrawable
 import android.util.Log
 import android.view.View
 import android.view.ViewGroup
@@ -125,20 +126,16 @@ class ProjectInteractionPresentationTest {
                 val historicalPark = activity.findViewById<ViewGroup>(ProjectUiIds.PARKING_HISTORY)
                     .descendants().filterIsInstance<LinearLayout>()
                     .single { it.tag?.toString()?.startsWith("park:") == true }
-                val divider = historicalPark.getChildAt(0)
-                val dividerMargins = divider.layoutParams as ViewGroup.MarginLayoutParams
-                assertEquals(0, dividerMargins.topMargin)
-                assertEquals(0, dividerMargins.bottomMargin)
-                val firstFieldAndDate = historicalPark.getChildAt(1) as LinearLayout
-                assertTrue(
-                    firstFieldAndDate.descendants().filterIsInstance<Button>().none(),
-                )
+                val halfLine = (8 * activity.resources.displayMetrics.density).toInt()
+                assertEquals(halfLine, historicalPark.paddingTop)
+                assertEquals(halfLine, historicalPark.paddingBottom)
                 val lowerAction = historicalPark.getChildAt(historicalPark.childCount - 1) as LinearLayout
+                assertTrue(lowerAction.getChildAt(0) is TextView)
+                assertTrue((lowerAction.getChildAt(0) as TextView).text.toString().contains('/'))
                 assertEquals(
                     "Delete park message",
                     lowerAction.descendants().filterIsInstance<Button>().single().contentDescription.toString(),
                 )
-                assertEquals(0, historicalPark.paddingBottom)
                 activity.historicalParkDeleteButton().performClick()
             }
             waitFor(first) { it.activeDialog != null }
@@ -165,6 +162,197 @@ class ProjectInteractionPresentationTest {
                 assertFalse(activity.visibleTexts().contains("Older bench"))
             }
             assertEquals(1, store.loadSyncState(TENANT).projectCache.parkingTombstones.size)
+        }
+    }
+
+    @Test
+    fun uc08DeadOverflowIsAbsentFromDashboardAndProjectChrome() {
+        store.saveSyncState(TENANT, populatedState(parkingCount = 2))
+        installDependencies()
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.findViewById<View>(ProjectUiIds.PROJECT_TILES) != null }
+            scenario.onActivity { activity -> activity.assertNoDeadOverflowTarget() }
+            scenario.openProject()
+            scenario.onActivity { activity -> activity.assertNoDeadOverflowTarget() }
+        }
+    }
+
+    @Test
+    fun uc08DividersStayBetweenRecordsAndTheNotesParkBoundaryKeepsSectionSpacing() {
+        val fixture = populatedState(parkingCount = 4).let { state ->
+            state.copy(
+                projectCache = state.projectCache.copy(
+                    noteItems = state.projectCache.noteItems.take(3),
+                ),
+            )
+        }
+        store.saveSyncState(TENANT, fixture)
+        installDependencies()
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            scenario.openProject()
+            scenario.onActivity { activity ->
+                val noteList = activity.findViewById<ViewGroup>(ProjectUiIds.PROJECT_NOTES)
+                val noteRows = noteList.directChildren().filter { it.tag?.toString()?.startsWith("note:") == true }
+                val noteDividers = noteList.directChildren().filter { it.id == ProjectUiIds.NOTE_HISTORY_DIVIDER }
+                assertEquals(3, noteRows.size)
+                assertEquals(2, noteDividers.size)
+
+                val parkList = activity.findViewById<ViewGroup>(ProjectUiIds.PARKING_HISTORY)
+                val parkRows = parkList.directChildren().filter { it.tag?.toString()?.startsWith("park:") == true }
+                val parkDividers = parkList.directChildren().filter {
+                    it.id == ProjectUiIds.PARKING_HISTORY_DIVIDER
+                }
+                assertEquals(3, parkRows.size)
+                assertEquals(2, parkDividers.size)
+
+                val linksHeading = activity.findViewById<ViewGroup>(ProjectUiIds.LINKS_SECTION)
+                    .getChildAt(0) as TextView
+                val notesHeading = activity.findViewById<ViewGroup>(ProjectUiIds.NOTES_SECTION)
+                    .getChildAt(0) as TextView
+                val parksHeading = activity.findViewById<ViewGroup>(ProjectUiIds.PARK_HISTORY_SECTION)
+                    .getChildAt(0) as TextView
+                assertEquals(linksHeading.paddingTop, notesHeading.paddingTop)
+                assertEquals(notesHeading.paddingTop, parksHeading.paddingTop)
+            }
+        }
+    }
+
+    @Test
+    fun uc08HistoryRowsUseHalfLinePaddingAndTwentyPercentSeparators() {
+        val fixture = populatedState(parkingCount = 4).let { state ->
+            state.copy(projectCache = state.projectCache.copy(noteItems = state.projectCache.noteItems.take(3)))
+        }
+        store.saveSyncState(TENANT, fixture)
+        installDependencies()
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            scenario.openProject()
+            scenario.onActivity { activity ->
+                val noteList = activity.findViewById<ViewGroup>(ProjectUiIds.PROJECT_NOTES)
+                val parkList = activity.findViewById<ViewGroup>(ProjectUiIds.PARKING_HISTORY)
+                val rows = (noteList.directChildren() + parkList.directChildren()).filter {
+                    val tag = it.tag?.toString().orEmpty()
+                    tag.startsWith("note:") || tag.startsWith("park:")
+                }
+                val halfLine = (8 * activity.resources.displayMetrics.density).toInt()
+                rows.forEach { row ->
+                    assertEquals(halfLine, row.paddingTop)
+                    assertEquals(halfLine, row.paddingBottom)
+                }
+
+                val separators = (noteList.descendants() + parkList.descendants()).filter { view ->
+                    view !is ViewGroup && view.background is ColorDrawable &&
+                        view.layoutParams?.height in 1..(2 * activity.resources.displayMetrics.density).toInt()
+                }.toList()
+                assertTrue(separators.isNotEmpty())
+                val expectedLine = activity.getColor(R.color.blocks_line)
+                separators.forEach { divider ->
+                    val rendered = (divider.background as ColorDrawable).color
+                    assertEquals(51, Color.alpha(rendered))
+                    assertEquals(Color.red(expectedLine), Color.red(rendered))
+                    assertEquals(Color.green(expectedLine), Color.green(rendered))
+                    assertEquals(Color.blue(expectedLine), Color.blue(rendered))
+                }
+            }
+        }
+    }
+
+    @Test
+    fun uc08ParkDateAndDeleteShareTheFooterAndCancellationChangesNothing() {
+        store.saveSyncState(TENANT, populatedState(parkingCount = 4))
+        installDependencies()
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            scenario.openProject()
+            scenario.onActivity { activity ->
+                val parkRows = activity.findViewById<ViewGroup>(ProjectUiIds.PARKING_HISTORY)
+                    .directChildren().filter { it.tag?.toString()?.startsWith("park:") == true }
+                assertEquals(3, parkRows.size)
+                parkRows.forEach { row ->
+                    val group = row as ViewGroup
+                    val footer = group.getChildAt(group.childCount - 1) as ViewGroup
+                    assertTrue(footer.getChildAt(0) is TextView)
+                    assertTrue((footer.getChildAt(0) as TextView).text.toString().contains('/'))
+                    assertEquals(
+                        "Delete park message",
+                        footer.descendants().filterIsInstance<Button>().single().contentDescription.toString(),
+                    )
+                }
+                activity.historicalParkDeleteButton().performClick()
+            }
+            waitFor(scenario) { it.activeDialog != null }
+            scenario.onActivity { it.dialogButton("Cancel").performClick() }
+            assertTrue(store.loadSyncState(TENANT).projectCache.parkingTombstones.isEmpty())
+        }
+    }
+
+    @Test
+    fun uc08NoteDividersExistOnlyBetweenVisibleNotes() {
+        listOf(1 to 0, 2 to 1, 3 to 2).forEach { (noteCount, expectedDividers) ->
+            store.clearSyncState(TENANT)
+            val fixture = populatedState(parkingCount = 1).let { state ->
+                state.copy(
+                    projectCache = state.projectCache.copy(
+                        noteItems = state.projectCache.noteItems.take(noteCount),
+                    ),
+                )
+            }
+            store.saveSyncState(TENANT, fixture)
+            installDependencies()
+            ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                scenario.openProject()
+                scenario.onActivity { activity ->
+                    val noteList = activity.findViewById<ViewGroup>(ProjectUiIds.PROJECT_NOTES)
+                    assertEquals(
+                        expectedDividers,
+                        noteList.directChildren().count { it.id == ProjectUiIds.NOTE_HISTORY_DIVIDER },
+                    )
+                }
+            }
+        }
+    }
+
+    @Test
+    fun writesUc08OneNoteAndMultipleHistoryReviewPngsOutsideTheAppRepository() {
+        val output = requireNotNull(context.getExternalFilesDir("review-0.9.5"))
+        output.mkdirs()
+        val populated = populatedState(parkingCount = 4)
+        val fixtures = listOf(
+            "project-one-note" to populated.copy(
+                projectCache = populated.projectCache.copy(
+                    noteItems = populated.projectCache.noteItems.take(1),
+                    parkingRecords = populated.projectCache.parkingRecords.takeLast(1),
+                ),
+            ),
+            "project-multiple-notes-parks" to populated.copy(
+                projectCache = populated.projectCache.copy(
+                    noteItems = populated.projectCache.noteItems.take(3),
+                ),
+            ),
+        )
+
+        fixtures.forEach { (name, fixture) ->
+            store.clearSyncState(TENANT)
+            store.saveSyncState(TENANT, fixture)
+            installDependencies()
+            ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                scenario.openProject()
+                scenario.onActivity { activity -> activity.scrollProjectToExactText("Notes") }
+                InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+                val file = File(output, "$name.png")
+                scenario.onActivity { activity ->
+                    val decor = activity.window.decorView
+                    val bitmap = Bitmap.createBitmap(decor.width, decor.height, Bitmap.Config.ARGB_8888)
+                    decor.draw(Canvas(bitmap))
+                    FileOutputStream(file).use { stream ->
+                        bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)
+                    }
+                }
+                assertTrue(file.isFile && file.length() > 0)
+                Log.i(TAG, "uc08-screenshot=$file")
+            }
         }
     }
 
@@ -485,6 +673,18 @@ class ProjectInteractionPresentationTest {
             .filterIsInstance<Button>()
             .filter { it.contentDescription?.toString() == description && it.isShown }
             .toList()
+
+    private fun ViewGroup.directChildren(): List<View> =
+        (0 until childCount).map(::getChildAt)
+
+    private fun Activity.assertNoDeadOverflowTarget() {
+        assertFalse(
+            findViewById<ViewGroup>(ProjectUiIds.TOP_NAVIGATION).descendants().any {
+                it.contentDescription?.toString() ==
+                    "Saved on this device. Reconnect in Settings to synchronize."
+            },
+        )
+    }
 
     private fun Activity.historicalParkDeleteButton(): Button =
         findViewById<ViewGroup>(ProjectUiIds.PARKING_HISTORY).descendants()
