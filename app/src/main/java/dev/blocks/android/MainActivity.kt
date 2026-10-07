@@ -224,6 +224,7 @@ internal object ProjectUiIds {
     const val NOTES_SECTION = 1099
     const val PROJECT_NOTES = 1100
     const val PARK_HISTORY_SECTION = 1101
+    const val NOTE_HISTORY_DIVIDER = 1102
 }
 
 class MainActivity : ComponentActivity() {
@@ -510,9 +511,6 @@ class MainActivity : ComponentActivity() {
         }
         if (controller.state.screen == ProjectScreen.PROJECT) {
             bar.addView(View(this), LinearLayout.LayoutParams(0, 0, 1f))
-            if (controller.state.authenticationRequired || controller.state.sessionConfirmationRequired) {
-                bar.addView(unsynchronizedIndicator(), LinearLayout.LayoutParams(dp(24), dp(48)))
-            }
             bar.addView(iconOnlyButton(R.drawable.ic_settings, "Settings") { showProjectSettings() }.apply {
                 id = ProjectUiIds.PROJECT_SETTINGS
             }, LinearLayout.LayoutParams(dp(48), dp(48)))
@@ -662,9 +660,6 @@ class MainActivity : ComponentActivity() {
                 marginEnd = dp(4)
             },
         )
-        if (controller.state.authenticationRequired || controller.state.sessionConfirmationRequired) {
-            controls.addView(unsynchronizedIndicator(), LinearLayout.LayoutParams(dp(24), dp(48)))
-        }
         controls.addView(iconOnlyButton(R.drawable.ic_settings, "Settings") { showSettings() }.apply {
             id = ProjectUiIds.SETTINGS
         }, LinearLayout.LayoutParams(dp(48), dp(48)))
@@ -1075,11 +1070,16 @@ class MainActivity : ComponentActivity() {
         archived: Boolean,
     ) {
         section.removeAllViews()
-        section.addView(heading("Notes", 20f).apply { setPadding(0, dp(12), 0, dp(4)) })
+        section.addView(heading("Notes", 20f).apply { setPadding(0, dp(8), 0, dp(4)) })
         section.addView(LinearLayout(this).apply {
             id = ProjectUiIds.PROJECT_NOTES
             orientation = LinearLayout.VERTICAL
-            notes.forEach { addView(noteTimelineRow(it, archived)) }
+            notes.forEachIndexed { index, note ->
+                addView(noteTimelineRow(note, archived))
+                if (index < notes.lastIndex) {
+                    addView(compactDivider(ProjectUiIds.NOTE_HISTORY_DIVIDER))
+                }
+            }
         })
     }
 
@@ -1099,11 +1099,17 @@ class MainActivity : ComponentActivity() {
         archived: Boolean,
     ) {
         section.removeAllViews()
-        section.addView(heading("Park History", 20f).apply { setPadding(0, dp(12), 0, dp(4)) })
+        section.addView(heading("Park History", 20f).apply { setPadding(0, dp(8), 0, dp(4)) })
         section.addView(LinearLayout(this).apply {
             id = ProjectUiIds.PARKING_HISTORY
             orientation = LinearLayout.VERTICAL
-            records.take(visibleActivityItemCount).forEach { addView(parkingHistoryRow(it, archived)) }
+            val visibleRecords = records.take(visibleActivityItemCount)
+            visibleRecords.forEachIndexed { index, record ->
+                addView(parkingHistoryRow(record, archived))
+                if (index < visibleRecords.lastIndex) {
+                    addView(compactDivider(ProjectUiIds.PARKING_HISTORY_DIVIDER))
+                }
+            }
         })
         if (records.size > visibleActivityItemCount) {
             section.addView(button("Show older park messages") {
@@ -1199,7 +1205,7 @@ class MainActivity : ComponentActivity() {
     private fun noteTimelineRow(note: ProjectNoteItem, archived: Boolean) = LinearLayout(this).apply {
         tag = "note:${note.id}"
         orientation = LinearLayout.VERTICAL
-        setPadding(0, dp(2), 0, 0)
+        setPadding(0, dp(8), 0, dp(8))
         addView(label(note.body, 16f, brandColor(R.color.blocks_ink)).apply {
             setTextIsSelectable(true)
             setPadding(0, 0, 0, dp(2))
@@ -1222,7 +1228,6 @@ class MainActivity : ComponentActivity() {
                     LinearLayout.LayoutParams(dp(48), dp(48)))
             }
         })
-        addView(compactDivider())
     }.also {
         it.layoutParams = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
@@ -1233,21 +1238,15 @@ class MainActivity : ComponentActivity() {
     private fun parkingHistoryRow(record: ProjectParking, archived: Boolean) = LinearLayout(this).apply {
         tag = "park:${record.id}"
         orientation = LinearLayout.VERTICAL
-        setPadding(0, 0, 0, 0)
-        addView(compactDivider())
-        addView(LinearLayout(this@MainActivity).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.TOP
-            addView(historyFieldValue("Where I was", record.location),
-                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-            addView(label(formatProjectTimestamp(record.occurredAt), 12f,
-                brandColor(R.color.blocks_muted)).apply { setPadding(dp(8), dp(1), 0, 0) })
-        })
+        setPadding(0, dp(8), 0, dp(8))
+        addView(historyFieldValue("Where I was", record.location))
         addView(historyFieldValue("Next physical action", record.nextAction))
+        addView(historyFieldValue("Must not forget", record.mustNotForget))
         addView(LinearLayout(this@MainActivity).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.BOTTOM
-            addView(historyFieldValue("Must not forget", record.mustNotForget),
+            gravity = Gravity.CENTER_VERTICAL
+            addView(label(formatProjectTimestamp(record.occurredAt), 12f,
+                brandColor(R.color.blocks_muted)),
                 LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
             if (!archived) addView(destructiveIconButton(R.drawable.ic_delete, "Delete park message") {
                 confirmDeleteParking(record)
@@ -1356,9 +1355,11 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-    private fun compactDivider() = View(this).apply {
-        setBackgroundColor(brandColor(R.color.blocks_input))
-        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(2)).apply {
+    private fun compactDivider(dividerId: Int) = View(this).apply {
+        id = dividerId
+        val line = brandColor(R.color.blocks_line)
+        setBackgroundColor(Color.argb(51, Color.red(line), Color.green(line), Color.blue(line)))
+        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1)).apply {
             topMargin = 0
             bottomMargin = 0
         }
@@ -2486,14 +2487,6 @@ class MainActivity : ComponentActivity() {
             setPadding(dp(12), dp(12), dp(12), dp(12))
             setOnClickListener(action)
         }
-
-    private fun unsynchronizedIndicator() = ImageView(this).apply {
-        setImageResource(R.drawable.ic_more)
-        imageTintList = ColorStateList.valueOf(brandColor(R.color.blocks_muted))
-        contentDescription = "Saved on this device. Reconnect in Settings to synchronize."
-        setPadding(dp(4), dp(16), dp(4), dp(16))
-        importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
-    }
 
     private fun loadCover(image: ImageView, cover: ProjectCover, thumbnail: Boolean) {
         val tenantId = controller.activeTenantId ?: return
