@@ -27,6 +27,7 @@ import dev.blocks.android.project.InteractionMutation
 import dev.blocks.android.project.InteractionAcknowledgement
 import dev.blocks.android.project.InteractionMutationType
 import dev.blocks.android.project.LinkOrderState
+import dev.blocks.android.project.NoteOrderState
 import dev.blocks.android.project.ParkingTombstone
 import dev.blocks.android.project.ProjectItemAcknowledgement
 import dev.blocks.android.project.ProjectItemMutation
@@ -1281,6 +1282,56 @@ class ProjectSyncRepository(
     }
 
     @Synchronized
+    override fun moveNoteItem(
+        session: Session,
+        noteId: String,
+        delta: Int,
+        operationId: String,
+    ): BackgroundSyncResult {
+        if (delta == 0) return activeState(session).toResult()
+        val state = activeState(session).withProjectLinks()
+        val note = state.projectCache.noteItems.single { it.id == noteId && it.deletedAt == null }
+        require(state.projectCache.pages.single { it.project.id == note.projectId }.project.lifecycle == ProjectLifecycle.ACTIVE)
+        val aggregate = state.projectCache.noteOrders.single { it.projectId == note.projectId }
+        val from = aggregate.orderedNoteIds.indexOf(noteId)
+        val to = from + delta
+        if (from < 0 || to !in aggregate.orderedNoteIds.indices) return state.toResult()
+        val ordered = aggregate.orderedNoteIds.toMutableList().apply { add(to, removeAt(from)) }
+        val dependencies = buildList {
+            addAll(state.projectCache.itemOperations.filter {
+                it.projectId == note.projectId && it.type in NOTE_ORDER_DEPENDENCY_TYPES
+            }.map { it.operationId })
+            state.projectCache.interactionOperations.lastOrNull {
+                it.type == InteractionMutationType.REORDER_NOTES && it.projectId == note.projectId
+            }?.operationId?.let(::add)
+        }.distinct()
+        val timestamp = now()
+        val operation = InteractionMutation(
+            operationId = operationId,
+            type = InteractionMutationType.REORDER_NOTES,
+            aggregateId = aggregate.aggregateId ?: "notes:${note.projectId}",
+            projectId = note.projectId,
+            orderedClientIds = ordered,
+            baseVersion = aggregate.version,
+            dependsOnOperationIds = dependencies,
+            createdAt = timestamp,
+            contractVersion = "0.8",
+        )
+        return commitInteractionLocal(session, operation, state, state, null) { current ->
+            current.copy(
+                projectCache = current.projectCache.copy(
+                    noteOrders = current.projectCache.noteOrders.filterNot { it.projectId == note.projectId } +
+                        aggregate.copy(
+                            orderedNoteIds = ordered,
+                            version = aggregate.version + 1,
+                            updatedAt = timestamp,
+                        ),
+                ),
+            )
+        }
+    }
+
+    @Synchronized
     override fun reorderActiveProjects(
         session: Session,
         orderedProjectIds: List<String>,
@@ -1744,7 +1795,7 @@ class ProjectSyncRepository(
         operation: ProjectItemMutation,
         projection: (TenantSyncState) -> TenantSyncState,
     ): BackgroundSyncResult {
-        val state = activeState(session)
+        val state = activeState(session).withProjectLinks()
         require(operation.operationId !in state.projectCache.retiredItemOperationIds) {
             "A retired project item operation identity cannot be reused"
         }
@@ -1758,7 +1809,7 @@ class ProjectSyncRepository(
             projectCache = projected.projectCache.copy(
                 itemOperations = projected.projectCache.itemOperations + operation,
             ),
-        )
+        ).withProjectLinks()
         syncStore.saveProjectItemMutation(session.tenantId, state, updated, operation.type)
         activeStateCache = updated
         return updated.toResult()
@@ -1980,6 +2031,7 @@ class ProjectSyncRepository(
         while (true) {
             val operation = state.projectCache.interactionOperations.firstOrNull { candidate ->
                 candidate.status == ProjectMutationStatus.PENDING &&
+                    candidate.type != InteractionMutationType.REORDER_NOTES &&
                     candidate.dependsOnOperationIds.none { dependency ->
                         state.projectCache.commands.any { it.operationId == dependency } ||
                             state.projectCache.itemOperations.any { it.operationId == dependency } ||
@@ -1999,6 +2051,7 @@ class ProjectSyncRepository(
                 val acknowledgement = when (sendable.type) {
                     InteractionMutationType.REORDER_PROJECTS -> service.reorderProjects(session, sendable)
                     InteractionMutationType.REORDER_LINKS -> service.reorderLinks(session, sendable)
+                    InteractionMutationType.REORDER_NOTES -> error("API 0.8 Note ordering is not active")
                     InteractionMutationType.DELETE_PARKING -> service.deleteParking(session, sendable)
                 }
                 state = applyInteractionAcknowledgement(state, acknowledgement)
@@ -2059,6 +2112,7 @@ class ProjectSyncRepository(
                     preparedForDelivery = true,
                 )
             }
+            InteractionMutationType.REORDER_NOTES -> return PreparedInteraction(initial, null)
             InteractionMutationType.DELETE_PARKING -> {
                 val projectId = requireNotNull(operation.projectId)
                 state = state.applyAuthoritativeTombstones(
@@ -2673,6 +2727,9 @@ class ProjectSyncRepository(
                 linkOrders = projectCache.linkOrders.map { order ->
                     if (order.projectId == provisionalId) order.copy(projectId = serverId) else order
                 }.distinctBy { it.projectId },
+                noteOrders = projectCache.noteOrders.map { order ->
+                    if (order.projectId == provisionalId) order.copy(projectId = serverId) else order
+                }.distinctBy { it.projectId },
                 parkingTombstones = projectCache.parkingTombstones.map { tombstone ->
                     if (tombstone.projectId == provisionalId) tombstone.copy(projectId = serverId) else tombstone
                 },
@@ -2680,6 +2737,7 @@ class ProjectSyncRepository(
                     operation.copy(
                         aggregateId = when {
                             operation.aggregateId == "links:$provisionalId" -> "links:$serverId"
+                            operation.aggregateId == "notes:$provisionalId" -> "notes:$serverId"
                             else -> operation.aggregateId
                         },
                         projectId = if (operation.projectId == provisionalId) serverId else operation.projectId,
@@ -2817,6 +2875,20 @@ class ProjectSyncRepository(
                     cache = cache.copy(
                         linkOrders = cache.linkOrders.filterNot { it.projectId == projectId } + existing.copy(
                             orderedLinkIds = desired + liveIds.filterNot(desired::contains),
+                        ),
+                    )
+                }
+                InteractionMutationType.REORDER_NOTES -> {
+                    val projectId = requireNotNull(operation.projectId)
+                    val liveIds = cache.noteItems.filter {
+                        it.projectId == projectId && it.deletedAt == null
+                    }.map { it.id }
+                    val desired = operation.orderedClientIds.filter { it in liveIds }.distinct()
+                    val existing = cache.noteOrders.firstOrNull { it.projectId == projectId }
+                        ?: NoteOrderState(projectId)
+                    cache = cache.copy(
+                        noteOrders = cache.noteOrders.filterNot { it.projectId == projectId } + existing.copy(
+                            orderedNoteIds = desired + liveIds.filterNot(desired::contains),
                         ),
                     )
                 }
@@ -3569,6 +3641,7 @@ class ProjectSyncRepository(
                 resourceLinks = resourceLinks.distinctBy { it.id },
                 projectOrder = proposed.projectCache.projectOrder,
                 linkOrders = proposed.projectCache.linkOrders,
+                noteOrders = proposed.projectCache.noteOrders,
                 parkingTombstones = parkingTombstones,
                 interactionOperations = interactionOperations,
                 retiredInteractionOperationIds = (
@@ -3851,6 +3924,11 @@ class ProjectSyncRepository(
         val LINK_ORDER_DEPENDENCY_TYPES = setOf(
             ProjectItemMutationType.CREATE_LINK,
             ProjectItemMutationType.DELETE_LINK,
+        )
+        val NOTE_ORDER_DEPENDENCY_TYPES = setOf(
+            ProjectItemMutationType.CREATE_NOTE,
+            ProjectItemMutationType.EDIT_NOTE,
+            ProjectItemMutationType.DELETE_NOTE,
         )
         val PROJECT_ORDER_DEPENDENCY_TYPES = setOf(
             ProjectMutationType.CREATE_PROJECT,

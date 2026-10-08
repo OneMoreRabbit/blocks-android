@@ -18,6 +18,7 @@ import dev.blocks.android.project.ProjectService
 import dev.blocks.android.project.ProjectSummary
 import dev.blocks.android.project.dashboardProjects
 import dev.blocks.android.project.orderedResourceLinks
+import dev.blocks.android.project.orderedNotes
 import java.lang.reflect.Proxy
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -26,6 +27,34 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ProjectInteractionOrderingTest {
+    @Test
+    fun noteOrderMigratesPinnedVisibleSequenceAndDragQueuesOneDeferredApi08Operation() {
+        val notes = listOf(
+            note(NOTE_A, "Unpinned older", pinned = false, updatedAt = "2026-09-01T00:00:00Z"),
+            note(NOTE_B, "Pinned", pinned = true, updatedAt = "2026-09-02T00:00:00Z"),
+            note(NOTE_C, "Unpinned newer", pinned = false, updatedAt = "2026-09-03T00:00:00Z"),
+        )
+        val initial = state().copy(projectCache = state().projectCache.copy(noteItems = notes))
+        val store = MemoryStore().apply { saveSyncState(TENANT_A, initial) }
+        var repository = repository(store)
+        repository.activate(SESSION_A)
+
+        assertEquals(listOf(NOTE_B, NOTE_C, NOTE_A), repository.snapshot(SESSION_A).cache.orderedNotes(PROJECT_A).map { it.id })
+        repository.moveNoteItem(SESSION_A, NOTE_A, -2, "reorder-notes")
+
+        val durable = store.cache(TENANT_A)
+        assertEquals(listOf(NOTE_A, NOTE_B, NOTE_C), durable.orderedNotes(PROJECT_A).map { it.id })
+        val operation = durable.interactionOperations.single { it.type == InteractionMutationType.REORDER_NOTES }
+        assertEquals("0.8", operation.contractVersion)
+        assertEquals(listOf(NOTE_A, NOTE_B, NOTE_C), operation.orderedClientIds)
+
+        repository.deactivate(SESSION_A)
+        repository = repository(store)
+        repository.activate(SESSION_A)
+        assertEquals(listOf(NOTE_A, NOTE_B, NOTE_C), repository.snapshot(SESSION_A).cache.orderedNotes(PROJECT_A).map { it.id })
+        assertEquals(1, repository.snapshot(SESSION_A).pendingInteractionOperations)
+    }
+
     @Test
     fun linkOrderAppendsMovesPreservesEditAndRemovesDeleteAcrossRestart() {
         val store = MemoryStore().apply { saveSyncState(TENANT_A, state()) }
@@ -271,6 +300,10 @@ class ProjectInteractionOrderingTest {
         id, PROJECT_A, title, "https://example.com/$id", NOW, NOW,
     )
 
+    private fun note(id: String, body: String, pinned: Boolean, updatedAt: String) = ProjectNoteItem(
+        id, PROJECT_A, body, pinned, "local", NOW, updatedAt,
+    )
+
     private fun parking(id: String, occurredAt: String) = ProjectParking(
         id = id,
         projectId = PROJECT_A,
@@ -325,6 +358,8 @@ class ProjectInteractionOrderingTest {
         const val LINK_B = "20000000-0000-4000-8000-000000000002"
         const val LINK_C = "20000000-0000-4000-8000-000000000003"
         const val NOTE_A = "30000000-0000-4000-8000-000000000001"
+        const val NOTE_B = "30000000-0000-4000-8000-000000000002"
+        const val NOTE_C = "30000000-0000-4000-8000-000000000003"
         const val PARK_A = "40000000-0000-4000-8000-000000000001"
         const val PARK_B = "40000000-0000-4000-8000-000000000002"
         const val NOW = "2026-09-30T10:00:00Z"

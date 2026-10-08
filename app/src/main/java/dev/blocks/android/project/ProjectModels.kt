@@ -296,6 +296,7 @@ data class ProjectCacheState(
     val projectsAwaitingNotesBaseline: List<String> = emptyList(),
     val projectOrder: ProjectOrderState = ProjectOrderState(),
     val linkOrders: List<LinkOrderState> = emptyList(),
+    val noteOrders: List<NoteOrderState> = emptyList(),
     val parkingTombstones: List<ParkingTombstone> = emptyList(),
     val interactionOperations: List<InteractionMutation> = emptyList(),
     val retiredInteractionOperationIds: List<String> = emptyList(),
@@ -593,6 +594,12 @@ interface ProjectWorkspace {
         delta: Int,
         operationId: String = newOperationIdentity(),
     ): BackgroundSyncResult = throw UnsupportedOperationException("Project resource ordering is unavailable")
+    fun moveNoteItem(
+        session: Session,
+        noteId: String,
+        delta: Int,
+        operationId: String = newOperationIdentity(),
+    ): BackgroundSyncResult = throw UnsupportedOperationException("Project note ordering is unavailable")
     fun reorderActiveProjects(
         session: Session,
         orderedProjectIds: List<String>,

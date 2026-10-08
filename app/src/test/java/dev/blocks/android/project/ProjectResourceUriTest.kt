@@ -62,9 +62,9 @@ class ProjectResourceUriTest {
     @Test
     fun matchesTheSharedVersionedAcceptanceCorpusIncludingOrdinaryOneNoteUris() {
         val corpus = requireNotNull(javaClass.classLoader)
-            .getResourceAsStream("project-resource-uri-validation-v0_3.json")
+            .getResourceAsStream("project-resource-uri-validation-v0_4.json")
             .use { input -> Gson().fromJson(input.reader(), UriCorpus::class.java) }
-        assertEquals("0.3", corpus.version)
+        assertEquals("0.4", corpus.version)
         corpus.accepted.forEach { value ->
             assertEquals(value, ProjectResourceUri.validate(value))
             assertTrue(ProjectResourceUri.canLaunch(value))

@@ -1,5 +1,5 @@
 {
-  "version": "0.3",
+  "version": "0.4",
   "accepted": [
     "https://example.com/path?q=one",
     "HTTPS://Example.COM/path",
@@ -12,9 +12,12 @@
     "onenote:http://example.com/Notebook/Section.one",
     "onenote:page-id=1234&section-id=5678",
     "onenote://open?section-id=%7B1234%7D",
-    "ONENOTE:page-id=1234"
+    "ONENOTE:page-id=1234",
+    "https://onedrive.live.com/view.aspx?resid=910F13AC82DD6A85%21s3e41686a70774cd9a73e26455598051c&id=documents&wd=target%28Sort.one%7C6AE3E6F6-BF93-4E82-A800-D6A11845B905%2FSubstack%7C59EC03EC-06A4-7147-8D44-6520F9D5001D%2F%29&wdpartid={93C88F73-24BD-8F0A-2668-A46A00CEF572}{1}&wdsectionfileid=910F13AC82DD6A85!s9451bb338c8a4c2bb2be63bc7d8ba57d&end"
   ],
   "refused": [
+    " https://example.com/path",
+    "https://example.com/path ",
     " onenote:page-id=1234",
     "onenote:page-id=1234 ",
     "onenote:",

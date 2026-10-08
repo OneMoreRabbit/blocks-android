@@ -23,6 +23,7 @@ import dev.blocks.android.project.ProjectIdentityMapping
 import dev.blocks.android.project.InteractionMutation
 import dev.blocks.android.project.InteractionMutationType
 import dev.blocks.android.project.LinkOrderState
+import dev.blocks.android.project.NoteOrderState
 import dev.blocks.android.project.ParkingTombstone
 import dev.blocks.android.project.ProjectOrderState
 import dev.blocks.android.project.ProjectItemMutation
@@ -38,7 +39,7 @@ import dev.blocks.android.project.ProjectSummary
 import dev.blocks.android.project.ProjectUiPreferences
 import dev.blocks.android.project.noteItemDraftKey
 import dev.blocks.android.project.ensureProjectLinks
-import dev.blocks.android.project.ensureInteractionState
+import dev.blocks.android.project.ensureNoteOrderState
 import dev.blocks.android.tag.LocalBlockOperation
 import dev.blocks.android.tag.LocalBlockOperationType
 import dev.blocks.android.tag.LocalBlockRecord
@@ -93,6 +94,7 @@ internal data class EncodedSyncRows(
     val projectUiPreferences: String? = null,
     val projectOrder: String? = null,
     val linkOrders: List<String> = emptyList(),
+    val noteOrders: List<String> = emptyList(),
     val parkingTombstones: List<String> = emptyList(),
     val interactionOperations: List<String> = emptyList(),
     val retiredInteractionOperations: List<String> = emptyList(),
@@ -149,6 +151,7 @@ internal class SyncStateRowCodec(
             projectUiPreferences = gson.toJson(state.projectUiPreferences),
             projectOrder = gson.toJson(projectCache.projectOrder),
             linkOrders = projectCache.linkOrders.map(gson::toJson),
+            noteOrders = projectCache.noteOrders.map(gson::toJson),
             parkingTombstones = projectCache.parkingTombstones.map(gson::toJson),
             interactionOperations = projectCache.interactionOperations.map(gson::toJson),
             retiredInteractionOperations = projectCache.retiredInteractionOperationIds,
@@ -260,6 +263,11 @@ internal class SyncStateRowCodec(
                 } else {
                     emptyList()
                 },
+                noteOrders = if (rows.schemaVersion >= NOTE_ORDER_SCHEMA_VERSION) {
+                    rows.noteOrders.map { gson.fromJson(it, NoteOrderState::class.java) }
+                } else {
+                    emptyList()
+                },
                 parkingTombstones = if (rows.schemaVersion >= INTERACTION_ORDER_SCHEMA_VERSION) {
                     rows.parkingTombstones.map { gson.fromJson(it, ParkingTombstone::class.java) }
                 } else {
@@ -303,7 +311,9 @@ internal class SyncStateRowCodec(
                     operation
                 }
             },
-        )
+        ).let { cache ->
+            if (rows.schemaVersion < NOTE_ORDER_SCHEMA_VERSION) cache.ensureNoteOrderState() else cache
+        }
         validateProjectCache(projectCache)
         val decodedDrafts = if (rows.schemaVersion >= LOCAL_FIRST_SCHEMA_VERSION) {
             rows.projectDrafts?.let { gson.fromJson(it, FormDrafts::class.java) } ?: FormDrafts()
@@ -367,7 +377,8 @@ internal class SyncStateRowCodec(
         const val PROJECT_COVER_SCHEMA_VERSION = 9
         const val PROJECT_ITEM_SCHEMA_VERSION = 10
         const val INTERACTION_ORDER_SCHEMA_VERSION = 11
-        const val CURRENT_SCHEMA_VERSION = INTERACTION_ORDER_SCHEMA_VERSION
+        const val NOTE_ORDER_SCHEMA_VERSION = 12
+        const val CURRENT_SCHEMA_VERSION = NOTE_ORDER_SCHEMA_VERSION
     }
 }
 
@@ -671,6 +682,17 @@ internal fun validateInteractionState(cache: ProjectCacheState) {
             "A Link order must contain every live Link exactly once"
         }
     }
+    require(cache.noteOrders.map { it.projectId }.distinct().size == cache.noteOrders.size) {
+        "A Project has more than one Note order aggregate"
+    }
+    cache.noteOrders.forEach { order ->
+        require(order.version >= 0) { "A Note order version is invalid" }
+        val live = cache.noteItems.filter { it.projectId == order.projectId && it.deletedAt == null }.map { it.id }
+        require(order.orderedNoteIds.size == order.orderedNoteIds.distinct().size &&
+            order.orderedNoteIds.toSet() == live.toSet()) {
+            "A Note order must contain every live Note exactly once"
+        }
+    }
     require(cache.parkingTombstones.map { it.parkingId }.distinct().size == cache.parkingTombstones.size) {
         "A Park record has more than one tombstone"
     }
@@ -688,7 +710,8 @@ internal fun validateInteractionState(cache: ProjectCacheState) {
     }
     val positions = cache.interactionOperations.mapIndexed { index, operation -> operation.operationId to index }.toMap()
     cache.interactionOperations.forEachIndexed { index, operation ->
-        require(operation.contractVersion == "0.7" && operation.operationId.isNotBlank()) {
+        val expectedContract = if (operation.type == InteractionMutationType.REORDER_NOTES) "0.8" else "0.7"
+        require(operation.contractVersion == expectedContract && operation.operationId.isNotBlank()) {
             "An interaction operation has an invalid contract boundary"
         }
         require(operation.baseVersion >= 0) { "An interaction operation base version is invalid" }
@@ -705,6 +728,7 @@ internal fun validateInteractionState(cache: ProjectCacheState) {
         when (operation.type) {
             InteractionMutationType.REORDER_PROJECTS -> require(operation.projectId == null && operation.targetId == null)
             InteractionMutationType.REORDER_LINKS -> require(!operation.projectId.isNullOrBlank())
+            InteractionMutationType.REORDER_NOTES -> require(!operation.projectId.isNullOrBlank())
             InteractionMutationType.DELETE_PARKING -> require(
                 !operation.projectId.isNullOrBlank() && !operation.targetId.isNullOrBlank(),
             )

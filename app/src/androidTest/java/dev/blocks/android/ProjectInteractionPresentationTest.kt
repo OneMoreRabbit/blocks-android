@@ -40,6 +40,7 @@ import dev.blocks.android.project.ProjectResourceLink
 import dev.blocks.android.project.ProjectService
 import dev.blocks.android.project.ProjectSummary
 import dev.blocks.android.project.ProjectUiPreferences
+import dev.blocks.android.project.orderedNotes
 import dev.blocks.android.state.AndroidSyncStateStore
 import dev.blocks.android.state.SessionContinuity
 import dev.blocks.android.sync.NoOpLegacyQueueReplay
@@ -80,6 +81,7 @@ class ProjectInteractionPresentationTest {
     fun tearDown() {
         MainActivity.dependencyFactory = null
         store.clearSyncState(TENANT)
+        AppearancePreferences(context).write(AppearanceMode.FOLLOW_PHONE)
     }
 
     @Test
@@ -90,6 +92,26 @@ class ProjectInteractionPresentationTest {
         ActivityScenario.launch(MainActivity::class.java).use { first ->
             first.openProject()
             assertTrue(launchedLinks.isEmpty())
+            val initialNoteOrder = store.loadSyncState(TENANT).projectCache.orderedNotes(PROJECT).map { it.id }
+            first.onActivity { activity ->
+                assertFalse(activity.buttonsWithDescription("Pin note").any())
+                val noteHandle = activity.buttonsWithDescription("Reorder note. Long press and drag.").first()
+                assertTrue(
+                    renderAlpha(requireNotNull(noteHandle.compoundDrawablesRelative[0])).contentEquals(
+                        renderAlpha(requireNotNull(activity.getDrawable(R.drawable.ic_reorder_vertical))),
+                    ),
+                )
+                noteHandle.performAccessibilityActionNamed("Move note later")
+            }
+            waitFor(first) {
+                store.loadSyncState(TENANT).projectCache.orderedNotes(PROJECT).map { note -> note.id } != initialNoteOrder
+            }
+            assertEquals(
+                1,
+                store.loadSyncState(TENANT).projectCache.interactionOperations.count {
+                    it.type == dev.blocks.android.project.InteractionMutationType.REORDER_NOTES
+                },
+            )
             first.onActivity { activity -> activity.buttonWithDescription("Open First reference").performClick() }
             assertEquals(listOf(ONENOTE_URI), launchedLinks)
 
@@ -97,12 +119,12 @@ class ProjectInteractionPresentationTest {
                 val firstHandle = activity.buttonWithDescription("Reorder First reference. Long press and drag.")
                 assertTrue(
                     renderAlpha(requireNotNull(firstHandle.compoundDrawablesRelative[0])).contentEquals(
-                        renderAlpha(requireNotNull(activity.getDrawable(R.drawable.ic_link))),
+                        renderAlpha(requireNotNull(activity.getDrawable(R.drawable.ic_reorder_vertical))),
                     ),
                 )
                 val firstRow = activity.findViewById<ViewGroup>(ProjectUiIds.PROJECT_LINKS).getChildAt(0) as ViewGroup
                 assertEquals(4, firstRow.childCount)
-                assertTrue(firstRow.getChildAt(0) === firstHandle)
+                assertTrue(firstRow.getChildAt(2) === firstHandle)
                 firstHandle.performAccessibilityActionNamed("Move link later")
             }
             waitFor(first) { it.visibleLinkTitles().firstOrNull() == "Second reference" }
@@ -451,6 +473,26 @@ class ProjectInteractionPresentationTest {
     }
 
     @Test
+    fun writesUc10LightAndDarkDashboardAndProjectReviewPngsOutsideTheAppRepository() {
+        val output = requireNotNull(context.getExternalFilesDir("review-0.10.0"))
+        output.mkdirs()
+        listOf(AppearanceMode.LIGHT, AppearanceMode.DARK).forEach { mode ->
+            store.clearSyncState(TENANT)
+            store.saveSyncState(TENANT, populatedState(parkingCount = 4))
+            AppearancePreferences(context).write(mode)
+            installDependencies()
+            ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                waitFor(scenario) { it.findViewById<View>(ProjectUiIds.PROJECT_TILES) != null }
+                scenario.capturePng(File(output, "dashboard-${mode.name.lowercase()}.png"))
+                scenario.openProject()
+                scenario.onActivity { it.scrollProjectToExactText("Notes") }
+                InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+                scenario.capturePng(File(output, "project-${mode.name.lowercase()}.png"))
+            }
+        }
+    }
+
+    @Test
     fun customProjectOrderUsesOnePersistedAggregateInTileAndListViews() {
         store.saveSyncState(
             TENANT,
@@ -722,6 +764,18 @@ class ProjectInteractionPresentationTest {
             activity.viewWithDescription("Open ${project().name}").performClick()
         }
         waitFor(this) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+    }
+
+    private fun ActivityScenario<MainActivity>.capturePng(file: File) {
+        onActivity { activity ->
+            val decor = activity.window.decorView
+            val bitmap = Bitmap.createBitmap(decor.width, decor.height, Bitmap.Config.ARGB_8888)
+            decor.draw(Canvas(bitmap))
+            FileOutputStream(file).use { stream -> bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream) }
+            bitmap.recycle()
+        }
+        assertTrue(file.isFile && file.length() > 0)
+        Log.i(TAG, "uc10-screenshot=$file")
     }
 
     private fun waitFor(scenario: ActivityScenario<MainActivity>, condition: (MainActivity) -> Boolean) {

@@ -16,6 +16,7 @@ import dev.blocks.android.project.ProjectLifecycle
 import dev.blocks.android.project.ProjectMutation
 import dev.blocks.android.project.ProjectMutationType
 import dev.blocks.android.project.ProjectNotes
+import dev.blocks.android.project.ProjectNoteItem
 import dev.blocks.android.project.ProjectPage
 import dev.blocks.android.project.ProjectParking
 import dev.blocks.android.project.ProjectSummary
@@ -27,6 +28,7 @@ import dev.blocks.android.project.LinkOrderState
 import dev.blocks.android.project.ParkingTombstone
 import dev.blocks.android.project.ProjectOrderState
 import dev.blocks.android.project.ProjectUiPreferences
+import dev.blocks.android.project.orderedNotes
 import dev.blocks.android.tag.LocalBlockOperation
 import dev.blocks.android.tag.LocalBlockOperationType
 import dev.blocks.android.tag.LocalBlockRecord
@@ -244,7 +246,7 @@ class SyncStateStorageCodecTest {
         val rows = SyncStateRowCodec().encode(state)
         val decoded = SyncStateRowCodec().decode(rows)
 
-        assertEquals(11, rows.schemaVersion)
+        assertEquals(12, rows.schemaVersion)
         assertEquals(1, rows.projects.size)
         assertEquals(1, rows.commands.size)
         assertEquals(1, rows.retiredIdempotencyKeys.size)
@@ -309,11 +311,45 @@ class SyncStateStorageCodecTest {
 
     @Test
     fun rejectsAnUnknownDatabaseRowSchemaWithoutDiscardingIt() {
-        val rows = SyncStateRowCodec().encode(TenantSyncState()).copy(schemaVersion = 12)
+        val rows = SyncStateRowCodec().encode(TenantSyncState()).copy(schemaVersion = 13)
 
         val error = runCatching { SyncStateRowCodec().decode(rows) }.exceptionOrNull()
 
         assertTrue(error is IllegalArgumentException)
+    }
+
+    @Test
+    fun schemaElevenSeedsNoteOrderFromTheExactReleasedVisibleSequence() {
+        val projectId = "10000000-0000-4000-8000-000000000001"
+        val notes = listOf(
+            ProjectNoteItem("30000000-0000-4000-8000-000000000001", projectId, "Unpinned older", false, null, "2026-10-01T00:00:00Z", "2026-10-01T01:00:00Z"),
+            ProjectNoteItem("30000000-0000-4000-8000-000000000002", projectId, "Pinned", true, null, "2026-10-01T00:00:00Z", "2026-10-01T02:00:00Z"),
+            ProjectNoteItem("30000000-0000-4000-8000-000000000003", projectId, "Unpinned newer", false, null, "2026-10-01T00:00:00Z", "2026-10-01T03:00:00Z"),
+        )
+        val project = ProjectSummary(
+            projectId,
+            "00000000-0000-0000-0000-000000000001",
+            "Project",
+            ProjectLifecycle.ACTIVE,
+            1,
+            "2026-10-01T00:00:00Z",
+            "2026-10-01T00:00:00Z",
+        )
+        val current = SyncStateRowCodec().encode(
+            TenantSyncState(
+                projectCache = ProjectCacheState(
+                    activeProjects = listOf(project),
+                    pages = listOf(ProjectPage(project, ProjectNotes(projectId, "", 1, "2026-10-01T00:00:00Z"), null)),
+                    noteItems = notes,
+                ),
+            ),
+        )
+
+        val migrated = SyncStateRowCodec().decode(current.copy(schemaVersion = 11, noteOrders = emptyList()))
+
+        assertEquals(listOf(notes[1].id, notes[2].id, notes[0].id), migrated.projectCache.orderedNotes(projectId).map { it.id })
+        assertEquals(listOf(false, true, false), migrated.projectCache.noteItems.map { it.pinned })
+        assertEquals(notes.map { it.body }, migrated.projectCache.noteItems.map { it.body })
     }
 
     @Test
@@ -496,7 +532,7 @@ class SyncStateStorageCodecTest {
         val rows = SyncStateRowCodec().encode(state)
         val decoded = SyncStateRowCodec().decode(rows)
 
-        assertEquals(11, rows.schemaVersion)
+        assertEquals(12, rows.schemaVersion)
         assertEquals(
             state,
             decoded.copy(projectCache = decoded.projectCache.copy(projectLinks = emptyList())),
