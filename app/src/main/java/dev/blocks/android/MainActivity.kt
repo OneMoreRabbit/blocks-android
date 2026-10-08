@@ -168,6 +168,7 @@ internal data class NoteDragPayload(override val itemId: String) : ProjectItemDr
 internal data class LinkDragPayload(override val itemId: String) : ProjectItemDragPayload
 
 private const val PROJECT_ITEM_ACTION_ICON_SIZE_DP = 20
+private const val PROJECT_ITEM_ACTION_EDGE_GAIN_DP = 12
 
 internal object ProjectUiIds {
     const val CONTENT = 1000
@@ -465,6 +466,7 @@ class MainActivity : ComponentActivity() {
             projectViewSnapshot = null
         }
         content.removeAllViews()
+        content.clipToPadding = true
         topNavigation.removeAllViews()
         bottomActions.removeAllViews()
         if (!continuity.shouldRestore) restoreTransientDraftsIfReady()
@@ -981,6 +983,7 @@ class MainActivity : ComponentActivity() {
 
     private fun renderProject() {
         content.tag = ProjectUiIds.SCREEN_PROJECT
+        content.clipToPadding = false
         val page = requireNotNull(controller.state.projectPage)
         if (visibleProjectItemsFor != page.project.id) {
             visibleProjectItemsFor = page.project.id
@@ -1081,7 +1084,7 @@ class MainActivity : ComponentActivity() {
                         render()
                     }.apply { id = ProjectUiIds.LOAD_MORE_LINKS })
                 }
-            })
+            }, projectItemSectionLayoutParams())
         }
 
         projectNotesSection(archived)?.let(content::addView)
@@ -1095,7 +1098,7 @@ class MainActivity : ComponentActivity() {
             id = ProjectUiIds.NOTES_SECTION
             orientation = LinearLayout.VERTICAL
             populateProjectNotesSection(this, notes, archived)
-        }
+        }.also { it.layoutParams = projectItemSectionLayoutParams() }
     }
 
     private fun populateProjectNotesSection(
@@ -1111,7 +1114,9 @@ class MainActivity : ComponentActivity() {
             notes.forEachIndexed { index, note ->
                 addView(noteTimelineRow(note, archived))
                 if (index < notes.lastIndex) {
-                    addView(compactDivider(ProjectUiIds.NOTE_HISTORY_DIVIDER))
+                    addView(compactDivider(ProjectUiIds.NOTE_HISTORY_DIVIDER).apply {
+                        (layoutParams as LinearLayout.LayoutParams).marginEnd = dp(PROJECT_ITEM_ACTION_EDGE_GAIN_DP)
+                    })
                 }
             }
         })
@@ -1233,6 +1238,14 @@ class MainActivity : ComponentActivity() {
         if (!end) marginEnd = dp(6)
     }
 
+    private fun projectItemSectionLayoutParams() = LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT,
+        LinearLayout.LayoutParams.WRAP_CONTENT,
+    ).apply {
+        // Put only Note/Link actions into the unused right page inset; leave the rest of the page unchanged.
+        marginEnd = -dp(PROJECT_ITEM_ACTION_EDGE_GAIN_DP)
+    }
+
     private fun newestParkingBlock(record: ProjectParking?) = LinearLayout(this).apply {
         id = ProjectUiIds.NEWEST_PARKING
         orientation = LinearLayout.VERTICAL
@@ -1256,21 +1269,27 @@ class MainActivity : ComponentActivity() {
         addView(label(note.body, 16f, brandColor(R.color.blocks_ink)).apply {
             setTextIsSelectable(true)
             setPadding(0, 0, 0, dp(2))
+        }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+            marginEnd = dp(PROJECT_ITEM_ACTION_EDGE_GAIN_DP)
         })
         addView(LinearLayout(this@MainActivity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             addView(label(formatProjectTimestamp(note.updatedAt), 12f, brandColor(R.color.blocks_muted)).apply {
                 setPadding(0, 0, 0, 0)
-            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginEnd = dp(PROJECT_ITEM_ACTION_EDGE_GAIN_DP)
+            })
             if (!archived) {
                 addView(iconOnlyButton(R.drawable.ic_edit, "Edit note") {
                     controller.showEditNoteForm(note.id)
                     render()
-                }.compactProjectItemActionGlyph(), LinearLayout.LayoutParams(dp(48), dp(48)))
-                addView(noteDragHandle(note), LinearLayout.LayoutParams(dp(48), dp(48)))
+                }.compactProjectItemActionGlyph(12), LinearLayout.LayoutParams(dp(48), dp(48)))
+                addView(noteDragHandle(note),
+                    LinearLayout.LayoutParams(dp(48), dp(48)))
                 addView(destructiveIconButton(R.drawable.ic_delete, "Delete note") { confirmDeleteNote(note) }
-                    .compactProjectItemActionGlyph(accentOnFocus = false),
+                    .compactProjectItemActionGlyph(4, accentOnFocus = false),
                     LinearLayout.LayoutParams(dp(48), dp(48)))
             }
         })
@@ -1335,15 +1354,18 @@ class MainActivity : ComponentActivity() {
             background = roundedBackground(Color.TRANSPARENT, Color.TRANSPARENT, 0f)
             setPadding(0, 0, dp(4), 0)
             setOnClickListener { launchProjectLink(link) }
-        }, LinearLayout.LayoutParams(0, dp(48), 1f))
+        }, LinearLayout.LayoutParams(0, dp(48), 1f).apply {
+            marginEnd = dp(PROJECT_ITEM_ACTION_EDGE_GAIN_DP)
+        })
         if (!archived) {
             addView(iconOnlyButton(R.drawable.ic_edit, "Edit link") {
                 controller.showEditLinkForm(link.id)
                 render()
-            }.compactProjectItemActionGlyph(), LinearLayout.LayoutParams(dp(48), dp(48)))
-            addView(resourceLinkDragHandle(link), LinearLayout.LayoutParams(dp(48), dp(48)))
+            }.compactProjectItemActionGlyph(12), LinearLayout.LayoutParams(dp(48), dp(48)))
+            addView(resourceLinkDragHandle(link),
+                LinearLayout.LayoutParams(dp(48), dp(48)))
             addView(destructiveIconButton(R.drawable.ic_delete, "Delete link") { confirmDeleteResourceLink(link) }
-                .compactProjectItemActionGlyph(accentOnFocus = false),
+                .compactProjectItemActionGlyph(4, accentOnFocus = false),
                 LinearLayout.LayoutParams(dp(48), dp(48)))
         }
         if (!archived) setOnDragListener { _, event ->
@@ -1391,7 +1413,7 @@ class MainActivity : ComponentActivity() {
                     true
                 }
             }
-        }.compactProjectItemActionGlyph()
+        }.compactProjectItemActionGlyph(8)
 
     private fun noteDragHandle(note: ProjectNoteItem) =
         iconOnlyButton(R.drawable.ic_reorder_vertical, "Reorder note. Long press and drag.") { }.apply {
@@ -1421,7 +1443,7 @@ class MainActivity : ComponentActivity() {
                     true
                 }
             }
-        }.compactProjectItemActionGlyph()
+        }.compactProjectItemActionGlyph(8)
 
     internal fun dropNotePayload(localState: Any?, targetNoteId: String): Boolean {
         val payload = localState as? NoteDragPayload ?: return false
@@ -2548,13 +2570,16 @@ class MainActivity : ComponentActivity() {
         setOnClickListener(action)
     }
 
-    private fun Button.compactProjectItemActionGlyph(accentOnFocus: Boolean = true) = apply {
+    private fun Button.compactProjectItemActionGlyph(
+        rightwardGlyphOffsetDp: Int,
+        accentOnFocus: Boolean = true,
+    ) = apply {
         val size = dp(PROJECT_ITEM_ACTION_ICON_SIZE_DP)
         val icon = requireNotNull(compoundDrawablesRelative[0]).mutate().apply {
             setBounds(0, 0, size, size)
         }
         setCompoundDrawablesRelative(icon, null, null, null)
-        setPadding(dp(14), dp(14), dp(14), dp(14))
+        setPadding(dp(14 + rightwardGlyphOffsetDp), dp(14), dp(14 - rightwardGlyphOffsetDp), dp(14))
         minimumWidth = dp(48)
         minimumHeight = dp(48)
         if (accentOnFocus) {

@@ -234,6 +234,28 @@ class ProjectInteractionPresentationTest {
                         assertEquals(glyphSize, glyph.bounds.height())
                     }
 
+                    val scroll = activity.findViewById<ScrollView>(ProjectUiIds.ROOT_SCROLL)
+                    val scrollLocation = IntArray(2).also(scroll::getLocationOnScreen)
+                    listOf(linkActions, noteActions).forEach { actions ->
+                        val locations = actions.map { button ->
+                            IntArray(2).also(button::getLocationOnScreen)[0]
+                        }
+                        val targetEnd = locations.last() + actions.last().width
+                        val rightInset = scrollLocation[0] + scroll.width - targetEnd
+                        assertTrue("action group right inset $rightInset", abs(rightInset - (4 * density).toInt()) <= 1)
+                        assertEquals(3 * touchTarget, targetEnd - locations.first())
+                        assertEquals(locations[0] + touchTarget, locations[1])
+                        assertEquals(locations[1] + touchTarget, locations[2])
+                        assertEquals(listOf(26, 22, 18).map { (it * density).toInt() },
+                            actions.map { it.paddingLeft })
+                        assertEquals(listOf(2, 6, 10).map { (it * density).toInt() },
+                            actions.map { it.paddingRight })
+                        val visibleStart = locations.first() + actions.first().paddingLeft
+                        val visibleEnd = locations.last() + actions.last().paddingLeft + glyphSize
+                        assertTrue("visible action envelope $visibleStart..$visibleEnd",
+                            abs((visibleEnd - visibleStart) - (108 * density).toInt()) <= 2)
+                    }
+
                     val neutral = activity.getColor(R.color.blocks_ink)
                     val accent = activity.getColor(R.color.blocks_teal)
                     val nonDestructive = listOf(linkActions[0], linkActions[1], noteActions[0], noteActions[1])
