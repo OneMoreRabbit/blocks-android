@@ -2031,7 +2031,6 @@ class ProjectSyncRepository(
         while (true) {
             val operation = state.projectCache.interactionOperations.firstOrNull { candidate ->
                 candidate.status == ProjectMutationStatus.PENDING &&
-                    candidate.type != InteractionMutationType.REORDER_NOTES &&
                     candidate.dependsOnOperationIds.none { dependency ->
                         state.projectCache.commands.any { it.operationId == dependency } ||
                             state.projectCache.itemOperations.any { it.operationId == dependency } ||
@@ -2051,7 +2050,7 @@ class ProjectSyncRepository(
                 val acknowledgement = when (sendable.type) {
                     InteractionMutationType.REORDER_PROJECTS -> service.reorderProjects(session, sendable)
                     InteractionMutationType.REORDER_LINKS -> service.reorderLinks(session, sendable)
-                    InteractionMutationType.REORDER_NOTES -> error("API 0.8 Note ordering is not active")
+                    InteractionMutationType.REORDER_NOTES -> service.reorderNotes(session, sendable)
                     InteractionMutationType.DELETE_PARKING -> service.deleteParking(session, sendable)
                 }
                 state = applyInteractionAcknowledgement(state, acknowledgement)
@@ -2064,6 +2063,30 @@ class ProjectSyncRepository(
                         it.copy(deliveryUncertain = true)
                     }
                     return save(session, state)
+                }
+                if (
+                    error is ServiceException && error.status == 409 &&
+                    sendable.type == InteractionMutationType.REORDER_NOTES
+                ) {
+                    val projectId = requireNotNull(sendable.projectId)
+                    val authoritative = service.noteOrder(session, projectId)
+                    state = hydrateNoteOrderMembers(session, state, authoritative)
+                        .applyAuthoritativeOrder(authoritative, authoritative.operationId)
+                    if (state.projectCache.interactionOperations.any { it.operationId == sendable.operationId }) {
+                        state = state.updateInteractionOperation(sendable.operationId) {
+                            it.copy(
+                                aggregateId = authoritative.aggregateId,
+                                baseVersion = authoritative.version,
+                                orderedClientIds = it.orderedClientIds.normalizeMembers(
+                                    authoritative.orderedClientIds,
+                                ),
+                                deliveryUncertain = false,
+                                preparedForDelivery = false,
+                            )
+                        }
+                    }
+                    state = save(session, state)
+                    continue
                 }
                 state = state.updateInteractionOperation(sendable.operationId) {
                     it.copy(status = ProjectMutationStatus.REQUIRES_RECONCILIATION)
@@ -2112,7 +2135,22 @@ class ProjectSyncRepository(
                     preparedForDelivery = true,
                 )
             }
-            InteractionMutationType.REORDER_NOTES -> return PreparedInteraction(initial, null)
+            InteractionMutationType.REORDER_NOTES -> {
+                val projectId = requireNotNull(operation.projectId)
+                val authoritative = service.noteOrder(session, projectId)
+                state = hydrateNoteOrderMembers(session, state, authoritative)
+                    .applyAuthoritativeOrder(authoritative, authoritative.operationId)
+                if (state.projectCache.interactionOperations.none { it.operationId == operation.operationId }) {
+                    return PreparedInteraction(save(session, state), null)
+                }
+                val ordered = operation.orderedClientIds.normalizeMembers(authoritative.orderedClientIds)
+                operation.copy(
+                    aggregateId = authoritative.aggregateId,
+                    baseVersion = authoritative.version,
+                    orderedClientIds = ordered,
+                    preparedForDelivery = true,
+                )
+            }
             InteractionMutationType.DELETE_PARKING -> {
                 val projectId = requireNotNull(operation.projectId)
                 state = state.applyAuthoritativeTombstones(
@@ -2143,7 +2181,7 @@ class ProjectSyncRepository(
             }
         }
         require(prepared.aggregateId.isUuid() && prepared.baseVersion > 0) {
-            "API 0.7 interaction operation is not bound to an authoritative aggregate"
+            "Interaction operation is not bound to an authoritative aggregate"
         }
         state = state.updateInteractionOperation(operation.operationId) { prepared }
         state = save(session, state)
@@ -2161,6 +2199,7 @@ class ProjectSyncRepository(
                 orderedClientIds = acknowledgement.orderedClientIds,
                 version = acknowledgement.version,
                 operationId = acknowledgement.operationId,
+                type = acknowledgement.type,
             ),
             acknowledgement.operationId,
         )
@@ -2216,6 +2255,11 @@ class ProjectSyncRepository(
             }
             state = bestEffortInteractionRefresh(session, state) {
                 it.applyAuthoritativeTombstones(projectId, service.parkingTombstones(session, projectId))
+            }
+            state = bestEffortInteractionRefresh(session, state) {
+                val order = service.noteOrder(session, projectId)
+                hydrateNoteOrderMembers(session, it, order)
+                    .applyAuthoritativeOrder(order, order.operationId)
             }
         }
         return state
@@ -2460,6 +2504,21 @@ class ProjectSyncRepository(
                 "Link-order event and authoritative aggregate disagree"
             }
             return updated.applyAuthoritativeOrder(authoritative, operationId)
+        }
+        if (event.eventType == NOTE_ORDER_EVENT && event.eventVersion == INTERACTION_EVENT_VERSION) {
+            val resolvedProjectId = requireNotNull(projectId) { "A Note-order event has no Project identity" }
+            val operationId = requireNotNull(event.payload["operationId"]?.toString()) {
+                "A Note-order event has no operation identity"
+            }
+            val aggregateId = requireNotNull(event.payload["aggregateId"]?.toString()) {
+                "A Note-order event has no aggregate identity"
+            }
+            val authoritative = service.noteOrder(session, resolvedProjectId)
+            check(authoritative.aggregateId == aggregateId) {
+                "Note-order event and authoritative aggregate disagree"
+            }
+            return hydrateNoteOrderMembers(session, updated, authoritative)
+                .applyAuthoritativeOrder(authoritative, operationId)
         }
         if (event.eventType == PARKING_DELETED_EVENT && event.eventVersion == INTERACTION_EVENT_VERSION) {
             val resolvedProjectId = requireNotNull(projectId) { "A Park-deleted event has no Project identity" }
@@ -2775,15 +2834,22 @@ class ProjectSyncRepository(
         authoritative: AuthoritativeOrder,
         acknowledgedOperationId: String?,
     ): TenantSyncState {
+        require(authoritative.aggregateId.isUuid() && authoritative.version > 0) {
+            "Service returned an invalid order aggregate"
+        }
+        require(authoritative.orderedClientIds.size == authoritative.orderedClientIds.distinct().size) {
+            "Service returned duplicate order members"
+        }
         var cache = projectCache
         val matching = acknowledgedOperationId?.let { operationId ->
             cache.interactionOperations.firstOrNull { operation ->
                 operation.operationId == operationId &&
-                    operation.type == if (authoritative.projectId == null) {
-                        InteractionMutationType.REORDER_PROJECTS
-                    } else {
-                        InteractionMutationType.REORDER_LINKS
-                    }
+                    operation.type == authoritative.type &&
+                    operation.projectId == authoritative.projectId &&
+                    operation.preparedForDelivery &&
+                    operation.aggregateId == authoritative.aggregateId &&
+                    operation.baseVersion + 1 == authoritative.version &&
+                    operation.orderedClientIds == authoritative.orderedClientIds
             }
         }
         if (matching != null) {
@@ -2796,37 +2862,85 @@ class ProjectSyncRepository(
                     ).distinct(),
             )
         }
-        if (authoritative.projectId == null) {
-            val localIds = authoritative.orderedClientIds.mapNotNull { cache.projectIdForClientOrNull(it) }
-            if (localIds.size != authoritative.orderedClientIds.size) {
-                return copy(
-                    projectCache = cache.copy(
-                        activeProjectsLoaded = false,
-                        archivedProjectsLoaded = false,
+        when (authoritative.type) {
+            InteractionMutationType.REORDER_PROJECTS -> {
+                require(authoritative.projectId == null) { "Project order unexpectedly names a Project" }
+                val localIds = authoritative.orderedClientIds.mapNotNull { cache.projectIdForClientOrNull(it) }
+                if (localIds.size != authoritative.orderedClientIds.size) {
+                    return copy(
+                        projectCache = cache.copy(
+                            activeProjectsLoaded = false,
+                            archivedProjectsLoaded = false,
+                        ),
+                    )
+                }
+                cache = cache.copy(
+                    projectOrder = cache.projectOrder.copy(
+                        orderedProjectIds = localIds,
+                        version = authoritative.version,
+                        updatedAt = now(),
+                        aggregateId = authoritative.aggregateId,
                     ),
                 )
             }
-            cache = cache.copy(
-                projectOrder = cache.projectOrder.copy(
-                    orderedProjectIds = localIds,
-                    version = authoritative.version,
-                    updatedAt = now(),
-                    aggregateId = authoritative.aggregateId,
-                ),
-            )
-        } else {
-            val projectId = authoritative.projectId
-            val existing = cache.linkOrders.firstOrNull { it.projectId == projectId } ?: LinkOrderState(projectId)
-            cache = cache.copy(
-                linkOrders = cache.linkOrders.filterNot { it.projectId == projectId } + existing.copy(
-                    orderedLinkIds = authoritative.orderedClientIds,
-                    version = authoritative.version,
-                    updatedAt = now(),
-                    aggregateId = authoritative.aggregateId,
-                ),
-            )
+            InteractionMutationType.REORDER_LINKS -> {
+                val projectId = requireNotNull(authoritative.projectId)
+                val existing = cache.linkOrders.firstOrNull { it.projectId == projectId }
+                    ?: LinkOrderState(projectId)
+                cache = cache.copy(
+                    linkOrders = cache.linkOrders.filterNot { it.projectId == projectId } + existing.copy(
+                        orderedLinkIds = authoritative.orderedClientIds,
+                        version = authoritative.version,
+                        updatedAt = now(),
+                        aggregateId = authoritative.aggregateId,
+                    ),
+                )
+            }
+            InteractionMutationType.REORDER_NOTES -> {
+                val projectId = requireNotNull(authoritative.projectId)
+                val knownIds = cache.noteItems.filter { it.projectId == projectId }.mapTo(mutableSetOf()) { it.id }
+                require(authoritative.orderedClientIds.all { it in knownIds }) {
+                    "Service Note order contains an unhydrated member"
+                }
+                val existing = cache.noteOrders.firstOrNull { it.projectId == projectId }
+                    ?: NoteOrderState(projectId)
+                cache = cache.copy(
+                    noteOrders = cache.noteOrders.filterNot { it.projectId == projectId } + existing.copy(
+                        orderedNoteIds = authoritative.orderedClientIds,
+                        version = authoritative.version,
+                        updatedAt = now(),
+                        aggregateId = authoritative.aggregateId,
+                    ),
+                )
+            }
+            InteractionMutationType.DELETE_PARKING -> error("A Park deletion cannot be an order aggregate")
         }
         return copy(projectCache = cache).reapplyPendingInteractionProjection()
+    }
+
+    private fun hydrateNoteOrderMembers(
+        session: Session,
+        initial: TenantSyncState,
+        authoritative: AuthoritativeOrder,
+    ): TenantSyncState {
+        if (authoritative.type != InteractionMutationType.REORDER_NOTES) return initial
+        val projectId = requireNotNull(authoritative.projectId)
+        var state = initial
+        val knownIds = state.projectCache.noteItems.filter { it.projectId == projectId }
+            .mapTo(mutableSetOf()) { it.id }
+        authoritative.orderedClientIds.filterNot(knownIds::contains).forEach { noteId ->
+            val note = service.readNote(session, projectId, noteId)
+            check(note.projectId == projectId && note.deletedAt == null) {
+                "Service returned an invalid live Note-order member"
+            }
+            state = state.copy(
+                projectCache = state.projectCache.copy(
+                    noteItems = state.projectCache.noteItems.filterNot { it.id == noteId } + note,
+                ),
+            )
+            knownIds += noteId
+        }
+        return state
     }
 
     private fun TenantSyncState.applyAuthoritativeTombstones(
@@ -3908,6 +4022,7 @@ class ProjectSyncRepository(
         const val INTERACTION_EVENT_VERSION = "0.1"
         const val PROJECT_ORDER_EVENT = "project.order_changed"
         const val LINK_ORDER_EVENT = "project.link_order_changed"
+        const val NOTE_ORDER_EVENT = "project.note_order_changed"
         const val PARKING_DELETED_EVENT = "project.parking_deleted"
         val PENDING_TAG_STATES = setOf(LocalBlockState.AWAITING_WRITE, LocalBlockState.WRITE_UNCERTAIN)
         val NOTE_ITEM_TYPES = setOf(

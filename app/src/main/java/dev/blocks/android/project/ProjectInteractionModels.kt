@@ -41,6 +41,11 @@ data class AuthoritativeOrder(
     val orderedClientIds: List<String>,
     val version: Int,
     val operationId: String?,
+    val type: InteractionMutationType = if (projectId == null) {
+        InteractionMutationType.REORDER_PROJECTS
+    } else {
+        InteractionMutationType.REORDER_LINKS
+    },
 )
 
 enum class InteractionMutationType {
@@ -50,7 +55,7 @@ enum class InteractionMutationType {
     DELETE_PARKING,
 }
 
-/** Durable API 0.7 envelope. Preparation binds the local intent to the authoritative aggregate before first send. */
+/** Durable interaction envelope. Preparation binds local intent to the authoritative aggregate before first send. */
 data class InteractionMutation(
     val operationId: String,
     val type: InteractionMutationType,
@@ -79,6 +84,11 @@ sealed interface InteractionAcknowledgement {
         override val version: Int,
         val projectId: String?,
         val orderedClientIds: List<String>,
+        val type: InteractionMutationType = if (projectId == null) {
+            InteractionMutationType.REORDER_PROJECTS
+        } else {
+            InteractionMutationType.REORDER_LINKS
+        },
     ) : InteractionAcknowledgement
 
     data class Parking(

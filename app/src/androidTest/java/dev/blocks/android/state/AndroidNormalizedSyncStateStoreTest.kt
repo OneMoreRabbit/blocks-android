@@ -75,7 +75,11 @@ class AndroidNormalizedSyncStateStoreTest {
     @Before
     @After
     fun clear() {
-        listOf(TENANT, FAILED_TENANT, OTHER_TENANT, BEFORE_MARKER_TENANT, AFTER_MARKER_TENANT).forEach {
+        val tenants = mutableListOf(TENANT, FAILED_TENANT, OTHER_TENANT, BEFORE_MARKER_TENANT, AFTER_MARKER_TENANT)
+        if (InstrumentationRegistry.getArguments().getString("preserveForceStopFixture") != "true") {
+            tenants += FORCE_STOP_TENANT
+        }
+        tenants.forEach {
             store.clearSyncState(it)
         }
     }
@@ -832,6 +836,187 @@ class AndroidNormalizedSyncStateStoreTest {
         )
     }
 
+    @Test
+    fun uc10PhaseOnePersistsAnUnpreparedNoteOrderBeforeForceStop() {
+        store.clearSyncState(FORCE_STOP_TENANT)
+        store.saveSyncState(FORCE_STOP_TENANT, forceStopNoteOrderState())
+        val repository = forceStopNoteOrderRepository(ForceStopNoteOrderFarEnd())
+        repository.activate(FORCE_STOP_SESSION)
+
+        repository.moveNoteItem(FORCE_STOP_SESSION, FORCE_STOP_NOTE_B, -1, FORCE_STOP_OPERATION)
+
+        val durable = AndroidSyncStateStore(context).loadSyncState(FORCE_STOP_TENANT).projectCache
+        val operation = durable.interactionOperations.single { it.operationId == FORCE_STOP_OPERATION }
+        assertEquals(InteractionMutationType.REORDER_NOTES, operation.type)
+        assertEquals("0.8", operation.contractVersion)
+        assertFalse(operation.preparedForDelivery)
+        assertEquals(listOf(FORCE_STOP_NOTE_B, FORCE_STOP_NOTE_A), operation.orderedClientIds)
+    }
+
+    @Test
+    fun uc10PhaseTwoDeliversThePersistedNoteOrderAfterForceStop() {
+        val requirePersistedFixture = InstrumentationRegistry.getArguments()
+            .getString("requireForceStopFixture") == "true"
+        if (!normalizedDatabase(FORCE_STOP_TENANT).exists()) {
+            check(!requirePersistedFixture) { "The force-stop continuation fixture is missing" }
+            store.saveSyncState(FORCE_STOP_TENANT, forceStopNoteOrderState())
+            forceStopNoteOrderRepository(ForceStopNoteOrderFarEnd()).also { repository ->
+                repository.activate(FORCE_STOP_SESSION)
+                repository.moveNoteItem(
+                    FORCE_STOP_SESSION,
+                    FORCE_STOP_NOTE_B,
+                    -1,
+                    FORCE_STOP_OPERATION,
+                )
+                repository.deactivate(FORCE_STOP_SESSION)
+            }
+        }
+        val farEnd = ForceStopNoteOrderFarEnd()
+        val repository = forceStopNoteOrderRepository(farEnd)
+        repository.activate(FORCE_STOP_SESSION)
+
+        repository.backgroundSync(FORCE_STOP_SESSION)
+
+        val durable = AndroidSyncStateStore(context).loadSyncState(FORCE_STOP_TENANT).projectCache
+        assertEquals(1, farEnd.deliveries.size)
+        assertEquals(FORCE_STOP_OPERATION, farEnd.deliveries.single().operationId)
+        assertTrue(farEnd.deliveries.single().preparedForDelivery)
+        assertTrue(durable.interactionOperations.isEmpty())
+        assertTrue(FORCE_STOP_OPERATION in durable.retiredInteractionOperationIds)
+        assertEquals(
+            listOf(FORCE_STOP_NOTE_B, FORCE_STOP_NOTE_A),
+            durable.noteOrders.single { it.projectId == FORCE_STOP_PROJECT }.orderedNoteIds,
+        )
+        store.clearSyncState(FORCE_STOP_TENANT)
+    }
+
+    private fun forceStopNoteOrderRepository(farEnd: ForceStopNoteOrderFarEnd) = ProjectSyncRepository(
+        farEnd.service(),
+        NoOpLegacyQueueReplay,
+        NoOpDraftStore,
+        AndroidSyncStateStore(context),
+        now = { NOW },
+        coverMediaStore = InMemoryProjectCoverMediaStore(),
+    )
+
+    private fun forceStopNoteOrderState(): TenantSyncState {
+        val project = ProjectSummary(
+            FORCE_STOP_PROJECT,
+            FORCE_STOP_TENANT,
+            "Restart fixture",
+            ProjectLifecycle.ACTIVE,
+            1,
+            NOW,
+            NOW,
+            clientId = FORCE_STOP_PROJECT,
+        )
+        val notes = listOf(
+            ProjectNoteItem(FORCE_STOP_NOTE_A, FORCE_STOP_PROJECT, "First", false, "service-user", NOW, NOW, rowVersion = 1),
+            ProjectNoteItem(FORCE_STOP_NOTE_B, FORCE_STOP_PROJECT, "Second", false, "service-user", NOW, NOW, rowVersion = 1),
+        )
+        return TenantSyncState(
+            projectCache = ProjectCacheState(
+                activeProjects = listOf(project),
+                activeProjectsLoaded = true,
+                archivedProjectsLoaded = true,
+                pages = listOf(ProjectPage(project, ProjectNotes(FORCE_STOP_PROJECT, "", 1, NOW), null)),
+                parkingLoadedProjectIds = listOf(FORCE_STOP_PROJECT),
+                blocksLoaded = true,
+                noteItems = notes,
+                projectOrder = ProjectOrderState(
+                    listOf(FORCE_STOP_PROJECT),
+                    1,
+                    NOW,
+                    FORCE_STOP_PROJECT_ORDER,
+                ),
+                linkOrders = listOf(LinkOrderState(FORCE_STOP_PROJECT, emptyList(), 1, NOW, FORCE_STOP_LINK_ORDER)),
+                noteOrders = listOf(
+                    NoteOrderState(
+                        FORCE_STOP_PROJECT,
+                        listOf(FORCE_STOP_NOTE_A, FORCE_STOP_NOTE_B),
+                        1,
+                        NOW,
+                        FORCE_STOP_NOTE_ORDER,
+                    ),
+                ),
+            ),
+            projectDraftsMigrated = true,
+        )
+    }
+
+    private class ForceStopNoteOrderFarEnd {
+        val deliveries = mutableListOf<InteractionMutation>()
+        private val project = ProjectSummary(
+            FORCE_STOP_PROJECT,
+            FORCE_STOP_TENANT,
+            "Restart fixture",
+            ProjectLifecycle.ACTIVE,
+            1,
+            NOW,
+            NOW,
+            clientId = FORCE_STOP_PROJECT,
+        )
+        private var noteOrder = AuthoritativeOrder(
+            FORCE_STOP_NOTE_ORDER,
+            FORCE_STOP_PROJECT,
+            listOf(FORCE_STOP_NOTE_A, FORCE_STOP_NOTE_B),
+            1,
+            null,
+            InteractionMutationType.REORDER_NOTES,
+        )
+
+        @Suppress("UNCHECKED_CAST")
+        fun service(): ProjectService = Proxy.newProxyInstance(
+            ProjectService::class.java.classLoader,
+            arrayOf(ProjectService::class.java),
+        ) { _, method, arguments ->
+            val args = arguments.orEmpty()
+            when (method.name) {
+                "listProjects" -> if (args[1] == ProjectLifecycle.ACTIVE) listOf(project) else emptyList<ProjectSummary>()
+                "projectPage" -> ProjectPage(project, ProjectNotes(FORCE_STOP_PROJECT, "", 1, NOW), null)
+                "blocks", "parking", "parkingTombstones" -> emptyList<Any>()
+                "changes" -> ChangePage(emptyList(), null, false)
+                "projectOrder" -> AuthoritativeOrder(
+                    FORCE_STOP_PROJECT_ORDER,
+                    null,
+                    listOf(FORCE_STOP_PROJECT),
+                    1,
+                    null,
+                )
+                "linkOrder" -> AuthoritativeOrder(
+                    FORCE_STOP_LINK_ORDER,
+                    FORCE_STOP_PROJECT,
+                    emptyList(),
+                    1,
+                    null,
+                )
+                "noteOrder" -> noteOrder
+                "attachNavigationKey" -> args[2] as ProjectKey
+                "reorderNotes" -> {
+                    val operation = args[1] as InteractionMutation
+                    deliveries += operation
+                    check(operation.operationId == FORCE_STOP_OPERATION)
+                    check(operation.aggregateId == noteOrder.aggregateId)
+                    check(operation.baseVersion == noteOrder.version)
+                    noteOrder = noteOrder.copy(
+                        orderedClientIds = operation.orderedClientIds,
+                        version = noteOrder.version + 1,
+                        operationId = operation.operationId,
+                    )
+                    InteractionAcknowledgement.Order(
+                        operation.operationId,
+                        operation.aggregateId,
+                        noteOrder.version,
+                        FORCE_STOP_PROJECT,
+                        operation.orderedClientIds,
+                        InteractionMutationType.REORDER_NOTES,
+                    )
+                }
+                else -> error("Unexpected Service call ${method.name}")
+            }
+        } as ProjectService
+    }
+
     private class PersistentRemapFarEnd {
         var parkingReadsOffline = true
         var deleteCalls = 0
@@ -851,6 +1036,16 @@ class AndroidNormalizedSyncStateStoreTest {
         private var projectOrder = AuthoritativeOrder(PROJECT_ORDER_AGGREGATE, null, listOf(PROJECT), 1, null)
         private val linkOrders = mutableMapOf(
             PROJECT to AuthoritativeOrder(LINK_ORDER_AGGREGATE, PROJECT, listOf(LINK_ID), 1, null),
+        )
+        private val noteOrders = mutableMapOf(
+            PROJECT to AuthoritativeOrder(
+                FORCE_STOP_NOTE_ORDER,
+                PROJECT,
+                emptyList(),
+                1,
+                null,
+                InteractionMutationType.REORDER_NOTES,
+            ),
         )
 
         @Suppress("UNCHECKED_CAST")
@@ -880,6 +1075,14 @@ class AndroidNormalizedSyncStateStoreTest {
                             1,
                             null,
                         )
+                        noteOrders[created.id] = AuthoritativeOrder(
+                            SERVER_NOTE_ORDER_AGGREGATE,
+                            created.id,
+                            emptyList(),
+                            1,
+                            null,
+                            InteractionMutationType.REORDER_NOTES,
+                        )
                         projectOrder = projectOrder.copy(
                             orderedClientIds = projectOrder.orderedClientIds + clientId,
                             version = projectOrder.version + 1,
@@ -906,6 +1109,7 @@ class AndroidNormalizedSyncStateStoreTest {
                 "changes" -> ChangePage(emptyList(), null, false)
                 "projectOrder" -> projectOrder
                 "linkOrder" -> linkOrders.getValue(args[1] as String)
+                "noteOrder" -> noteOrders.getValue(args[1] as String)
                 "parkingTombstones" -> {
                     if (parkingReadsOffline) {
                         throw ServiceException(503, ApiError(ApiErrorCode.UNKNOWN, "offline at acknowledgement boundary"))
@@ -1337,7 +1541,17 @@ class AndroidNormalizedSyncStateStoreTest {
         const val PROJECT_ORDER_AGGREGATE = "e23e4567-e89b-42d3-a456-426614174075"
         const val LINK_ORDER_AGGREGATE = "f23e4567-e89b-42d3-a456-426614174075"
         const val SERVER_LINK_ORDER_AGGREGATE = "023e4567-e89b-42d3-a456-426614174075"
+        const val SERVER_NOTE_ORDER_AGGREGATE = "123e4567-e89b-42d3-a456-426614174076"
+        const val FORCE_STOP_TENANT = "133e4567-e89b-42d3-a456-426614174075"
+        const val FORCE_STOP_PROJECT = "233e4567-e89b-42d3-a456-426614174075"
+        const val FORCE_STOP_NOTE_A = "333e4567-e89b-42d3-a456-426614174075"
+        const val FORCE_STOP_NOTE_B = "433e4567-e89b-42d3-a456-426614174075"
+        const val FORCE_STOP_OPERATION = "533e4567-e89b-42d3-a456-426614174075"
+        const val FORCE_STOP_PROJECT_ORDER = "633e4567-e89b-42d3-a456-426614174075"
+        const val FORCE_STOP_LINK_ORDER = "733e4567-e89b-42d3-a456-426614174075"
+        const val FORCE_STOP_NOTE_ORDER = "833e4567-e89b-42d3-a456-426614174075"
         const val NOW = "2026-09-15T12:00:00Z"
+        val FORCE_STOP_SESSION = Session(FORCE_STOP_TENANT, "force-stop-token")
         val TAG_TOKEN = OpaqueTagToken.fromBytes(ByteArray(32) { (it + 41).toByte() })
     }
 

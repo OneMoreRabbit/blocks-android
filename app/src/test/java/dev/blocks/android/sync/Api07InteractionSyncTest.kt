@@ -16,18 +16,21 @@ import dev.blocks.android.project.BackgroundSyncResult
 import dev.blocks.android.project.InteractionAcknowledgement
 import dev.blocks.android.project.InteractionMutation
 import dev.blocks.android.project.LinkOrderState
+import dev.blocks.android.project.NoteOrderState
 import dev.blocks.android.project.ParkingTombstone
 import dev.blocks.android.project.ProjectCacheState
 import dev.blocks.android.project.ProjectItemAcknowledgement
 import dev.blocks.android.project.ProjectItemMutation
 import dev.blocks.android.project.ProjectLifecycle
 import dev.blocks.android.project.ProjectNotes
+import dev.blocks.android.project.ProjectNoteItem
 import dev.blocks.android.project.ProjectPage
 import dev.blocks.android.project.ProjectParking
 import dev.blocks.android.project.ProjectResourceLink
 import dev.blocks.android.project.ProjectService
 import dev.blocks.android.project.ProjectSummary
 import dev.blocks.android.project.visibleParking
+import dev.blocks.android.project.orderedNotes
 import java.lang.reflect.Proxy
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -607,6 +610,204 @@ class Api07InteractionSyncTest {
     }
 
     @Test
+    fun queuedPreActivationNoteOrderPreparesAndDeliversAfterProcessRestart() {
+        val initial = stateWithNotes()
+        val store = MemoryStore().apply { saveSyncState(TENANT_A, initial) }
+        val farEnd = FarEnd().apply {
+            noteItems[PROJECT_A] = initial.projectCache.noteItems.toMutableList()
+            noteOrders[PROJECT_A] = noteOrders.getValue(PROJECT_A).copy(
+                orderedClientIds = listOf(NOTE_A, NOTE_B),
+            )
+        }
+        var repository = repository(store, farEnd.service())
+        repository.activate(SESSION_A)
+        repository.moveNoteItem(SESSION_A, NOTE_B, -1, OP_NOTE_ORDER)
+        repository.deactivate(SESSION_A)
+
+        repository = repository(store, farEnd.service())
+        repository.activate(SESSION_A)
+        repository.backgroundSync(SESSION_A)
+
+        val delivered = farEnd.noteReorders.single()
+        assertEquals(OP_NOTE_ORDER, delivered.operationId)
+        assertEquals("0.8", delivered.contractVersion)
+        assertTrue(delivered.preparedForDelivery)
+        assertEquals(NOTE_AGGREGATE_A, delivered.aggregateId)
+        assertEquals(listOf(NOTE_B, NOTE_A), delivered.orderedClientIds)
+        assertTrue(store.loadSyncState(TENANT_A).projectCache.interactionOperations.isEmpty())
+        assertTrue(OP_NOTE_ORDER in store.loadSyncState(TENANT_A).projectCache.retiredInteractionOperationIds)
+        assertEquals(
+            listOf(NOTE_B, NOTE_A),
+            store.loadSyncState(TENANT_A).projectCache.orderedNotes(PROJECT_A).map { it.id },
+        )
+    }
+
+    @Test
+    fun lostNoteOrderResponseReplaysTheExactPreparedEnvelopeWithoutSecondMutation() {
+        val initial = stateWithNotes()
+        val store = MemoryStore().apply { saveSyncState(TENANT_A, initial) }
+        val farEnd = FarEnd().apply {
+            noteItems[PROJECT_A] = initial.projectCache.noteItems.toMutableList()
+            noteOrders[PROJECT_A] = noteOrders.getValue(PROJECT_A).copy(
+                orderedClientIds = listOf(NOTE_A, NOTE_B),
+            )
+            loseNextNoteOrderResponse = true
+            hideAcceptedNoteOperationFromAggregate = true
+        }
+        var repository = repository(store, farEnd.service())
+        repository.activate(SESSION_A)
+        repository.moveNoteItem(SESSION_A, NOTE_B, -1, OP_NOTE_ORDER)
+        repository.backgroundSync(SESSION_A)
+
+        val uncertain = store.loadSyncState(TENANT_A).projectCache.interactionOperations.single()
+        assertTrue(uncertain.deliveryUncertain)
+        assertTrue(uncertain.preparedForDelivery)
+
+        repository.deactivate(SESSION_A)
+        repository = repository(store, farEnd.service())
+        repository.activate(SESSION_A)
+        repository.backgroundSync(SESSION_A)
+
+        assertEquals(2, farEnd.noteReorders.size)
+        assertEquals(
+            farEnd.noteReorders[0].copy(deliveryUncertain = false),
+            farEnd.noteReorders[1].copy(deliveryUncertain = false),
+        )
+        assertEquals(1, farEnd.noteOrderMutationCount)
+        assertTrue(store.loadSyncState(TENANT_A).projectCache.interactionOperations.isEmpty())
+    }
+
+    @Test
+    fun staleNoteOrderConflictReadsAuthoritativeStateThenRetriesTheSameIdentity() {
+        val initial = stateWithNotes()
+        val store = MemoryStore().apply { saveSyncState(TENANT_A, initial) }
+        val farEnd = FarEnd().apply {
+            noteItems[PROJECT_A] = initial.projectCache.noteItems.toMutableList()
+            noteOrders[PROJECT_A] = noteOrders.getValue(PROJECT_A).copy(
+                orderedClientIds = listOf(NOTE_A, NOTE_B),
+            )
+            conflictNextNoteOrder = true
+        }
+        val repository = repository(store, farEnd.service())
+        repository.activate(SESSION_A)
+        repository.moveNoteItem(SESSION_A, NOTE_B, -1, OP_NOTE_ORDER)
+
+        repository.backgroundSync(SESSION_A)
+
+        assertEquals(2, farEnd.noteReorders.size)
+        assertEquals(listOf(OP_NOTE_ORDER, OP_NOTE_ORDER), farEnd.noteReorders.map { it.operationId })
+        assertEquals(listOf(1, 2), farEnd.noteReorders.map { it.baseVersion })
+        assertEquals(1, farEnd.noteOrderMutationCount)
+        assertTrue(store.loadSyncState(TENANT_A).projectCache.interactionOperations.isEmpty())
+        assertEquals(listOf(NOTE_B, NOTE_A), farEnd.noteOrders.getValue(PROJECT_A).orderedClientIds)
+    }
+
+    @Test
+    fun noteOrderEventHydratesEveryUnknownMemberAndAdvancesCursorAtomically() {
+        val initial = stateWithNotes()
+        val remoteNote = note(NOTE_C)
+        val store = MemoryStore().apply { saveSyncState(TENANT_A, initial) }
+        val farEnd = FarEnd().apply {
+            noteItems[PROJECT_A] = (initial.projectCache.noteItems + remoteNote).toMutableList()
+            noteOrders[PROJECT_A] = noteOrders.getValue(PROJECT_A).copy(
+                orderedClientIds = listOf(NOTE_C, NOTE_A, NOTE_B),
+                version = 2,
+                operationId = REMOTE_NOTE_ORDER,
+            )
+            changes += ChangePage(
+                listOf(
+                    change(
+                        "81",
+                        "project.note_order_changed",
+                        mapOf(
+                            "projectId" to PROJECT_A,
+                            "aggregateId" to NOTE_AGGREGATE_A,
+                            "operationId" to REMOTE_NOTE_ORDER,
+                        ),
+                    ),
+                ),
+                "81",
+                false,
+            )
+        }
+        val repository = repository(store, farEnd.service())
+        repository.activate(SESSION_A)
+
+        repository.backgroundSync(SESSION_A)
+
+        val durable = store.loadSyncState(TENANT_A)
+        assertEquals("81", durable.changeCursor)
+        assertTrue(durable.projectCache.noteItems.any { it.id == NOTE_C })
+        assertEquals(listOf(NOTE_C, NOTE_A, NOTE_B), durable.projectCache.orderedNotes(PROJECT_A).map { it.id })
+    }
+
+    @Test
+    fun twoIndependentClientStoresConvergeThroughOneAuthoritativeNoteOrder() {
+        val initial = stateWithNotes()
+        val farEnd = FarEnd().apply {
+            noteItems[PROJECT_A] = initial.projectCache.noteItems.toMutableList()
+            noteOrders[PROJECT_A] = noteOrders.getValue(PROJECT_A).copy(
+                orderedClientIds = listOf(NOTE_A, NOTE_B),
+            )
+        }
+        val firstStore = MemoryStore().apply { saveSyncState(TENANT_A, initial) }
+        val secondStore = MemoryStore().apply { saveSyncState(TENANT_A, initial) }
+        val first = repository(firstStore, farEnd.service()).also { it.activate(SESSION_A) }
+        val second = repository(secondStore, farEnd.service()).also { it.activate(SESSION_A) }
+
+        first.moveNoteItem(SESSION_A, NOTE_B, -1, OP_NOTE_ORDER)
+        first.backgroundSync(SESSION_A)
+        second.backgroundSync(SESSION_A)
+
+        assertEquals(
+            firstStore.loadSyncState(TENANT_A).projectCache.orderedNotes(PROJECT_A).map { it.id },
+            secondStore.loadSyncState(TENANT_A).projectCache.orderedNotes(PROJECT_A).map { it.id },
+        )
+        second.moveNoteItem(SESSION_A, NOTE_A, -1, OP_NOTE_ORDER_B)
+        second.backgroundSync(SESSION_A)
+        first.backgroundSync(SESSION_A)
+        assertEquals(listOf(NOTE_A, NOTE_B), farEnd.noteOrders.getValue(PROJECT_A).orderedClientIds)
+        assertEquals(
+            firstStore.loadSyncState(TENANT_A).projectCache.orderedNotes(PROJECT_A).map { it.id },
+            secondStore.loadSyncState(TENANT_A).projectCache.orderedNotes(PROJECT_A).map { it.id },
+        )
+    }
+
+    @Test
+    fun foregroundNoteOrderDuringAcknowledgementPreservesBothOperationsAcrossRestart() {
+        val initial = stateWithNotes()
+        val store = MemoryStore().apply { saveSyncState(TENANT_A, initial) }
+        val farEnd = FarEnd().apply {
+            noteItems[PROJECT_A] = initial.projectCache.noteItems.toMutableList()
+            noteOrders[PROJECT_A] = noteOrders.getValue(PROJECT_A).copy(
+                orderedClientIds = listOf(NOTE_A, NOTE_B),
+            )
+            blockFirstNoteReorder = true
+        }
+        var repository = repository(store, farEnd.service())
+        repository.activate(SESSION_A)
+        repository.moveNoteItem(SESSION_A, NOTE_B, -1, OP_NOTE_ORDER)
+        val executor = Executors.newSingleThreadExecutor()
+        val sync = executor.submit<BackgroundSyncResult> { repository.backgroundSync(SESSION_A) }
+        assertTrue(farEnd.noteReorderEntered.await(5, TimeUnit.SECONDS))
+
+        repository.moveNoteItem(SESSION_A, NOTE_A, -1, OP_NOTE_ORDER_B)
+        farEnd.releaseNoteReorder.countDown()
+        sync.get(10, TimeUnit.SECONDS)
+        executor.shutdownNow()
+
+        assertEquals(listOf(OP_NOTE_ORDER, OP_NOTE_ORDER_B), farEnd.noteReorders.map { it.operationId })
+        assertTrue(store.loadSyncState(TENANT_A).projectCache.interactionOperations.isEmpty())
+        repository.deactivate(SESSION_A)
+        repository = repository(store, farEnd.service())
+        repository.activate(SESSION_A)
+        assertEquals(
+            listOf(NOTE_A, NOTE_B),
+            repository.snapshot(SESSION_A).cache.orderedNotes(PROJECT_A).map { it.id },
+        )
+    }
+
+    @Test
     fun identifierOnlyParkEventCommitsTombstoneAndCursorWithoutDeletingAuthoredContent() {
         val store = MemoryStore().apply {
             saveSyncState(TENANT_A, state())
@@ -720,6 +921,18 @@ class Api07InteractionSyncTest {
         )
     }
 
+    private fun stateWithNotes(): TenantSyncState {
+        val base = state()
+        return base.copy(
+            projectCache = base.projectCache.copy(
+                noteItems = listOf(note(NOTE_A), note(NOTE_B)),
+                noteOrders = listOf(
+                    NoteOrderState(PROJECT_A, listOf(NOTE_A, NOTE_B), 1, NOW, NOTE_AGGREGATE_A),
+                ),
+            ),
+        )
+    }
+
     private fun stateWithSecondPark(): TenantSyncState {
         val base = state()
         val second = parking().copy(
@@ -744,7 +957,13 @@ class Api07InteractionSyncTest {
     private fun change(id: String, type: String, payload: Map<String, Any?>) = ChangeEvent(
         eventId = id,
         eventType = type,
-        eventVersion = if (type in setOf("project.order_changed", "project.parking_deleted")) "0.1" else "0.7",
+        eventVersion = if (type in setOf(
+                "project.order_changed",
+                "project.link_order_changed",
+                "project.note_order_changed",
+                "project.parking_deleted",
+            )
+        ) "0.1" else "0.7",
         tenantId = TENANT_A,
         payload = payload,
     )
@@ -762,6 +981,17 @@ class Api07InteractionSyncTest {
     )
 
     private fun link(id: String) = ProjectResourceLink(id, PROJECT_A, id.takeLast(4), "https://example.com", NOW, NOW)
+
+    private fun note(id: String) = ProjectNoteItem(
+        id = id,
+        projectId = PROJECT_A,
+        body = id.takeLast(4),
+        pinned = false,
+        authoredByUserId = USER_A,
+        createdAt = NOW,
+        updatedAt = NOW,
+        rowVersion = 1,
+    )
 
     private fun parking() = ProjectParking(
         id = PARK_A,
@@ -802,6 +1032,33 @@ class Api07InteractionSyncTest {
             PROJECT_B to AuthoritativeOrder(LINK_AGGREGATE_B, PROJECT_B, emptyList(), 1, null),
             PROJECT_C to AuthoritativeOrder(LINK_AGGREGATE_C, PROJECT_C, emptyList(), 1, null),
         )
+        val noteItems = mutableMapOf<String, MutableList<ProjectNoteItem>>()
+        val noteOrders = mutableMapOf(
+            PROJECT_A to AuthoritativeOrder(
+                NOTE_AGGREGATE_A,
+                PROJECT_A,
+                emptyList(),
+                1,
+                null,
+                dev.blocks.android.project.InteractionMutationType.REORDER_NOTES,
+            ),
+            PROJECT_B to AuthoritativeOrder(
+                NOTE_AGGREGATE_B,
+                PROJECT_B,
+                emptyList(),
+                1,
+                null,
+                dev.blocks.android.project.InteractionMutationType.REORDER_NOTES,
+            ),
+            PROJECT_C to AuthoritativeOrder(
+                NOTE_AGGREGATE_C,
+                PROJECT_C,
+                emptyList(),
+                1,
+                null,
+                dev.blocks.android.project.InteractionMutationType.REORDER_NOTES,
+            ),
+        )
         val tombstones = mutableMapOf(
             PROJECT_A to emptyList<ParkingTombstone>(),
             PROJECT_B to emptyList(),
@@ -810,6 +1067,7 @@ class Api07InteractionSyncTest {
         val changes = ArrayDeque<ChangePage>()
         val projectReorders = mutableListOf<InteractionMutation>()
         val linkReorders = mutableListOf<InteractionMutation>()
+        val noteReorders = mutableListOf<InteractionMutation>()
         val parkDeletes = mutableListOf<InteractionMutation>()
         val createdLinks = mutableListOf<ProjectItemMutation>()
         val deletedLinks = mutableListOf<ProjectItemMutation>()
@@ -824,11 +1082,22 @@ class Api07InteractionSyncTest {
             String,
             Pair<InteractionMutation, InteractionAcknowledgement.Order>,
             >()
+        private val noteOrderReceipts = mutableMapOf<
+            String,
+            Pair<InteractionMutation, InteractionAcknowledgement.Order>,
+            >()
         private val parkDeleteReceipts = mutableMapOf<
             String,
             Pair<InteractionMutation, InteractionAcknowledgement.Parking>,
             >()
         var conflictNextProjectOrder = false
+        var conflictNextNoteOrder = false
+        var loseNextNoteOrderResponse = false
+        var hideAcceptedNoteOperationFromAggregate = false
+        var noteOrderMutationCount = 0
+        var blockFirstNoteReorder = false
+        val noteReorderEntered = CountDownLatch(1)
+        val releaseNoteReorder = CountDownLatch(1)
         var blockFirstProjectReorder = false
         val projectReorderEntered = CountDownLatch(1)
         val releaseProjectReorder = CountDownLatch(1)
@@ -962,6 +1231,8 @@ class Api07InteractionSyncTest {
                 "changes" -> if (changes.isEmpty()) ChangePage(emptyList(), null, false) else changes.removeFirst()
                 "projectOrder" -> projectOrder
                 "linkOrder" -> linkOrders.getValue(args[1] as String)
+                "noteOrder" -> noteOrders.getValue(args[1] as String)
+                "readNote" -> noteItems.getValue(args[1] as String).single { it.id == args[2] as String }
                 "parkingTombstones" -> {
                     tombstoneReads += 1
                     if (blockFirstTombstoneRead && tombstoneReads == 1) {
@@ -1057,6 +1328,61 @@ class Api07InteractionSyncTest {
                         ).also { linkOrderReceipts[operation.operationId] = operation to it }
                     }
                 }
+                "reorderNotes" -> {
+                    val operation = args[1] as InteractionMutation
+                    noteReorders += operation
+                    if (blockFirstNoteReorder && noteReorders.size == 1) {
+                        noteReorderEntered.countDown()
+                        check(releaseNoteReorder.await(5, TimeUnit.SECONDS))
+                    }
+                    val receipt = noteOrderReceipts[operation.operationId]
+                    if (receipt != null) {
+                        if (receipt.first.copy(deliveryUncertain = false) != operation.copy(deliveryUncertain = false)) {
+                            throw ServiceException(409, ApiError(ApiErrorCode.CONFLICT, "operation identity reused"))
+                        }
+                        receipt.second
+                    } else {
+                        val projectId = requireNotNull(operation.projectId)
+                        if (conflictNextNoteOrder) {
+                            conflictNextNoteOrder = false
+                            val current = noteOrders.getValue(projectId)
+                            noteOrders[projectId] = current.copy(
+                                orderedClientIds = current.orderedClientIds.reversed(),
+                                version = current.version + 1,
+                                operationId = REMOTE_NOTE_ORDER,
+                            )
+                            throw ServiceException(409, ApiError(ApiErrorCode.CONFLICT, "stale Note order"))
+                        }
+                        val current = noteOrders.getValue(projectId)
+                        if (operation.aggregateId != current.aggregateId || operation.baseVersion != current.version) {
+                            throw ServiceException(409, ApiError(ApiErrorCode.CONFLICT, "stale Note order"))
+                        }
+                        noteOrderMutationCount += 1
+                        val next = current.copy(
+                            orderedClientIds = operation.orderedClientIds,
+                            version = current.version + 1,
+                            operationId = operation.operationId,
+                        )
+                        noteOrders[projectId] = next
+                        val acknowledgement = InteractionAcknowledgement.Order(
+                            operation.operationId,
+                            operation.aggregateId,
+                            next.version,
+                            projectId,
+                            operation.orderedClientIds,
+                            dev.blocks.android.project.InteractionMutationType.REORDER_NOTES,
+                        )
+                        noteOrderReceipts[operation.operationId] = operation to acknowledgement
+                        if (loseNextNoteOrderResponse) {
+                            loseNextNoteOrderResponse = false
+                            if (hideAcceptedNoteOperationFromAggregate) {
+                                noteOrders[projectId] = next.copy(operationId = REMOTE_NOTE_ORDER)
+                            }
+                            throw ServiceException(503, ApiError(ApiErrorCode.UNKNOWN, "response lost"))
+                        }
+                        acknowledgement
+                    }
+                }
                 "deleteParking" -> {
                     val operation = args[1] as InteractionMutation
                     parkDeletes += operation
@@ -1110,6 +1436,10 @@ class Api07InteractionSyncTest {
             private fun linkStatic(id: String) = ProjectResourceLink(
                 id, PROJECT_A, id.takeLast(4), "https://example.com", NOW, NOW, rowVersion = 1,
             )
+
+            private fun noteStatic(id: String) = ProjectNoteItem(
+                id, PROJECT_A, id.takeLast(4), false, USER_A, NOW, NOW, rowVersion = 1,
+            )
         }
     }
 
@@ -1126,6 +1456,9 @@ class Api07InteractionSyncTest {
         const val LINK_A = "20000000-0000-4000-8000-000000000001"
         const val LINK_B = "20000000-0000-4000-8000-000000000002"
         const val LINK_C = "20000000-0000-4000-8000-000000000003"
+        const val NOTE_A = "21000000-0000-4000-8000-000000000001"
+        const val NOTE_B = "21000000-0000-4000-8000-000000000002"
+        const val NOTE_C = "21000000-0000-4000-8000-000000000003"
         const val PARK_A = "30000000-0000-4000-8000-000000000001"
         const val PARK_B = "30000000-0000-4000-8000-000000000002"
         const val LOCAL_PARK = "30000000-0000-4000-8000-000000000011"
@@ -1136,6 +1469,9 @@ class Api07InteractionSyncTest {
         const val LINK_AGGREGATE_A = "40000000-0000-4000-8000-000000000002"
         const val LINK_AGGREGATE_B = "40000000-0000-4000-8000-000000000003"
         const val LINK_AGGREGATE_C = "40000000-0000-4000-8000-000000000004"
+        const val NOTE_AGGREGATE_A = "41000000-0000-4000-8000-000000000001"
+        const val NOTE_AGGREGATE_B = "41000000-0000-4000-8000-000000000002"
+        const val NOTE_AGGREGATE_C = "41000000-0000-4000-8000-000000000003"
         const val OP_PROJECT_ORDER = "50000000-0000-4000-8000-000000000001"
         const val OP_LINK_ORDER = "50000000-0000-4000-8000-000000000002"
         const val OP_DELETE_PARK = "50000000-0000-4000-8000-000000000003"
@@ -1152,6 +1488,9 @@ class Api07InteractionSyncTest {
         const val OP_CREATE = "50000000-0000-4000-8000-00000000000e"
         const val OP_CREATE_LINK = "50000000-0000-4000-8000-00000000000f"
         const val OP_DELETE_LINK = "50000000-0000-4000-8000-000000000010"
+        const val OP_NOTE_ORDER = "50000000-0000-4000-8000-000000000011"
+        const val OP_NOTE_ORDER_B = "50000000-0000-4000-8000-000000000012"
+        const val REMOTE_NOTE_ORDER = "50000000-0000-4000-8000-000000000013"
         const val FOREIGN_CLIENT = "f0000000-0000-4000-8000-000000000001"
         const val NOW = "2026-10-01T10:00:00Z"
         const val LATER = "2026-10-01T10:01:00Z"

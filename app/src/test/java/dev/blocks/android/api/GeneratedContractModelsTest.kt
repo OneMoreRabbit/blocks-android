@@ -8,8 +8,8 @@ import dev.blocks.android.api.generated.v04.model.ProjectIn
 import dev.blocks.android.api.generated.v04.model.ProjectPageOut
 import dev.blocks.android.api.generated.v04.model.ProjectParkIn
 import dev.blocks.android.api.generated.v06.model.NoteAck
-import dev.blocks.android.api.generated.v07.model.OrderOut
-import dev.blocks.android.api.generated.v07.model.ParkingTombstoneOut
+import dev.blocks.android.api.generated.v08.model.OrderOut
+import dev.blocks.android.api.generated.v08.model.ParkingTombstoneOut
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull

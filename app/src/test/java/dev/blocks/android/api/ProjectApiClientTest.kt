@@ -13,7 +13,7 @@ import org.junit.Test
 
 class ProjectApiClientTest {
     @Test
-    fun sendsLegacyNotesAndParkingToTenantScopedProjectRoutesWithApi07ClientNegotiation() {
+    fun sendsLegacyNotesAndParkingToTenantScopedProjectRoutesWithApi08ClientNegotiation() {
         val captured = mutableListOf<Request>()
         val server = server(captured::add)
         try {
@@ -39,7 +39,7 @@ class ProjectApiClientTest {
             assertEquals("POST", captured[1].method)
             assertEquals("/v1/tenants/$tenant/projects/$project/parking", captured[1].path)
             assertEquals("parking-key", captured[1].idempotencyKey)
-            assertEquals(listOf("0.7", "0.7"), captured.map { it.clientVersion })
+            assertEquals(listOf("0.8", "0.8"), captured.map { it.clientVersion })
             assertTrue(captured.all { it.authorization == "Bearer token" })
         } finally {
             server.stop(0)
@@ -87,9 +87,9 @@ class ProjectApiClientTest {
             )
             assertEquals(listOf(null, "3", "4", "5", null, "6", "7", null, null), captured.map { it.ifMatch })
             assertTrue(captured.none { it.path.contains(key) || it.query?.contains(key) == true })
-            assertEquals(listOf("0.7"), captured.map { it.clientVersion }.distinct())
-            assertEquals("0.7", captured[4].apiVersion)
-            assertEquals("0.7", captured[5].apiVersion)
+            assertEquals(listOf("0.8"), captured.map { it.clientVersion }.distinct())
+            assertEquals("0.8", captured[4].apiVersion)
+            assertEquals("0.8", captured[5].apiVersion)
             assertNull(captured[6].apiVersion)
         } finally {
             server.stop(0)
@@ -97,7 +97,7 @@ class ProjectApiClientTest {
     }
 
     @Test
-    fun sendsApi07InteractionOperationsToTheirExactTenantScopedRoutes() {
+    fun sendsApi07AndApi08InteractionOperationsToTheirExactTenantScopedRoutes() {
         val captured = mutableListOf<Request>()
         val server = server(captured::add)
         try {
@@ -112,8 +112,10 @@ class ProjectApiClientTest {
             client.reorderLinks("token", tenant, project, "{\"operation_id\":\"two\"}")
             client.parkingTombstones("token", tenant, project)
             client.deleteParking("token", tenant, project, park, "{\"operation_id\":\"three\"}")
+            client.noteOrder("token", tenant, project)
+            client.reorderNotes("token", tenant, project, "{\"operation_id\":\"four\"}")
 
-            assertEquals(listOf("GET", "PUT", "GET", "PUT", "GET", "POST"), captured.map { it.method })
+            assertEquals(listOf("GET", "PUT", "GET", "PUT", "GET", "POST", "GET", "PUT"), captured.map { it.method })
             assertEquals(
                 listOf(
                     "/v1/tenants/$tenant/interaction/project-order",
@@ -122,10 +124,13 @@ class ProjectApiClientTest {
                     "/v1/tenants/$tenant/projects/$project/interaction/link-order",
                     "/v1/tenants/$tenant/projects/$project/interaction/parking-tombstones",
                     "/v1/tenants/$tenant/projects/$project/parking/$park/delete",
+                    "/v1/tenants/$tenant/projects/$project/interaction/note-order",
+                    "/v1/tenants/$tenant/projects/$project/interaction/note-order",
                 ),
                 captured.map { it.path },
             )
-            assertTrue(captured.all { it.clientVersion == "0.7" })
+            assertTrue(captured.all { it.clientVersion == "0.8" })
+            assertEquals(listOf("0.8", "0.8"), captured.takeLast(2).map { it.apiVersion })
         } finally {
             server.stop(0)
         }

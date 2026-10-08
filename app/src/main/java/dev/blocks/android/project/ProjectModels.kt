@@ -87,7 +87,7 @@ data class ProjectResourceLink(
     val deletedAt: String? = null,
     /** State provenance only; acknowledgement is always the response/event operation id. */
     val lastOperationId: String? = null,
-    /** Retained local value that cannot cross the active API 0.7 URI boundary unchanged. */
+    /** Retained local value that cannot cross the active API 0.8 URI boundary unchanged. */
     val requiresReconciliation: Boolean = false,
 )
 
@@ -397,6 +397,10 @@ interface ProjectService {
         throw UnsupportedOperationException("Service API 0.7 Link order is unavailable")
     fun reorderLinks(session: Session, operation: InteractionMutation): InteractionAcknowledgement.Order =
         throw UnsupportedOperationException("Service API 0.7 Link ordering is unavailable")
+    fun noteOrder(session: Session, projectId: String): AuthoritativeOrder =
+        throw UnsupportedOperationException("Service API 0.8 Note order is unavailable")
+    fun reorderNotes(session: Session, operation: InteractionMutation): InteractionAcknowledgement.Order =
+        throw UnsupportedOperationException("Service API 0.8 Note ordering is unavailable")
     fun parkingTombstones(session: Session, projectId: String): List<ParkingTombstone> =
         throw UnsupportedOperationException("Service API 0.7 Park tombstones are unavailable")
     fun deleteParking(session: Session, operation: InteractionMutation): InteractionAcknowledgement.Parking =
