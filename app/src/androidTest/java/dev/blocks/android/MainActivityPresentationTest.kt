@@ -1389,7 +1389,7 @@ class MainActivityPresentationTest {
                 activity.selectDialogItem("About")
                 val about = activity.dialogTexts().joinToString("\n")
                 assertTrue(about.contains("Blocks Android"))
-                assertTrue(about.contains("Version 0.10.0 (24)"))
+                assertTrue(about.contains("Version 0.10.1 (25)"))
                 assertTrue(about.contains("dev.blocks.android/debug"))
                 assertFalse(about.contains("tenant", ignoreCase = true))
                 assertFalse(about.contains("token", ignoreCase = true))
