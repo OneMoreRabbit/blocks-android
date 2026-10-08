@@ -189,38 +189,65 @@ class ProjectInteractionPresentationTest {
     }
 
     @Test
-    fun projectItemActionGlyphsUseHalfTheReleasedWhitespaceInsideDistinctTouchTargets() {
-        store.saveSyncState(TENANT, populatedState(parkingCount = 2))
-        installDependencies()
+    fun uc11ItemActionsUseRestrainedGlyphsNeutralRestingTintAndDistinctTouchTargets() {
+        listOf(AppearanceMode.LIGHT, AppearanceMode.DARK).forEach { mode ->
+            store.clearSyncState(TENANT)
+            store.saveSyncState(TENANT, populatedState(parkingCount = 2))
+            AppearancePreferences(context).write(mode)
+            installDependencies()
 
-        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-            scenario.openProject()
-            waitFor(scenario) {
-                it.findViewById<ViewGroup>(ProjectUiIds.PROJECT_NOTES).width > 0 &&
-                    it.findViewById<ViewGroup>(ProjectUiIds.PROJECT_LINKS).width > 0
-            }
-            scenario.onActivity { activity ->
-                val actionButtons = listOf(
-                    activity.buttonAnywhereWithDescription("Edit link"),
-                    activity.buttonAnywhereWithDescription("Reorder First reference. Long press and drag."),
-                    activity.buttonAnywhereWithDescription("Delete link"),
-                    activity.buttonAnywhereWithDescription("Edit note"),
-                    activity.buttonAnywhereWithDescription("Reorder note. Long press and drag."),
-                    activity.buttonAnywhereWithDescription("Delete note"),
-                )
-                val density = activity.resources.displayMetrics.density
-                val touchTarget = (48 * density).toInt()
-                val glyphSize = (36 * density).toInt()
-                val totalWhitespace = touchTarget - glyphSize
-                actionButtons.forEach { button ->
-                    val glyph = requireNotNull(button.compoundDrawablesRelative[0])
-                    assertEquals(touchTarget, button.width)
-                    assertEquals(touchTarget, button.height)
-                    assertTrue(button.minimumWidth >= touchTarget)
-                    assertTrue(button.minimumHeight >= touchTarget)
-                    assertEquals(glyphSize, glyph.bounds.width())
-                    assertEquals(glyphSize, glyph.bounds.height())
-                    assertEquals(totalWhitespace, button.width - glyph.bounds.width())
+            ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                scenario.openProject()
+                waitFor(scenario) {
+                    it.findViewById<ViewGroup>(ProjectUiIds.PROJECT_NOTES).width > 0 &&
+                        it.findViewById<ViewGroup>(ProjectUiIds.PROJECT_LINKS).width > 0
+                }
+                scenario.onActivity { activity ->
+                    val linkRow = activity.findViewById<ViewGroup>(ProjectUiIds.PROJECT_LINKS)
+                        .directChildren().filterIsInstance<ViewGroup>().first()
+                    val noteRow = activity.findViewById<ViewGroup>(ProjectUiIds.PROJECT_NOTES)
+                        .directChildren().filterIsInstance<ViewGroup>()
+                        .first { it.tag?.toString()?.startsWith("note:") == true }
+                    val noteFooter = noteRow.getChildAt(noteRow.childCount - 1) as ViewGroup
+                    val linkActions = linkRow.directChildren().filterIsInstance<Button>().drop(1)
+                    val noteActions = noteFooter.directChildren().filterIsInstance<Button>()
+                    assertEquals(
+                        listOf("Edit link", "Reorder First reference. Long press and drag.", "Delete link"),
+                        linkActions.map { it.contentDescription.toString() },
+                    )
+                    assertEquals(
+                        listOf("Edit note", "Reorder note. Long press and drag.", "Delete note"),
+                        noteActions.map { it.contentDescription.toString() },
+                    )
+
+                    val density = activity.resources.displayMetrics.density
+                    val touchTarget = (48 * density).toInt()
+                    val glyphSize = (20 * density).toInt()
+                    val actionButtons = linkActions + noteActions
+                    actionButtons.forEach { button ->
+                        val glyph = requireNotNull(button.compoundDrawablesRelative[0])
+                        assertEquals(touchTarget, button.width)
+                        assertEquals(touchTarget, button.height)
+                        assertTrue(button.minimumWidth >= touchTarget)
+                        assertTrue(button.minimumHeight >= touchTarget)
+                        assertEquals(glyphSize, glyph.bounds.width())
+                        assertEquals(glyphSize, glyph.bounds.height())
+                    }
+
+                    val neutral = activity.getColor(R.color.blocks_ink)
+                    val accent = activity.getColor(R.color.blocks_teal)
+                    val nonDestructive = listOf(linkActions[0], linkActions[1], noteActions[0], noteActions[1])
+                    nonDestructive.forEach { button ->
+                        val tint = requireNotNull(button.compoundDrawableTintList)
+                        assertEquals(neutral, tint.defaultColor)
+                        assertEquals(accent, tint.getColorForState(intArrayOf(android.R.attr.state_focused), 0))
+                        assertTrue(tint.defaultColor != accent)
+                    }
+                    listOf(linkActions[2], noteActions[2]).forEach { button ->
+                        val tint = requireNotNull(button.compoundDrawableTintList)
+                        assertTrue(Color.alpha(tint.defaultColor) <= 72)
+                        assertTrue(tint.defaultColor != accent)
+                    }
                 }
             }
         }
@@ -248,6 +275,29 @@ class ProjectInteractionPresentationTest {
                 assertFalse(activity.dropLinkPayload(NoteDragPayload(linkIds.first()), linkIds.last()))
                 assertEquals(renderedNoteOrder, activity.renderedNoteOrder())
                 assertEquals(renderedLinkOrder, activity.renderedLinkOrder())
+            }
+            InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+            assertEquals(before, store.loadSyncState(TENANT))
+        }
+    }
+
+    @Test
+    fun uc11NoOpDragAndDeleteCancellationPreserveQueueAndEncryptedState() {
+        store.saveSyncState(TENANT, populatedState(parkingCount = 2))
+        installDependencies()
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            scenario.openProject()
+            val before = store.loadSyncState(TENANT)
+            val noteId = before.projectCache.orderedNotes(PROJECT).first().id
+            val linkId = before.projectCache.resourceLinks.first { it.projectId == PROJECT }.id
+            scenario.onActivity { activity ->
+                assertTrue(activity.dropNotePayload(NoteDragPayload(noteId), noteId))
+                assertTrue(activity.dropLinkPayload(LinkDragPayload(linkId), linkId))
+                activity.buttonAnywhereWithDescription("Delete link").performClick()
+                activity.dialogButton("Cancel").performClick()
+                activity.buttonAnywhereWithDescription("Delete note").performClick()
+                activity.dialogButton("Cancel").performClick()
             }
             InstrumentationRegistry.getInstrumentation().waitForIdleSync()
             assertEquals(before, store.loadSyncState(TENANT))
@@ -574,6 +624,44 @@ class ProjectInteractionPresentationTest {
                     ).all { description ->
                         activity.buttonAnywhereWithDescription(description).isFullyVisible()
                     }
+                }
+                scenario.capturePng(File(output, "project-${mode.name.lowercase()}.png"))
+            }
+        }
+    }
+
+    @Test
+    fun writesUc11PopulatedProjectLightAndDarkReviewPngsOutsideTheAppRepository() {
+        val output = requireNotNull(context.getExternalFilesDir("review-0.10.1"))
+        output.mkdirs()
+        val populated = populatedState(parkingCount = 4)
+        val reviewLinks = populated.projectCache.resourceLinks.take(1)
+        val reviewNotes = populated.projectCache.noteItems.take(1)
+        val reviewFixture = populated.copy(
+            projectCache = populated.projectCache.copy(
+                resourceLinks = reviewLinks,
+                noteItems = reviewNotes,
+                linkOrders = listOf(LinkOrderState(PROJECT, reviewLinks.map { it.id }, 0, NOW)),
+            ),
+        )
+        listOf(AppearanceMode.LIGHT, AppearanceMode.DARK).forEach { mode ->
+            store.clearSyncState(TENANT)
+            store.saveSyncState(TENANT, reviewFixture)
+            AppearancePreferences(context).write(mode)
+            installDependencies()
+            ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                scenario.openProject()
+                scenario.onActivity { it.scrollProjectToExactText("Links", extraScrollDp = 10) }
+                InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+                waitFor(scenario) { activity ->
+                    activity.textAnywhere("Links").isFullyVisible() && listOf(
+                        "Edit link",
+                        "Reorder First reference. Long press and drag.",
+                        "Delete link",
+                        "Edit note",
+                        "Reorder note. Long press and drag.",
+                        "Delete note",
+                    ).all { description -> activity.buttonAnywhereWithDescription(description).isFullyVisible() }
                 }
                 scenario.capturePng(File(output, "project-${mode.name.lowercase()}.png"))
             }

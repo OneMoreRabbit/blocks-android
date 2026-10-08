@@ -167,7 +167,7 @@ internal data class NoteDragPayload(override val itemId: String) : ProjectItemDr
 
 internal data class LinkDragPayload(override val itemId: String) : ProjectItemDragPayload
 
-private const val PROJECT_ITEM_ACTION_ICON_SIZE_DP = 36
+private const val PROJECT_ITEM_ACTION_ICON_SIZE_DP = 20
 
 internal object ProjectUiIds {
     const val CONTENT = 1000
@@ -1270,7 +1270,7 @@ class MainActivity : ComponentActivity() {
                 }.compactProjectItemActionGlyph(), LinearLayout.LayoutParams(dp(48), dp(48)))
                 addView(noteDragHandle(note), LinearLayout.LayoutParams(dp(48), dp(48)))
                 addView(destructiveIconButton(R.drawable.ic_delete, "Delete note") { confirmDeleteNote(note) }
-                    .compactProjectItemActionGlyph(),
+                    .compactProjectItemActionGlyph(accentOnFocus = false),
                     LinearLayout.LayoutParams(dp(48), dp(48)))
             }
         })
@@ -1343,7 +1343,7 @@ class MainActivity : ComponentActivity() {
             }.compactProjectItemActionGlyph(), LinearLayout.LayoutParams(dp(48), dp(48)))
             addView(resourceLinkDragHandle(link), LinearLayout.LayoutParams(dp(48), dp(48)))
             addView(destructiveIconButton(R.drawable.ic_delete, "Delete link") { confirmDeleteResourceLink(link) }
-                .compactProjectItemActionGlyph(),
+                .compactProjectItemActionGlyph(accentOnFocus = false),
                 LinearLayout.LayoutParams(dp(48), dp(48)))
         }
         if (!archived) setOnDragListener { _, event ->
@@ -1365,7 +1365,6 @@ class MainActivity : ComponentActivity() {
 
     private fun resourceLinkDragHandle(link: ProjectResourceLink) =
         iconOnlyButton(R.drawable.ic_reorder_vertical, "Reorder ${link.title}. Long press and drag.") { }.apply {
-            compoundDrawableTintList = ColorStateList.valueOf(brandColor(R.color.blocks_teal))
             setOnLongClickListener {
                 startDragAndDrop(
                     ClipData.newPlainText("Blocks Link", link.id),
@@ -1396,7 +1395,6 @@ class MainActivity : ComponentActivity() {
 
     private fun noteDragHandle(note: ProjectNoteItem) =
         iconOnlyButton(R.drawable.ic_reorder_vertical, "Reorder note. Long press and drag.") { }.apply {
-            compoundDrawableTintList = ColorStateList.valueOf(brandColor(R.color.blocks_teal))
             setOnLongClickListener {
                 startDragAndDrop(
                     ClipData.newPlainText("Blocks Note", note.id),
@@ -2550,15 +2548,29 @@ class MainActivity : ComponentActivity() {
         setOnClickListener(action)
     }
 
-    private fun Button.compactProjectItemActionGlyph() = apply {
+    private fun Button.compactProjectItemActionGlyph(accentOnFocus: Boolean = true) = apply {
         val size = dp(PROJECT_ITEM_ACTION_ICON_SIZE_DP)
         val icon = requireNotNull(compoundDrawablesRelative[0]).mutate().apply {
             setBounds(0, 0, size, size)
         }
         setCompoundDrawablesRelative(icon, null, null, null)
-        setPadding(dp(6), dp(6), dp(6), dp(6))
+        setPadding(dp(14), dp(14), dp(14), dp(14))
         minimumWidth = dp(48)
         minimumHeight = dp(48)
+        if (accentOnFocus) {
+            compoundDrawableTintList = ColorStateList(
+                arrayOf(
+                    intArrayOf(android.R.attr.state_focused),
+                    intArrayOf(android.R.attr.state_activated),
+                    intArrayOf(),
+                ),
+                intArrayOf(
+                    brandColor(R.color.blocks_teal),
+                    brandColor(R.color.blocks_teal),
+                    brandColor(R.color.blocks_ink),
+                ),
+            )
+        }
     }
 
     private fun destructiveIconButton(icon: Int, description: String, action: (View) -> Unit) =
