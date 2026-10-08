@@ -159,6 +159,16 @@ private data class ProjectViewSnapshot(
     val scrollY: Int,
 )
 
+internal sealed interface ProjectItemDragPayload {
+    val itemId: String
+}
+
+internal data class NoteDragPayload(override val itemId: String) : ProjectItemDragPayload
+
+internal data class LinkDragPayload(override val itemId: String) : ProjectItemDragPayload
+
+private const val PROJECT_ITEM_ACTION_ICON_SIZE_DP = 36
+
 internal object ProjectUiIds {
     const val CONTENT = 1000
     const val SCREEN_LOGIN = 1001
@@ -1257,22 +1267,17 @@ class MainActivity : ComponentActivity() {
                 addView(iconOnlyButton(R.drawable.ic_edit, "Edit note") {
                     controller.showEditNoteForm(note.id)
                     render()
-                }, LinearLayout.LayoutParams(dp(48), dp(48)))
+                }.compactProjectItemActionGlyph(), LinearLayout.LayoutParams(dp(48), dp(48)))
                 addView(noteDragHandle(note), LinearLayout.LayoutParams(dp(48), dp(48)))
-                addView(destructiveIconButton(R.drawable.ic_delete, "Delete note") { confirmDeleteNote(note) },
+                addView(destructiveIconButton(R.drawable.ic_delete, "Delete note") { confirmDeleteNote(note) }
+                    .compactProjectItemActionGlyph(),
                     LinearLayout.LayoutParams(dp(48), dp(48)))
             }
         })
         if (!archived) setOnDragListener { _, event ->
             when (event.action) {
-                DragEvent.ACTION_DRAG_STARTED -> event.localState is String
-                DragEvent.ACTION_DROP -> {
-                    val draggedId = event.localState as? String ?: return@setOnDragListener false
-                    runRepositoryAction(renderCommitted = { renderNoteOrder() }) {
-                        controller.moveNote(draggedId, note.id)
-                    }
-                    true
-                }
+                DragEvent.ACTION_DRAG_STARTED -> event.localState is NoteDragPayload
+                DragEvent.ACTION_DROP -> dropNotePayload(event.localState, note.id)
                 else -> true
             }
         }
@@ -1335,21 +1340,16 @@ class MainActivity : ComponentActivity() {
             addView(iconOnlyButton(R.drawable.ic_edit, "Edit link") {
                 controller.showEditLinkForm(link.id)
                 render()
-            }, LinearLayout.LayoutParams(dp(48), dp(48)))
+            }.compactProjectItemActionGlyph(), LinearLayout.LayoutParams(dp(48), dp(48)))
             addView(resourceLinkDragHandle(link), LinearLayout.LayoutParams(dp(48), dp(48)))
-            addView(destructiveIconButton(R.drawable.ic_delete, "Delete link") { confirmDeleteResourceLink(link) },
+            addView(destructiveIconButton(R.drawable.ic_delete, "Delete link") { confirmDeleteResourceLink(link) }
+                .compactProjectItemActionGlyph(),
                 LinearLayout.LayoutParams(dp(48), dp(48)))
         }
         if (!archived) setOnDragListener { _, event ->
             when (event.action) {
-                DragEvent.ACTION_DRAG_STARTED -> event.localState is String
-                DragEvent.ACTION_DROP -> {
-                    val draggedId = event.localState as? String ?: return@setOnDragListener false
-                    runRepositoryAction(renderCommitted = { renderResourceLinkOrder() }) {
-                        controller.moveResourceLink(draggedId, link.id)
-                    }
-                    true
-                }
+                DragEvent.ACTION_DRAG_STARTED -> event.localState is LinkDragPayload
+                DragEvent.ACTION_DROP -> dropLinkPayload(event.localState, link.id)
                 else -> true
             }
         }
@@ -1370,7 +1370,7 @@ class MainActivity : ComponentActivity() {
                 startDragAndDrop(
                     ClipData.newPlainText("Blocks Link", link.id),
                     View.DragShadowBuilder(this),
-                    link.id,
+                    LinkDragPayload(link.id),
                     0,
                 )
                 true
@@ -1392,7 +1392,7 @@ class MainActivity : ComponentActivity() {
                     true
                 }
             }
-        }
+        }.compactProjectItemActionGlyph()
 
     private fun noteDragHandle(note: ProjectNoteItem) =
         iconOnlyButton(R.drawable.ic_reorder_vertical, "Reorder note. Long press and drag.") { }.apply {
@@ -1401,7 +1401,7 @@ class MainActivity : ComponentActivity() {
                 startDragAndDrop(
                     ClipData.newPlainText("Blocks Note", note.id),
                     View.DragShadowBuilder(this),
-                    note.id,
+                    NoteDragPayload(note.id),
                     0,
                 )
                 true
@@ -1423,7 +1423,23 @@ class MainActivity : ComponentActivity() {
                     true
                 }
             }
+        }.compactProjectItemActionGlyph()
+
+    internal fun dropNotePayload(localState: Any?, targetNoteId: String): Boolean {
+        val payload = localState as? NoteDragPayload ?: return false
+        runRepositoryAction(renderCommitted = { renderNoteOrder() }) {
+            controller.moveNote(payload.itemId, targetNoteId)
         }
+        return true
+    }
+
+    internal fun dropLinkPayload(localState: Any?, targetLinkId: String): Boolean {
+        val payload = localState as? LinkDragPayload ?: return false
+        runRepositoryAction(renderCommitted = { renderResourceLinkOrder() }) {
+            controller.moveResourceLink(payload.itemId, targetLinkId)
+        }
+        return true
+    }
 
     private fun compactDivider(dividerId: Int) = View(this).apply {
         id = dividerId
@@ -2532,6 +2548,17 @@ class MainActivity : ComponentActivity() {
         minimumHeight = dp(48)
         setPadding(dp(12), dp(12), dp(12), dp(12))
         setOnClickListener(action)
+    }
+
+    private fun Button.compactProjectItemActionGlyph() = apply {
+        val size = dp(PROJECT_ITEM_ACTION_ICON_SIZE_DP)
+        val icon = requireNotNull(compoundDrawablesRelative[0]).mutate().apply {
+            setBounds(0, 0, size, size)
+        }
+        setCompoundDrawablesRelative(icon, null, null, null)
+        setPadding(dp(6), dp(6), dp(6), dp(6))
+        minimumWidth = dp(48)
+        minimumHeight = dp(48)
     }
 
     private fun destructiveIconButton(icon: Int, description: String, action: (View) -> Unit) =

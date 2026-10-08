@@ -30,6 +30,17 @@ grep -F 'ProjectResourceUriTest > matchesTheSharedVersionedAcceptanceCorpusInclu
     "$EVIDENCE/released-0.9.6-uri-v0.4-fail.txt" >/dev/null
 echo 'EXPECTED/ACTUAL: released 0.9.6 refuses the owner brace-bearing HTTPS value under corpus v0.4.'
 
+echo '$ verify frozen 0.10 review failing-before evidence'
+grep -F 'HEAD 8bbc0c528e455a784d396389134b969059787fde' \
+    "$EVIDENCE/review-repair-failing-before.txt" >/dev/null
+grep -F 'FAIL: action glyph whitespace is halved' \
+    "$EVIDENCE/review-repair-failing-before.txt" >/dev/null
+grep -F 'FAIL: Note drag accepts only Note payloads' \
+    "$EVIDENCE/review-repair-failing-before.txt" >/dev/null
+grep -F 'FAIL: Link drag accepts only Link payloads' \
+    "$EVIDENCE/review-repair-failing-before.txt" >/dev/null
+echo 'EXPECTED/ACTUAL: frozen head 8bbc0c5 fails density and both cross-type payload checks.'
+
 echo '$ verify exact candidate identity and clean tree'
 grep -F 'applicationId = "dev.blocks.android"' app/build.gradle.kts >/dev/null
 grep -F 'versionCode = 24' app/build.gradle.kts >/dev/null
@@ -61,7 +72,7 @@ REMOTE=/sdcard/Android/data/dev.blocks.android/files/review-0.10.0
 for name in dashboard-light dashboard-dark project-light project-dark; do
     "$ADB" -s "$SERIAL" pull "$REMOTE/$name.png" "$EVIDENCE/screenshots/$name.png" >/dev/null
 done
-echo 'EXPECTED/ACTUAL: four Light/Dark dashboard/Project PNGs are copied outside Git.'
+echo 'EXPECTED/ACTUAL: four Light/Dark dashboard/Project PNGs are copied outside Git; both Project captures show one complete Link and Note control row without clipped top fragments.'
 
 echo 'PAUSE visual-architecture: inspect all four PNGs before merge or release.'
 
