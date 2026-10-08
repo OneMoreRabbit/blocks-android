@@ -9,13 +9,13 @@ object ProjectResourceUri {
 
     fun validate(value: String): String {
         val trimmed = value.trim()
-        if (trimmed.startsWith("onenote:", ignoreCase = true)) {
-            require(value == trimmed) { "OneNote links cannot contain surrounding whitespace." }
-        }
-        require(trimmed.isNotEmpty() && trimmed.all { it.code in 0x21..0x7e }) {
+        require(value == trimmed && trimmed.isNotEmpty() && trimmed.all { it.code in 0x21..0x7e }) {
             "Enter a valid link."
         }
-        val parsed = runCatching { URI(trimmed) }.getOrElse {
+        // Validate against an equivalent escaped view. Browsers accept printable braces in query
+        // values; the strict JVM parser does not. The stored and launched value stays byte-for-byte.
+        val parseable = trimmed.replace("{", "%7B").replace("}", "%7D")
+        val parsed = runCatching { URI(parseable) }.getOrElse {
             throw IllegalArgumentException("Enter a valid link.")
         }
         val scheme = parsed.scheme?.lowercase()

@@ -1,6 +1,7 @@
 package dev.blocks.android
 
 import android.app.AlertDialog
+import android.content.Context
 import android.content.res.ColorStateList
 import android.content.Intent
 import android.content.ClipData
@@ -158,6 +159,16 @@ private data class ProjectViewSnapshot(
     val scrollY: Int,
 )
 
+internal sealed interface ProjectItemDragPayload {
+    val itemId: String
+}
+
+internal data class NoteDragPayload(override val itemId: String) : ProjectItemDragPayload
+
+internal data class LinkDragPayload(override val itemId: String) : ProjectItemDragPayload
+
+private const val PROJECT_ITEM_ACTION_ICON_SIZE_DP = 36
+
 internal object ProjectUiIds {
     const val CONTENT = 1000
     const val SCREEN_LOGIN = 1001
@@ -276,6 +287,11 @@ class MainActivity : ComponentActivity() {
     private val coverPickerLauncher = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         handleCoverPickerResult(uri)
     }
+
+    override fun attachBaseContext(newBase: Context) {
+        super.attachBaseContext(AppearancePreferences.themedContext(newBase))
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         consumeTagIntent(intent, clearActivityIntent = true)
@@ -465,7 +481,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         renderTopBar()
-        controller.state.error?.let { content.addView(label(it, 14f, Color.rgb(150, 40, 40))) }
+        controller.state.error?.let { content.addView(label(it, 14f, brandColor(R.color.blocks_error))) }
         controller.state.conflict?.let {
             content.addView(button("Resolve saved change") { showConflictResolution() }.apply {
                 id = ProjectUiIds.RESOLVE_CONFLICT
@@ -893,6 +909,7 @@ class MainActivity : ComponentActivity() {
 
     private fun showSettings() {
         val items = buildList {
+            add("Appearance")
             add("About")
             if (controller.state.authenticationRequired || controller.state.sessionConfirmationRequired) {
                 add("Reconnect Google account")
@@ -904,6 +921,7 @@ class MainActivity : ComponentActivity() {
         val dialog = AlertDialog.Builder(this).setTitle("Settings")
             .setItems(items.toTypedArray()) { _, which ->
                 when (items[which]) {
+                    "Appearance" -> showAppearanceSettings()
                     "About" -> showAbout()
                     "Reconnect Google account" -> reauthenticate()
                     "Switch account" -> switchAccount()
@@ -914,6 +932,26 @@ class MainActivity : ComponentActivity() {
             .setNegativeButton("Done", null)
             .create()
         showManagedDialog(dialog)
+    }
+
+    private fun showAppearanceSettings() {
+        val preferences = AppearancePreferences(this)
+        val modes = AppearanceMode.entries.toTypedArray()
+        val selected = modes.indexOf(preferences.read())
+        showManagedDialog(
+            AlertDialog.Builder(this)
+                .setTitle("Appearance")
+                .setSingleChoiceItems(modes.map { it.label }.toTypedArray(), selected) { dialog, which ->
+                    val chosen = modes[which]
+                    if (chosen != preferences.read()) {
+                        preferences.write(chosen)
+                        dialog.dismiss()
+                        recreate()
+                    }
+                }
+                .setNegativeButton("Done", null)
+                .create(),
+        )
     }
 
     private fun showAbout() {
@@ -1051,11 +1089,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun projectNotesSection(archived: Boolean): View? {
-        val notes = controller.state.noteItems.sortedWith(
-            compareByDescending<ProjectNoteItem> { it.pinned }
-                .thenByDescending { it.updatedAt }
-                .thenByDescending { it.id },
-        )
+        val notes = controller.state.noteItems
         if (notes.isEmpty()) return null
         return LinearLayout(this).apply {
             id = ProjectUiIds.NOTES_SECTION
@@ -1160,6 +1194,19 @@ class MainActivity : ComponentActivity() {
         return true
     }
 
+    /** Reuses the existing Note rows after one atomic local drag reorder. */
+    private fun renderNoteOrder(): Boolean {
+        if (controller.state.screen != ProjectScreen.PROJECT) return false
+        val container = content.findViewById<LinearLayout>(ProjectUiIds.PROJECT_NOTES) ?: return false
+        val desired = controller.state.noteItems
+        container.removeAllViews()
+        desired.forEachIndexed { index, note ->
+            container.addView(noteTimelineRow(note, archived = false))
+            if (index < desired.lastIndex) container.addView(compactDivider(ProjectUiIds.NOTE_HISTORY_DIVIDER))
+        }
+        return true
+    }
+
     /** Replaces only Park-derived projections after the atomic tombstone commit. */
     private fun renderParkingProjection(): Boolean {
         if (controller.state.screen != ProjectScreen.PROJECT) return false
@@ -1220,14 +1267,20 @@ class MainActivity : ComponentActivity() {
                 addView(iconOnlyButton(R.drawable.ic_edit, "Edit note") {
                     controller.showEditNoteForm(note.id)
                     render()
-                }, LinearLayout.LayoutParams(dp(48), dp(48)))
-                addView(iconOnlyButton(R.drawable.ic_pin, if (note.pinned) "Unpin note" else "Pin note") { source ->
-                    runRepositoryAction(source = source) { controller.setNotePinned(note.id, !note.pinned) }
-                }, LinearLayout.LayoutParams(dp(48), dp(48)))
-                addView(destructiveIconButton(R.drawable.ic_delete, "Delete note") { confirmDeleteNote(note) },
+                }.compactProjectItemActionGlyph(), LinearLayout.LayoutParams(dp(48), dp(48)))
+                addView(noteDragHandle(note), LinearLayout.LayoutParams(dp(48), dp(48)))
+                addView(destructiveIconButton(R.drawable.ic_delete, "Delete note") { confirmDeleteNote(note) }
+                    .compactProjectItemActionGlyph(),
                     LinearLayout.LayoutParams(dp(48), dp(48)))
             }
         })
+        if (!archived) setOnDragListener { _, event ->
+            when (event.action) {
+                DragEvent.ACTION_DRAG_STARTED -> event.localState is NoteDragPayload
+                DragEvent.ACTION_DROP -> dropNotePayload(event.localState, note.id)
+                else -> true
+            }
+        }
     }.also {
         it.layoutParams = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
@@ -1267,7 +1320,6 @@ class MainActivity : ComponentActivity() {
         orientation = LinearLayout.HORIZONTAL
         gravity = Gravity.CENTER_VERTICAL
         minimumHeight = dp(48)
-        addView(resourceLinkLeadingIcon(link, archived), LinearLayout.LayoutParams(dp(48), dp(48)))
         addView(Button(this@MainActivity).apply {
             text = if (link.requiresReconciliation) "${link.title} · Update required" else link.title
             contentDescription = "Open ${link.title}"
@@ -1288,20 +1340,16 @@ class MainActivity : ComponentActivity() {
             addView(iconOnlyButton(R.drawable.ic_edit, "Edit link") {
                 controller.showEditLinkForm(link.id)
                 render()
-            }, LinearLayout.LayoutParams(dp(48), dp(48)))
-            addView(destructiveIconButton(R.drawable.ic_delete, "Delete link") { confirmDeleteResourceLink(link) },
+            }.compactProjectItemActionGlyph(), LinearLayout.LayoutParams(dp(48), dp(48)))
+            addView(resourceLinkDragHandle(link), LinearLayout.LayoutParams(dp(48), dp(48)))
+            addView(destructiveIconButton(R.drawable.ic_delete, "Delete link") { confirmDeleteResourceLink(link) }
+                .compactProjectItemActionGlyph(),
                 LinearLayout.LayoutParams(dp(48), dp(48)))
         }
         if (!archived) setOnDragListener { _, event ->
             when (event.action) {
-                DragEvent.ACTION_DRAG_STARTED -> event.localState is String
-                DragEvent.ACTION_DROP -> {
-                    val draggedId = event.localState as? String ?: return@setOnDragListener false
-                    runRepositoryAction(renderCommitted = { renderResourceLinkOrder() }) {
-                        controller.moveResourceLink(draggedId, link.id)
-                    }
-                    true
-                }
+                DragEvent.ACTION_DRAG_STARTED -> event.localState is LinkDragPayload
+                DragEvent.ACTION_DROP -> dropLinkPayload(event.localState, link.id)
                 else -> true
             }
         }
@@ -1315,27 +1363,14 @@ class MainActivity : ComponentActivity() {
 
     private fun resourceLinkCard(link: ProjectResourceLink, archived: Boolean) = resourceLinkRow(link, archived)
 
-    private fun resourceLinkLeadingIcon(link: ProjectResourceLink, archived: Boolean): View =
-        if (archived) {
-            ImageView(this).apply {
-                setImageResource(R.drawable.ic_link)
-                imageTintList = ColorStateList.valueOf(brandColor(R.color.blocks_teal))
-                contentDescription = null
-                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-                setPadding(dp(12), dp(12), dp(12), dp(12))
-            }
-        } else {
-            resourceLinkDragHandle(link)
-        }
-
     private fun resourceLinkDragHandle(link: ProjectResourceLink) =
-        iconOnlyButton(R.drawable.ic_link, "Reorder ${link.title}. Long press and drag.") { }.apply {
+        iconOnlyButton(R.drawable.ic_reorder_vertical, "Reorder ${link.title}. Long press and drag.") { }.apply {
             compoundDrawableTintList = ColorStateList.valueOf(brandColor(R.color.blocks_teal))
             setOnLongClickListener {
                 startDragAndDrop(
                     ClipData.newPlainText("Blocks Link", link.id),
                     View.DragShadowBuilder(this),
-                    link.id,
+                    LinkDragPayload(link.id),
                     0,
                 )
                 true
@@ -1357,7 +1392,54 @@ class MainActivity : ComponentActivity() {
                     true
                 }
             }
+        }.compactProjectItemActionGlyph()
+
+    private fun noteDragHandle(note: ProjectNoteItem) =
+        iconOnlyButton(R.drawable.ic_reorder_vertical, "Reorder note. Long press and drag.") { }.apply {
+            compoundDrawableTintList = ColorStateList.valueOf(brandColor(R.color.blocks_teal))
+            setOnLongClickListener {
+                startDragAndDrop(
+                    ClipData.newPlainText("Blocks Note", note.id),
+                    View.DragShadowBuilder(this),
+                    NoteDragPayload(note.id),
+                    0,
+                )
+                true
+            }
+            val position = controller.state.noteItems.indexOfFirst { it.id == note.id }
+            if (position > 0) {
+                ViewCompat.addAccessibilityAction(this, "Move note earlier") { _, _ ->
+                    runRepositoryAction(renderCommitted = { renderNoteOrder() }) {
+                        controller.moveNote(note.id, -1)
+                    }
+                    true
+                }
+            }
+            if (position >= 0 && position < controller.state.noteItems.lastIndex) {
+                ViewCompat.addAccessibilityAction(this, "Move note later") { _, _ ->
+                    runRepositoryAction(renderCommitted = { renderNoteOrder() }) {
+                        controller.moveNote(note.id, 1)
+                    }
+                    true
+                }
+            }
+        }.compactProjectItemActionGlyph()
+
+    internal fun dropNotePayload(localState: Any?, targetNoteId: String): Boolean {
+        val payload = localState as? NoteDragPayload ?: return false
+        runRepositoryAction(renderCommitted = { renderNoteOrder() }) {
+            controller.moveNote(payload.itemId, targetNoteId)
         }
+        return true
+    }
+
+    internal fun dropLinkPayload(localState: Any?, targetLinkId: String): Boolean {
+        val payload = localState as? LinkDragPayload ?: return false
+        runRepositoryAction(renderCommitted = { renderResourceLinkOrder() }) {
+            controller.moveResourceLink(payload.itemId, targetLinkId)
+        }
+        return true
+    }
 
     private fun compactDivider(dividerId: Int) = View(this).apply {
         id = dividerId
@@ -1456,13 +1538,11 @@ class MainActivity : ComponentActivity() {
                         val added = controller.state.noteItems.singleOrNull { it.id !in priorIds }
                         (added != null && priorIds.isNotEmpty() && restoreProjectView {
                             val section = findViewById<LinearLayout>(ProjectUiIds.NOTES_SECTION)
-                            val notes = controller.state.noteItems.sortedWith(
-                                compareByDescending<ProjectNoteItem> { it.pinned }
-                                    .thenByDescending { it.updatedAt }
-                                    .thenByDescending { it.id },
-                            )
-                            populateProjectNotesSection(section, notes, archived = false)
+                            populateProjectNotesSection(section, controller.state.noteItems, archived = false)
                         })
+                    },
+                    complete = {
+                        if (!controller.state.showNoteForm) scrollProjectToText(submittedBody)
                     },
                 ) { controller.saveNoteItem(submittedBody) }
             },
@@ -1564,7 +1644,7 @@ class MainActivity : ComponentActivity() {
             LinearLayout.LayoutParams(dp(48), dp(48)),
         )
         heading.addView(
-            label("Park", 24f, Color.rgb(32, 48, 42)).apply { gravity = Gravity.CENTER_VERTICAL },
+            label("Park", 24f, brandColor(R.color.blocks_ink)).apply { gravity = Gravity.CENTER_VERTICAL },
             LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(8) },
         )
         heading.addView(primaryButton("Save", R.drawable.ic_park) { source ->
@@ -2470,6 +2550,17 @@ class MainActivity : ComponentActivity() {
         setOnClickListener(action)
     }
 
+    private fun Button.compactProjectItemActionGlyph() = apply {
+        val size = dp(PROJECT_ITEM_ACTION_ICON_SIZE_DP)
+        val icon = requireNotNull(compoundDrawablesRelative[0]).mutate().apply {
+            setBounds(0, 0, size, size)
+        }
+        setCompoundDrawablesRelative(icon, null, null, null)
+        setPadding(dp(6), dp(6), dp(6), dp(6))
+        minimumWidth = dp(48)
+        minimumHeight = dp(48)
+    }
+
     private fun destructiveIconButton(icon: Int, description: String, action: (View) -> Unit) =
         iconOnlyButton(icon, description, action).apply {
             val muted = brandColor(R.color.blocks_muted)
@@ -2548,7 +2639,7 @@ class MainActivity : ComponentActivity() {
 
     internal fun coverCacheKeysForTest(): Set<String> = coverBitmaps.snapshot().keys
 
-    private fun label(text: String, size: Float, color: Int = Color.DKGRAY) = TextView(this).apply {
+    private fun label(text: String, size: Float, color: Int = brandColor(R.color.blocks_ink)) = TextView(this).apply {
         this.text = text
         textSize = size
         typeface = interTypeface

@@ -23,6 +23,7 @@ import dev.blocks.android.project.DashboardOrderMode
 import dev.blocks.android.project.InteractionMutation
 import dev.blocks.android.project.InteractionMutationType
 import dev.blocks.android.project.LinkOrderState
+import dev.blocks.android.project.NoteOrderState
 import dev.blocks.android.project.ParkingTombstone
 import dev.blocks.android.project.ProjectIdentityMapping
 import dev.blocks.android.project.ProjectItemAcknowledgement
@@ -570,6 +571,75 @@ class AndroidNormalizedSyncStateStoreTest {
         assertEquals(listOf(PROJECT), seeded.projectCache.projectOrder.orderedProjectIds)
         assertEquals(listOf(LINK_ID), seeded.projectCache.linkOrders.single().orderedLinkIds)
         assertEquals(seeded, AndroidSyncStateStore(context).loadSyncState(TENANT))
+    }
+
+    @Test
+    fun realReleased096DatabaseMigratesNoteOrderWithoutChangingEncryptedTenantState() {
+        val pinnedOlder = ProjectNoteItem(
+            "50000000-0000-4000-8000-000000000001",
+            PROJECT,
+            "Pinned older",
+            true,
+            "local",
+            "2026-10-01T09:00:00Z",
+            "2026-10-01T10:00:00Z",
+            rowVersion = 3,
+        )
+        val unpinnedOlder = ProjectNoteItem(
+            "50000000-0000-4000-8000-000000000002",
+            PROJECT,
+            "Unpinned older",
+            false,
+            "local",
+            "2026-10-01T09:00:00Z",
+            "2026-10-01T11:00:00Z",
+            rowVersion = 2,
+        )
+        val unpinnedNewer = ProjectNoteItem(
+            "50000000-0000-4000-8000-000000000003",
+            PROJECT,
+            "Unpinned newer",
+            false,
+            "local",
+            "2026-10-01T09:00:00Z",
+            "2026-10-01T12:00:00Z",
+            rowVersion = 1,
+        )
+        val released096 = state(TENANT).withoutCommands().copy(
+            projectCache = state(TENANT).withoutCommands().projectCache.copy(
+                noteItems = listOf(unpinnedOlder, pinnedOlder, unpinnedNewer),
+                noteOrders = emptyList(),
+            ),
+        )
+        store.saveSyncState(TENANT, released096)
+        SQLiteDatabase.openDatabase(normalizedDatabase(TENANT).path, null, SQLiteDatabase.OPEN_READWRITE).use { db ->
+            db.execSQL("DROP TABLE ${AndroidSyncStateStore.TABLE_NOTE_ORDERS}")
+            db.execSQL(
+                "UPDATE ${AndroidSyncStateStore.TABLE_METADATA} SET value = '11' WHERE record_id = ?",
+                arrayOf(AndroidSyncStateStore.META_SCHEMA_VERSION),
+            )
+            db.version = 3
+        }
+
+        val migrated = AndroidSyncStateStore(context).loadSyncState(TENANT)
+        val expected = released096.copy(
+            projectCache = released096.projectCache.copy(
+                noteOrders = listOf(
+                    NoteOrderState(
+                        PROJECT,
+                        listOf(pinnedOlder.id, unpinnedNewer.id, unpinnedOlder.id),
+                    ),
+                ),
+            ),
+        )
+
+        assertEquals(expected, migrated)
+        assertEquals(expected, AndroidSyncStateStore(context).loadSyncState(TENANT))
+        SQLiteDatabase.openDatabase(normalizedDatabase(TENANT).path, null, SQLiteDatabase.OPEN_READONLY).use { db ->
+            assertEquals(AndroidSyncStateStore.DATABASE_VERSION, db.version)
+        }
+        assertTrue(keyStore().containsAlias(secretKeyAlias(TENANT)))
+        assertFalse(normalizedDatabase(TENANT).readBytes().containsBytes(TAG_TOKEN.encoded.toByteArray()))
     }
 
     @Test

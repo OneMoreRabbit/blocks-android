@@ -394,6 +394,21 @@ class ProjectPresentationController(
     }
 
     @Synchronized
+    fun moveNote(noteId: String, delta: Int) {
+        activeProjectPage()
+        applyResult(workspace.moveNoteItem(activeSession(), noteId, delta))
+    }
+
+    @Synchronized
+    fun moveNote(noteId: String, targetNoteId: String) {
+        activeProjectPage()
+        val from = state.noteItems.indexOfFirst { it.id == noteId }
+        val to = state.noteItems.indexOfFirst { it.id == targetNoteId }
+        if (from < 0 || to < 0 || from == to) return
+        applyResult(workspace.moveNoteItem(activeSession(), noteId, to - from))
+    }
+
+    @Synchronized
     fun showAddLinkForm() {
         val projectId = activeProjectPage().project.id
         val key = resourceLinkDraftKey(projectId)
@@ -1033,8 +1048,7 @@ class ProjectPresentationController(
 }
 
 private fun ProjectCacheState.noteItemsFor(projectId: String): List<ProjectNoteItem> = noteItems
-    .filter { it.projectId == projectId && it.deletedAt == null }
-    .sortedWith(compareByDescending<ProjectNoteItem> { it.pinned }.thenByDescending { it.updatedAt })
+    .let { orderedNotes(projectId) }
 
 private fun ProjectCacheState.resourceLinksFor(projectId: String): List<ProjectResourceLink> =
     orderedResourceLinks(projectId)

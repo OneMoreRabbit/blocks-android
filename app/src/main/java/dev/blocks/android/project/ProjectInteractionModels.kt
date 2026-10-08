@@ -18,6 +18,14 @@ data class LinkOrderState(
     val aggregateId: String? = null,
 )
 
+data class NoteOrderState(
+    val projectId: String,
+    val orderedNoteIds: List<String> = emptyList(),
+    val version: Int = 0,
+    val updatedAt: String = "",
+    val aggregateId: String? = null,
+)
+
 /** Visibility metadata only. The immutable [ProjectParking] row remains untouched. */
 data class ParkingTombstone(
     val parkingId: String,
@@ -38,6 +46,7 @@ data class AuthoritativeOrder(
 enum class InteractionMutationType {
     REORDER_PROJECTS,
     REORDER_LINKS,
+    REORDER_NOTES,
     DELETE_PARKING,
 }
 
@@ -105,6 +114,7 @@ internal fun ProjectCacheState.ensureInteractionState(): ProjectCacheState {
             add(existing.copy(orderedLinkIds = retained + liveIds.filterNot(retainedSet::contains)))
         }
     }
+    val normalizedNoteOrders = ensureNoteOrderState().noteOrders
     val hiddenParkingIds = parkingTombstones.mapTo(mutableSetOf()) { it.parkingId }
     val normalizedPages = pages.map { page ->
         val newest = parkingRecords
@@ -117,9 +127,43 @@ internal fun ProjectCacheState.ensureInteractionState(): ProjectCacheState {
     return copy(
         projectOrder = normalizedProjectOrder,
         linkOrders = normalizedLinkOrders,
+        noteOrders = normalizedNoteOrders,
         pages = normalizedPages,
     )
 }
+
+/** Adds only the 0.10 Note-order aggregate without changing older interaction aggregates. */
+internal fun ProjectCacheState.ensureNoteOrderState(): ProjectCacheState {
+    val liveNotesByProject = noteItems.filter { it.deletedAt == null }.groupBy { it.projectId }
+    val normalizedNoteOrders = buildList {
+        val existingByProject = noteOrders.associateBy { it.projectId }
+        val projectIds = (existingByProject.keys + liveNotesByProject.keys).sorted()
+        projectIds.forEach { projectId ->
+            val live = liveNotesByProject[projectId].orEmpty()
+            val liveIds = live.map { it.id }
+            val liveIdSet = liveIds.toSet()
+            val existing = existingByProject[projectId] ?: NoteOrderState(
+                projectId = projectId,
+                orderedNoteIds = live.sortedWith(LEGACY_NOTE_ORDER).map { it.id },
+            )
+            val retained = existing.orderedNoteIds.filter { it in liveIdSet }
+            val retainedSet = retained.toSet()
+            add(existing.copy(orderedNoteIds = retained + liveIds.filterNot(retainedSet::contains)))
+        }
+    }
+    return copy(noteOrders = normalizedNoteOrders)
+}
+
+internal fun ProjectCacheState.orderedNotes(projectId: String): List<ProjectNoteItem> {
+    val live = noteItems.filter { it.projectId == projectId && it.deletedAt == null }
+    val byId = live.associateBy { it.id }
+    val sequence = noteOrders.firstOrNull { it.projectId == projectId }?.orderedNoteIds.orEmpty()
+    return sequence.mapNotNull(byId::get) + live.filterNot { it.id in sequence }
+}
+
+private val LEGACY_NOTE_ORDER = compareByDescending<ProjectNoteItem> { it.pinned }
+    .thenByDescending { it.updatedAt }
+    .thenByDescending { it.id }
 
 internal fun ProjectCacheState.orderedResourceLinks(projectId: String): List<ProjectResourceLink> {
     val live = resourceLinks.filter { it.projectId == projectId && it.deletedAt == null }

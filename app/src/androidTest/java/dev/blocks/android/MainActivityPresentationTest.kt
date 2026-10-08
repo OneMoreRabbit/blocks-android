@@ -138,6 +138,7 @@ class MainActivityPresentationTest {
     @Before
     fun setUp() {
         AndroidEncryptedDraftStore(context).clear(TENANT_ID)
+        AppearancePreferences(context).write(AppearanceMode.FOLLOW_PHONE)
         workspace = FakeWorkspace()
         identity = FakeIdentity()
         continuity = MemoryContinuity(true)
@@ -188,6 +189,7 @@ class MainActivityPresentationTest {
         AndroidEncryptedDraftStore(context).clear(TENANT_ID)
         AndroidSyncStateStore(context).clearSyncState(TENANT_ID)
         AndroidEncryptedAcceptedTenantContinuityStore(context).clear()
+        AppearancePreferences(context).write(AppearanceMode.FOLLOW_PHONE)
     }
 
     @Test
@@ -1009,6 +1011,7 @@ class MainActivityPresentationTest {
                 val items = activity.activeDialog?.listView?.adapter ?: error("Settings menu is missing")
                 assertEquals(
                     listOf(
+                        "Appearance",
                         "About",
                         "Reconnect Google account",
                         "Switch account",
@@ -1017,6 +1020,26 @@ class MainActivityPresentationTest {
                     ),
                     (0 until items.count).map { items.getItem(it).toString() },
                 )
+            }
+        }
+    }
+
+    @Test
+    fun appearanceChoiceIsDeviceLocalAndSurvivesActivityRecreation() {
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { activity ->
+                assertEquals(AppearanceMode.FOLLOW_PHONE, AppearancePreferences(activity).read())
+                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                activity.selectDialogItem("Appearance")
+                assertEquals(listOf("Follow phone", "Light", "Dark"), activity.dialogItems())
+                activity.selectDialogItem("Dark")
+            }
+            waitFor(scenario) { AppearancePreferences(it).read() == AppearanceMode.DARK }
+            scenario.recreate()
+            waitFor(scenario) {
+                AppearancePreferences(it).read() == AppearanceMode.DARK &&
+                    it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD
             }
         }
     }
@@ -1209,14 +1232,14 @@ class MainActivityPresentationTest {
 
                 val linkRow = activity.findViewById<ViewGroup>(ProjectUiIds.PROJECT_LINKS).getChildAt(0) as ViewGroup
                 assertTrue(linkRow.background == null)
-                val dragHandle = linkRow.getChildAt(0) as Button
+                val title = linkRow.getChildAt(0) as Button
+                val dragHandle = linkRow.getChildAt(2) as Button
                 assertEquals("Reorder Build notes. Long press and drag.", dragHandle.contentDescription.toString())
                 assertTrue(
                     renderAlpha(requireNotNull(dragHandle.compoundDrawablesRelative[0])).contentEquals(
-                        renderAlpha(requireNotNull(activity.getDrawable(R.drawable.ic_link))),
+                        renderAlpha(requireNotNull(activity.getDrawable(R.drawable.ic_reorder_vertical))),
                     ),
                 )
-                val title = linkRow.getChildAt(1) as Button
                 val minimumTouch = (48 * activity.resources.displayMetrics.density).toInt()
                 assertEquals("Build notes", title.text.toString())
                 assertFalse(descendantText(linkRow).contains("https://"))
@@ -1366,7 +1389,7 @@ class MainActivityPresentationTest {
                 activity.selectDialogItem("About")
                 val about = activity.dialogTexts().joinToString("\n")
                 assertTrue(about.contains("Blocks Android"))
-                assertTrue(about.contains("Version 0.9.6 (23)"))
+                assertTrue(about.contains("Version 0.10.0 (24)"))
                 assertTrue(about.contains("dev.blocks.android/debug"))
                 assertFalse(about.contains("tenant", ignoreCase = true))
                 assertFalse(about.contains("token", ignoreCase = true))
@@ -2069,7 +2092,7 @@ class MainActivityPresentationTest {
     }
 
     @Test
-    fun projectItemsUseContainedLocalFormsPinOrderingSafeValidationAndConfirmedDelete() {
+    fun projectItemsUseContainedLocalFormsOrderingSafeValidationAndConfirmedDelete() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
             scenario.onActivity { it.button("Active project").performClick() }
@@ -2094,12 +2117,12 @@ class MainActivityPresentationTest {
                     it.texts().contains("Pinned workshop context") &&
                     it.findViewById<ViewGroup>(android.R.id.content).descendants()
                         .filterIsInstance<Button>()
-                        .any { button -> button.contentDescription == "Pin note" }
+                        .any { button -> button.contentDescription == "Reorder note. Long press and drag." }
             }
-            scenario.onActivity { it.buttonWithDescription("Pin note").performClick() }
-            waitUntil { workspace.cache.noteItems.single().pinned }
             scenario.onActivity { activity ->
                 assertTrue(activity.findViewById<View>(ProjectUiIds.PROJECT_NOTES) != null)
+                assertFalse(activity.hasDescription("Pin note"))
+                assertTrue(activity.hasDescription("Reorder note. Long press and drag."))
                 activity.buttonWithDescription("Edit note").performClick()
             }
             waitFor(scenario) { it.findViewById<EditText>(ProjectUiIds.NOTE_BODY) != null }

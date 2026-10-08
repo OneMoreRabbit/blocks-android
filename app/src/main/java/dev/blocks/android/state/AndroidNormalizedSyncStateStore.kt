@@ -17,6 +17,7 @@ import dev.blocks.android.project.ProjectIdentityMapping
 import dev.blocks.android.project.InteractionMutation
 import dev.blocks.android.project.InteractionMutationType
 import dev.blocks.android.project.LinkOrderState
+import dev.blocks.android.project.NoteOrderState
 import dev.blocks.android.project.ParkingTombstone
 import dev.blocks.android.project.ProjectItemMutation
 import dev.blocks.android.project.ProjectItemMutationType
@@ -66,6 +67,7 @@ class AndroidSyncStateStore internal constructor(
         gson.getAdapter(InteractionMutation::class.java),
         gson.getAdapter(dev.blocks.android.project.ProjectOrderState::class.java),
         gson.getAdapter(LinkOrderState::class.java),
+        gson.getAdapter(NoteOrderState::class.java),
         gson.getAdapter(ParkingTombstone::class.java),
     )
 
@@ -221,6 +223,16 @@ class AndroidSyncStateStore internal constructor(
                     gson.toJson(order),
                 )
             }
+            InteractionMutationType.REORDER_NOTES -> {
+                val order = state.projectCache.noteOrders.single { it.projectId == operation.projectId }
+                upsertRecord(
+                    database,
+                    TABLE_NOTE_ORDERS,
+                    order.projectId,
+                    state.projectCache.noteOrders.indexOf(order),
+                    gson.toJson(order),
+                )
+            }
             InteractionMutationType.DELETE_PARKING -> {
                 val tombstone = state.projectCache.parkingTombstones.single {
                     it.parkingId == operation.targetId
@@ -250,7 +262,8 @@ class AndroidSyncStateStore internal constructor(
             "An interaction append cannot also retire operations"
         }
         val operation = current.interactionOperations.last()
-        require(operation.operationId.isNotBlank() && operation.contractVersion == "0.7" &&
+        val expectedContract = if (operation.type == InteractionMutationType.REORDER_NOTES) "0.8" else "0.7"
+        require(operation.operationId.isNotBlank() && operation.contractVersion == expectedContract &&
             before.interactionOperations.none { it.operationId == operation.operationId } &&
             operation.operationId !in current.retiredInteractionOperationIds) {
             "The appended interaction operation identity is invalid"
@@ -294,6 +307,20 @@ class AndroidSyncStateStore internal constructor(
                     order.orderedLinkIds.toSet() == liveIds.toSet() &&
                     order.orderedLinkIds.distinct().size == order.orderedLinkIds.size) {
                     "The appended Link order does not match its aggregate"
+                }
+            }
+            InteractionMutationType.REORDER_NOTES -> {
+                val projectId = requireNotNull(operation.projectId)
+                require(operation.targetId == null)
+                val old = before.noteOrders.firstOrNull { it.projectId == projectId } ?: NoteOrderState(projectId)
+                val order = current.noteOrders.single { it.projectId == projectId }
+                val liveIds = current.noteItems.filter {
+                    it.projectId == projectId && it.deletedAt == null
+                }.map { it.id }
+                require(order.version == old.version + 1 && order.orderedNoteIds == operation.orderedClientIds &&
+                    order.orderedNoteIds.toSet() == liveIds.toSet() &&
+                    order.orderedNoteIds.distinct().size == order.orderedNoteIds.size) {
+                    "The appended Note order does not match its aggregate"
                 }
             }
             InteractionMutationType.DELETE_PARKING -> {
@@ -347,6 +374,15 @@ class AndroidSyncStateStore internal constructor(
                     state.projectCache.noteItems.indexOf(note),
                     gson.toJson(note),
                 )
+                state.projectCache.noteOrders.firstOrNull { it.projectId == note.projectId }?.let { order ->
+                    upsertRecord(
+                        database,
+                        TABLE_NOTE_ORDERS,
+                        order.projectId,
+                        state.projectCache.noteOrders.indexOf(order),
+                        gson.toJson(order),
+                    )
+                }
             }
             ProjectItemMutationType.CREATE_LINK,
             ProjectItemMutationType.EDIT_LINK,
@@ -697,6 +733,7 @@ class AndroidSyncStateStore internal constructor(
             projectUiPreferences = rows(TABLE_PROJECT_UI_PREFERENCES).singleOrNull(),
             projectOrder = rows(TABLE_PROJECT_ORDER).singleOrNull(),
             linkOrders = rows(TABLE_LINK_ORDERS),
+            noteOrders = rows(TABLE_NOTE_ORDERS),
             parkingTombstones = rows(TABLE_PARKING_TOMBSTONES),
             interactionOperations = rows(TABLE_INTERACTION_OPERATIONS),
             retiredInteractionOperations = rows(TABLE_RETIRED_INTERACTION_OPERATIONS),
@@ -780,6 +817,7 @@ class AndroidSyncStateStore internal constructor(
             TABLE_PROJECT_UI_PREFERENCES to listOfNotNull(rows.projectUiPreferences),
             TABLE_PROJECT_ORDER to listOfNotNull(rows.projectOrder),
             TABLE_LINK_ORDERS to rows.linkOrders,
+            TABLE_NOTE_ORDERS to rows.noteOrders,
             TABLE_PARKING_TOMBSTONES to rows.parkingTombstones,
             TABLE_INTERACTION_OPERATIONS to rows.interactionOperations,
             TABLE_RETIRED_INTERACTION_OPERATIONS to rows.retiredInteractionOperations,
@@ -889,6 +927,7 @@ class AndroidSyncStateStore internal constructor(
         TABLE_PROJECT_DRAFTS, TABLE_PROJECT_UI_PREFERENCES -> SINGLETON_ID
         TABLE_PROJECT_ORDER -> SINGLETON_ID
         TABLE_LINK_ORDERS -> gson.fromJson(value, LinkOrderState::class.java).projectId
+        TABLE_NOTE_ORDERS -> gson.fromJson(value, NoteOrderState::class.java).projectId
         TABLE_PARKING_TOMBSTONES -> gson.fromJson(value, ParkingTombstone::class.java).parkingId
         TABLE_INTERACTION_OPERATIONS -> gson.fromJson(value, InteractionMutation::class.java).operationId
         else -> value
@@ -962,7 +1001,7 @@ class AndroidSyncStateStore internal constructor(
             )
             STATE_TABLES.forEach { table ->
                 database.execSQL(
-                    "CREATE TABLE $table (" +
+                    "CREATE TABLE IF NOT EXISTS $table (" +
                         "$COLUMN_ID TEXT PRIMARY KEY NOT NULL, " +
                         "$COLUMN_POSITION INTEGER NOT NULL, " +
                         "$COLUMN_PAYLOAD BLOB NOT NULL)",
@@ -971,16 +1010,17 @@ class AndroidSyncStateStore internal constructor(
         }
 
         override fun onUpgrade(database: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-            require(oldVersion in 1..2 && newVersion == 3) {
+            require(oldVersion in 1..3 && newVersion == 4) {
                 "No normalized local-state migration from $oldVersion to $newVersion"
             }
             val additions = buildList {
                 if (oldVersion < 2) addAll(PROJECT_ITEM_TABLES)
-                addAll(INTERACTION_TABLES)
+                if (oldVersion < 3) addAll(INTERACTION_TABLES)
+                if (oldVersion < 4) add(TABLE_NOTE_ORDERS)
             }
             additions.forEach { table ->
                 database.execSQL(
-                    "CREATE TABLE $table (" +
+                    "CREATE TABLE IF NOT EXISTS $table (" +
                         "$COLUMN_ID TEXT PRIMARY KEY NOT NULL, " +
                         "$COLUMN_POSITION INTEGER NOT NULL, " +
                         "$COLUMN_PAYLOAD BLOB NOT NULL)",
@@ -996,7 +1036,7 @@ class AndroidSyncStateStore internal constructor(
     private data class StoredRow(val position: Int, val value: String)
 
     internal companion object {
-        const val DATABASE_VERSION = 3
+        const val DATABASE_VERSION = 4
         const val DATABASE_PREFIX = "blocks_local_v10_"
         const val SECRET_KEY_PREFIX = "blocks-local-secrets-v1-"
         const val TRANSFORMATION = "AES/GCM/NoPadding"
@@ -1030,6 +1070,7 @@ class AndroidSyncStateStore internal constructor(
         const val TABLE_PROJECT_UI_PREFERENCES = "project_ui_preferences"
         const val TABLE_PROJECT_ORDER = "project_custom_order"
         const val TABLE_LINK_ORDERS = "project_link_orders"
+        const val TABLE_NOTE_ORDERS = "project_note_orders"
         const val TABLE_PARKING_TOMBSTONES = "project_parking_tombstones"
         const val TABLE_INTERACTION_OPERATIONS = "interaction_operations"
         const val TABLE_RETIRED_INTERACTION_OPERATIONS = "retired_interaction_operations"
@@ -1092,6 +1133,7 @@ class AndroidSyncStateStore internal constructor(
             TABLE_PROJECT_UI_PREFERENCES,
             TABLE_PROJECT_ORDER,
             TABLE_LINK_ORDERS,
+            TABLE_NOTE_ORDERS,
             TABLE_PARKING_TOMBSTONES,
             TABLE_INTERACTION_OPERATIONS,
             TABLE_RETIRED_INTERACTION_OPERATIONS,
