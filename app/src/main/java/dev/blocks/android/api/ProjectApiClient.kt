@@ -6,7 +6,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 
-/** Active API 0.7 transport. It intentionally exposes no retired session or map route. */
+/** Active API 0.8 transport. It intentionally exposes no retired session or map route. */
 interface ProjectTransport {
     fun listProjects(identityToken: String, tenantId: String, status: String): ApiResponse
     fun createProject(
@@ -122,6 +122,10 @@ interface ProjectTransport {
         throw UnsupportedOperationException("API 0.7 Link order is unavailable")
     fun reorderLinks(identityToken: String, tenantId: String, projectId: String, body: String): ApiResponse =
         throw UnsupportedOperationException("API 0.7 Link ordering is unavailable")
+    fun noteOrder(identityToken: String, tenantId: String, projectId: String): ApiResponse =
+        throw UnsupportedOperationException("API 0.8 Note order is unavailable")
+    fun reorderNotes(identityToken: String, tenantId: String, projectId: String, body: String): ApiResponse =
+        throw UnsupportedOperationException("API 0.8 Note ordering is unavailable")
     fun parkingTombstones(identityToken: String, tenantId: String, projectId: String): ApiResponse =
         throw UnsupportedOperationException("API 0.7 Park tombstones are unavailable")
     fun deleteParking(
@@ -135,7 +139,7 @@ interface ProjectTransport {
 
 class ProjectApiClient(
     private val baseUri: URI,
-    private val clientVersion: String = "0.7",
+    private val clientVersion: String = "0.8",
     private val httpClient: OkHttpClient = OkHttpClient(),
 ) : ProjectTransport {
     override fun listProjects(identityToken: String, tenantId: String, status: String) = request(
@@ -323,7 +327,7 @@ class ProjectApiClient(
         itemPath(tenantId, projectId, "links"),
         identityToken,
         body,
-        mapOf(API_VERSION_HEADER to API_VERSION_07),
+        mapOf(API_VERSION_HEADER to API_VERSION_08),
     )
 
     override fun readLink(identityToken: String, tenantId: String, projectId: String, itemId: String) = request(
@@ -349,7 +353,7 @@ class ProjectApiClient(
         itemId,
         rowVersion,
         body,
-        mapOf(API_VERSION_HEADER to API_VERSION_07),
+        mapOf(API_VERSION_HEADER to API_VERSION_08),
     )
 
     override fun deleteLink(
@@ -404,6 +408,21 @@ class ProjectApiClient(
         "${projectPath(tenantId, projectId)}/interaction/link-order",
         identityToken,
         body,
+    )
+
+    override fun noteOrder(identityToken: String, tenantId: String, projectId: String) = request(
+        "GET",
+        "${projectPath(tenantId, projectId)}/interaction/note-order",
+        identityToken,
+        headers = mapOf(API_VERSION_HEADER to API_VERSION_08),
+    )
+
+    override fun reorderNotes(identityToken: String, tenantId: String, projectId: String, body: String) = request(
+        "PUT",
+        "${projectPath(tenantId, projectId)}/interaction/note-order",
+        identityToken,
+        body,
+        mapOf(API_VERSION_HEADER to API_VERSION_08),
     )
 
     override fun parkingTombstones(identityToken: String, tenantId: String, projectId: String) = request(
@@ -506,7 +525,7 @@ class ProjectApiClient(
 
     private companion object {
         const val API_VERSION_HEADER = "X-Blocks-API-Version"
-        const val API_VERSION_07 = "0.7"
+        const val API_VERSION_08 = "0.8"
         val METHODS_REQUIRING_BODY = setOf("POST", "PUT", "PATCH")
     }
 }

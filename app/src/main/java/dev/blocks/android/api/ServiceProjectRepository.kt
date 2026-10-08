@@ -2,41 +2,41 @@ package dev.blocks.android.api
 
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
-import dev.blocks.android.api.generated.v07.model.AliasIn
-import dev.blocks.android.api.generated.v07.model.AliasOut
-import dev.blocks.android.api.generated.v07.model.BindIn
-import dev.blocks.android.api.generated.v07.model.BindingOut
-import dev.blocks.android.api.generated.v07.model.BlockOut
-import dev.blocks.android.api.generated.v07.model.ChangesOut
-import dev.blocks.android.api.generated.v07.model.DeleteIn
-import dev.blocks.android.api.generated.v07.model.DeleteParkingIn
-import dev.blocks.android.api.generated.v07.model.LinkAck
-import dev.blocks.android.api.generated.v07.model.LinkCreateIn
-import dev.blocks.android.api.generated.v07.model.LinkEditIn
-import dev.blocks.android.api.generated.v07.model.LinkOut
-import dev.blocks.android.api.generated.v07.model.LegacyBlockIn
-import dev.blocks.android.api.generated.v07.model.LookupIn
-import dev.blocks.android.api.generated.v07.model.LookupOut
-import dev.blocks.android.api.generated.v07.model.NoteAck
-import dev.blocks.android.api.generated.v07.model.NoteCreateIn
-import dev.blocks.android.api.generated.v07.model.NoteEditIn
-import dev.blocks.android.api.generated.v07.model.NoteOut
-import dev.blocks.android.api.generated.v07.model.NotePinIn
-import dev.blocks.android.api.generated.v07.model.NotesIn
-import dev.blocks.android.api.generated.v07.model.NotesOut
-import dev.blocks.android.api.generated.v07.model.OrderOut
-import dev.blocks.android.api.generated.v07.model.ParkingDeleteOut
-import dev.blocks.android.api.generated.v07.model.ParkingTombstoneOut
-import dev.blocks.android.api.generated.v07.model.ProjectIn
-import dev.blocks.android.api.generated.v07.model.ProjectOut
-import dev.blocks.android.api.generated.v07.model.ProjectPageOut
-import dev.blocks.android.api.generated.v07.model.ProjectParkIn
-import dev.blocks.android.api.generated.v07.model.ProjectParkingOut
-import dev.blocks.android.api.generated.v07.model.ProjectRename
-import dev.blocks.android.api.generated.v07.model.RegisteredBlockOut
-import dev.blocks.android.api.generated.v07.model.ReorderIn
-import dev.blocks.android.api.generated.v07.model.ResolveKeyIn
-import dev.blocks.android.api.generated.v07.model.ResolveKeyOut
+import dev.blocks.android.api.generated.v08.model.AliasIn
+import dev.blocks.android.api.generated.v08.model.AliasOut
+import dev.blocks.android.api.generated.v08.model.BindIn
+import dev.blocks.android.api.generated.v08.model.BindingOut
+import dev.blocks.android.api.generated.v08.model.BlockOut
+import dev.blocks.android.api.generated.v08.model.ChangesOut
+import dev.blocks.android.api.generated.v08.model.DeleteIn
+import dev.blocks.android.api.generated.v08.model.DeleteParkingIn
+import dev.blocks.android.api.generated.v08.model.LinkAck
+import dev.blocks.android.api.generated.v08.model.LinkCreateIn
+import dev.blocks.android.api.generated.v08.model.LinkEditIn
+import dev.blocks.android.api.generated.v08.model.LinkOut
+import dev.blocks.android.api.generated.v08.model.LegacyBlockIn
+import dev.blocks.android.api.generated.v08.model.LookupIn
+import dev.blocks.android.api.generated.v08.model.LookupOut
+import dev.blocks.android.api.generated.v08.model.NoteAck
+import dev.blocks.android.api.generated.v08.model.NoteCreateIn
+import dev.blocks.android.api.generated.v08.model.NoteEditIn
+import dev.blocks.android.api.generated.v08.model.NoteOut
+import dev.blocks.android.api.generated.v08.model.NotePinIn
+import dev.blocks.android.api.generated.v08.model.NotesIn
+import dev.blocks.android.api.generated.v08.model.NotesOut
+import dev.blocks.android.api.generated.v08.model.OrderOut
+import dev.blocks.android.api.generated.v08.model.ParkingDeleteOut
+import dev.blocks.android.api.generated.v08.model.ParkingTombstoneOut
+import dev.blocks.android.api.generated.v08.model.ProjectIn
+import dev.blocks.android.api.generated.v08.model.ProjectOut
+import dev.blocks.android.api.generated.v08.model.ProjectPageOut
+import dev.blocks.android.api.generated.v08.model.ProjectParkIn
+import dev.blocks.android.api.generated.v08.model.ProjectParkingOut
+import dev.blocks.android.api.generated.v08.model.ProjectRename
+import dev.blocks.android.api.generated.v08.model.RegisteredBlockOut
+import dev.blocks.android.api.generated.v08.model.ReorderIn
+import dev.blocks.android.api.generated.v08.model.ResolveKeyIn
+import dev.blocks.android.api.generated.v08.model.ResolveKeyOut
 import dev.blocks.android.mvp.ChangeEvent
 import dev.blocks.android.mvp.ChangePage
 import dev.blocks.android.mvp.ParkingDraft
@@ -63,7 +63,7 @@ import dev.blocks.android.project.RegisteredBlock
 import dev.blocks.android.tag.ProjectKey
 import java.util.UUID
 
-/** Maps generated API 0.7 transport models into Android-owned project-domain models. */
+/** Maps generated API 0.8 transport models into Android-owned project-domain models. */
 class ServiceProjectRepository(
     private val client: ProjectTransport,
     private val json: Gson = Gson(),
@@ -428,7 +428,7 @@ class ServiceProjectRepository(
         json.fromJson(
             client.projectOrder(session.identityToken, session.tenantId).successBody(),
             OrderOut::class.java,
-        ).toAuthoritativeOrder(null)
+        ).toAuthoritativeOrder(null, InteractionMutationType.REORDER_PROJECTS)
     }
 
     override fun reorderProjects(
@@ -442,7 +442,7 @@ class ServiceProjectRepository(
         json.fromJson(
             client.linkOrder(session.identityToken, session.tenantId, projectId).successBody(),
             OrderOut::class.java,
-        ).toAuthoritativeOrder(projectId)
+        ).toAuthoritativeOrder(projectId, InteractionMutationType.REORDER_LINKS)
     }
 
     override fun reorderLinks(
@@ -450,6 +450,25 @@ class ServiceProjectRepository(
         operation: InteractionMutation,
     ): InteractionAcknowledgement.Order = reorder(session, operation) { body ->
         client.reorderLinks(
+            session.identityToken,
+            session.tenantId,
+            requireNotNull(operation.projectId),
+            body,
+        )
+    }
+
+    override fun noteOrder(session: Session, projectId: String): AuthoritativeOrder = decodeContract {
+        json.fromJson(
+            client.noteOrder(session.identityToken, session.tenantId, projectId).successBody(),
+            OrderOut::class.java,
+        ).toAuthoritativeOrder(projectId, InteractionMutationType.REORDER_NOTES)
+    }
+
+    override fun reorderNotes(
+        session: Session,
+        operation: InteractionMutation,
+    ): InteractionAcknowledgement.Order = reorder(session, operation) { body ->
+        client.reorderNotes(
             session.identityToken,
             session.tenantId,
             requireNotNull(operation.projectId),
@@ -524,6 +543,7 @@ class ServiceProjectRepository(
         require(operation.type in setOf(
             InteractionMutationType.REORDER_PROJECTS,
             InteractionMutationType.REORDER_LINKS,
+            InteractionMutationType.REORDER_NOTES,
         ))
         val response = json.fromJson(
             send(
@@ -549,10 +569,14 @@ class ServiceProjectRepository(
             version = response.version,
             projectId = response.projectId?.toString(),
             orderedClientIds = response.orderedClientIds.map(UUID::toString),
+            type = operation.type,
         )
     }
 
-    private fun OrderOut.toAuthoritativeOrder(expectedProjectId: String?): AuthoritativeOrder {
+    private fun OrderOut.toAuthoritativeOrder(
+        expectedProjectId: String?,
+        type: InteractionMutationType,
+    ): AuthoritativeOrder {
         check(projectId?.toString() == expectedProjectId) { "Service returned an unexpected order aggregate" }
         return AuthoritativeOrder(
             aggregateId = aggregateId.toString(),
@@ -560,6 +584,7 @@ class ServiceProjectRepository(
             orderedClientIds = orderedClientIds.map(UUID::toString),
             version = version,
             operationId = operationId?.toString(),
+            type = type,
         )
     }
 

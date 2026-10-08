@@ -3,6 +3,8 @@ package dev.blocks.android.api
 import dev.blocks.android.mvp.ParkingDraft
 import dev.blocks.android.mvp.Session
 import dev.blocks.android.project.ProjectLifecycle
+import dev.blocks.android.project.InteractionMutation
+import dev.blocks.android.project.InteractionMutationType
 import dev.blocks.android.project.ProjectItemMutation
 import dev.blocks.android.project.ProjectItemMutationType
 import dev.blocks.android.tag.ProjectKey
@@ -159,6 +161,34 @@ class ServiceProjectRepositoryTest {
         assertEquals(NAVIGATION_KEY, JSONObject(transport.resolveBody).getString("project_key"))
     }
 
+    @Test
+    fun mapsApi08NoteOrderReadAndExactReorderReceipt() {
+        val transport = FakeProjectTransport()
+        val repository = ServiceProjectRepository(transport)
+        val operation = InteractionMutation(
+            operationId = OPERATION_A,
+            type = InteractionMutationType.REORDER_NOTES,
+            aggregateId = NOTE_ORDER_ID,
+            projectId = PROJECT_ID,
+            orderedClientIds = listOf(ITEM_ID, ITEM_ID_B),
+            baseVersion = 4,
+            createdAt = NOW,
+            preparedForDelivery = true,
+            contractVersion = "0.8",
+        )
+
+        val read = repository.noteOrder(SESSION, PROJECT_ID)
+        val receipt = repository.reorderNotes(SESSION, operation)
+
+        assertEquals(InteractionMutationType.REORDER_NOTES, read.type)
+        assertEquals(listOf(ITEM_ID_B, ITEM_ID), read.orderedClientIds)
+        assertEquals(InteractionMutationType.REORDER_NOTES, receipt.type)
+        assertEquals(OPERATION_A, receipt.operationId)
+        assertEquals(listOf(ITEM_ID, ITEM_ID_B), receipt.orderedClientIds)
+        assertEquals(OPERATION_A, JSONObject(transport.reorderNotesBody).getString("operation_id"))
+        assertEquals(4, JSONObject(transport.reorderNotesBody).getInt("base_version"))
+    }
+
     private class FakeProjectTransport(
         private val pageTenant: String = TENANT_ID,
         private val oldCreateResponse: Boolean = false,
@@ -180,6 +210,7 @@ class ServiceProjectRepositoryTest {
         var createNoteBody = ""
         var aliasBody = ""
         var resolveBody = ""
+        var reorderNotesBody = ""
 
         override fun listProjects(identityToken: String, tenantId: String, status: String): ApiResponse {
             requestedStatus = status
@@ -321,6 +352,22 @@ class ServiceProjectRepositoryTest {
             return success("""{"project_id":"$PROJECT_ID"}""")
         }
 
+        override fun noteOrder(identityToken: String, tenantId: String, projectId: String) = success(
+            orderJson(operationId = OPERATION_B, orderedIds = listOf(ITEM_ID_B, ITEM_ID), version = 4),
+        )
+
+        override fun reorderNotes(
+            identityToken: String,
+            tenantId: String,
+            projectId: String,
+            body: String,
+        ): ApiResponse {
+            reorderNotesBody = body
+            return success(
+                orderJson(operationId = OPERATION_A, orderedIds = listOf(ITEM_ID, ITEM_ID_B), version = 5),
+            )
+        }
+
         private fun success(body: String) = ApiResponse.Success(200, body)
     }
 
@@ -365,8 +412,13 @@ class ServiceProjectRepositoryTest {
         private fun noteAckJson() =
             """{"authored_by_user_id":"$USER_ID","body":"Later state","created_at":"$NOW","deleted_at":null,"id":"$ITEM_ID","last_operation_id":"$OPERATION_B","operation_id":"$OPERATION_A","pinned":true,"project_id":"$PROJECT_ID","row_version":2,"tenant_id":"$TENANT_ID","updated_at":"$NOW"}"""
 
+        private fun orderJson(operationId: String, orderedIds: List<String>, version: Int) =
+            """{"aggregate_id":"$NOTE_ORDER_ID","operation_id":"$operationId","ordered_client_ids":${orderedIds.joinToString(prefix = "[", postfix = "]") { "\"$it\"" }},"version":$version,"project_id":"$PROJECT_ID"}"""
+
         private const val CLIENT_ID = "00000000-0000-0000-0000-000000000098"
         private const val ITEM_ID = "00000000-0000-4000-8000-000000000009"
+        private const val ITEM_ID_B = "00000000-0000-4000-8000-000000000019"
+        private const val NOTE_ORDER_ID = "00000000-0000-4000-8000-000000000029"
         private const val OPERATION_A = "00000000-0000-4000-8000-00000000000a"
         private const val OPERATION_B = "00000000-0000-4000-8000-00000000000b"
         private const val NAVIGATION_KEY = "00000000-0000-4000-8000-00000000000c"
