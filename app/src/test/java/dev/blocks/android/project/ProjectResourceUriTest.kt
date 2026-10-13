@@ -74,6 +74,27 @@ class ProjectResourceUriTest {
         }
     }
 
+    @Test
+    fun oneDriveCorpusExampleContainsOnlySyntheticIdentifiers() {
+        val corpus = requireNotNull(javaClass.classLoader)
+            .getResourceAsStream("project-resource-uri-validation-v0_4.json")
+            .use { input -> Gson().fromJson(input.reader(), UriCorpus::class.java) }
+        val examples = corpus.accepted.filter { it.startsWith("https://onedrive.live.com/") }
+        val expectedQuery = listOf(
+            "resid=0000000000000000%210000",
+            "id=synthetic-account",
+            "wd=onenote%28https%3A%2F%2Fsynthetic.example%2F00000000-0000-0000-0000-000000000000%2FExample%7C00000000-0000-0000-0000-000000000000%2F%29",
+            "wdpartid={00000000-0000-0000-0000-000000000000}{0}",
+            "wdsectionfileid=0000000000000000!00000000000000000000000000000000",
+            "id=synthetic-secondary",
+            "end",
+        ).joinToString("&")
+        assertTrue(
+            "The OneDrive URI regression must use only approved synthetic identifiers",
+            examples == listOf("https://onedrive.live.com/edit.aspx?$expectedQuery"),
+        )
+    }
+
     private data class UriCorpus(
         val version: String,
         val accepted: List<String>,
