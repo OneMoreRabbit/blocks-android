@@ -24,7 +24,7 @@ The interface stays deliberately narrow. Projects are freely browsable, parking 
 
 - **[Blocks Android](https://github.com/OneMoreRabbit/blocks-android)** is the local-first client. It owns device presentation, local work, QR/NFC interaction and a durable background sync queue.
 - **[Blocks Service](https://github.com/OneMoreRabbit/blocks-service)** is the authenticated shared API and domain authority. It checks tenant membership, stores shared project data, and accepts versioned, retry-safe synchronization. Its API 0.8 is deployed; Android consumes that published contract.
-- **[Blocks Web](https://github.com/OneMoreRabbit/blocks-web)** is a planned browser client of the same Service API, not a direct database client. Its component and identity design are registered, but there is no live Web product UI yet. A Windows client is parked, not part of this release.
+- **Blocks Web** (not yet public) is a planned browser client of the same Service API, not a direct database client. Its component and identity design are registered, but there is no live Web product UI yet. A Windows client is parked, not part of this release.
 
 Android **v0.10.1** is a custody-signed pilot, not a Play Store release. The Service deployment is live, but physical signed-upgrade data retention and two-device production synchronization remain open observations; a local test is not proof of those journeys. See [release notes](release-notes.md) for the latest Android change.
 
