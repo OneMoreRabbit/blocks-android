@@ -89,6 +89,12 @@ class IsolatedServiceSyncTest {
         assertTrue(independent.listProjects(session, ProjectLifecycle.ACTIVE).any { it.id == project.id && it.name == projectName })
         assertEquals(noteBody, independent.readNote(session, project.id, note.id).body)
         assertEquals(1, independent.listProjects(session, ProjectLifecycle.ACTIVE).count { it.clientId == projectClientId })
+        val secondClient = ProjectSyncRepository(
+            independent, NoOpLegacyQueueReplay, MemoryDrafts(), MemoryState(),
+            coverMediaStore = InMemoryProjectCoverMediaStore(),
+        )
+        secondClient.activate(session)
+        assertTrue(secondClient.backgroundSync(session).cache.activeProjects.any { it.id == project.id })
         val forbidden = ProjectApiClient(base, httpClient = http).projectPage(token2, tenant1, project.id)
         assertTrue(
             "Another synthetic account must not see this Project",
