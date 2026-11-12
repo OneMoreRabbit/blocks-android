@@ -160,27 +160,21 @@ class AndroidNormalizedSyncStateStoreTest {
         assertEquals(before.projectCache.projectIdMappings, recovered.projectCache.projectIdMappings)
         assertEquals(before.changeCursor, recovered.changeCursor)
         assertEquals(2, payload.coverMedia.size)
-        assertEquals(1, payload.excludedProtectedBlockRecords)
-        assertEquals(2, payload.excludedProtectedBlockOperations)
-        assertEquals(1, payload.protectedBlockMetadata.size)
-        assertEquals(2, payload.protectedBlockOperationMetadata.size)
+        assertEquals(1, payload.state.localBlocks.size)
+        assertEquals(2, payload.state.localBlockOperations.size)
         assertEquals(before.projectCache.localBlocks.single().boundProjectId,
-            payload.protectedBlockMetadata.single().boundProjectId)
-        assertEquals(before.projectCache.localBlocks.single().token.fingerprint(),
-            payload.protectedBlockMetadata.single().tokenFingerprint)
-        assertFalse(Gson().toJson(payload).contains(before.projectCache.localBlocks.single().token.encoded))
+            Gson().fromJson(payload.state.localBlocks.single(), dev.blocks.android.tag.LocalBlockRecord::class.java).boundProjectId)
+        assertTrue(Gson().toJson(payload).contains(before.projectCache.localBlocks.single().token.encoded))
         assertEquals(1, payload.excludedKnownOtherAccountPartitions)
         assertEquals("Release 25 draft", payload.drafts.projectName)
         assertEquals(before, store.loadSyncState(TENANT))
         assertEquals(otherBefore, store.loadSyncState(OTHER_TENANT))
-        val passphrase = "disposable-release25-passphrase".toCharArray()
-        val archive = PortableBackupCodec.seal(payload, passphrase)
-        assertEquals(payload, PortableBackupCodec.open(archive, passphrase))
+        val archive = PortableBackupCodec.encode(payload)
+        assertEquals(payload, PortableBackupCodec.decode(archive))
         val destination = requireNotNull(context.getExternalFilesDir(null))
         File(destination, "release25-upgrade.blocksbackup").writeBytes(archive)
         File(destination, "release25-upgrade-expected.json").writeText(Gson().toJson(payload))
         archive.fill(0)
-        passphrase.fill('\u0000')
         if (!required) {
             AndroidEncryptedDraftStore(context).clear(TENANT)
             AndroidEncryptedAcceptedTenantContinuityStore(context).clear()
@@ -247,7 +241,7 @@ class AndroidNormalizedSyncStateStoreTest {
         .digest(bytes).joinToString("") { "%02x".format(it.toInt() and 0xff) }
 
     @Test
-    fun exportSnapshotReadsCommittedWalAndPendingStateWithoutDecryptingProtectedTokens() {
+    fun exportSnapshotReadsCommittedWalPendingStateAndProtectedDomainRows() {
         val expected = state(TENANT).withCreatedProject().withAddedParking().withExistingItems()
         val other = state(OTHER_TENANT, OTHER_PROJECT)
         store.saveSyncState(TENANT, expected)
@@ -265,10 +259,8 @@ class AndroidNormalizedSyncStateStoreTest {
         assertEquals(expected.projectCache.commands, decoded.projectCache.commands)
         assertEquals(expected.projectCache.projectIdMappings, decoded.projectCache.projectIdMappings)
         assertEquals(expected.changeCursor, decoded.changeCursor)
-        assertTrue(snapshot.rows.localBlocks.isEmpty())
-        assertTrue(snapshot.rows.localBlockOperations.isEmpty())
-        assertEquals(1, snapshot.localBlocks.size)
-        assertEquals(2, snapshot.localBlockOperations.size)
+        assertEquals(1, snapshot.rows.localBlocks.size)
+        assertEquals(2, snapshot.rows.localBlockOperations.size)
         assertEquals(otherBefore, store.loadSyncState(OTHER_TENANT))
         assertEquals(expected, store.loadSyncState(TENANT))
         assertTrue(databaseBefore.contentEquals(normalizedDatabase(TENANT).readBytes()))

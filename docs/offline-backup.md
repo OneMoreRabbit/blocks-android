@@ -1,32 +1,36 @@
-# Offline backup (Android 0.10.2 candidate)
+# Offline backup and restore (Android 0.10.2 candidate)
 
-Blocks can export the **currently open local account** without a network connection or a fresh Google sign-in. This is a recovery archive, not a sync command and not an APK. Export does not send data to Blocks Service.
+Blocks can export the currently open account without a network connection or fresh Google sign-in. This is not sync and does not send anything to Blocks Service. **The backup is not encrypted. Anyone holding the file can read its projects, notes, images, NFC tag locators and unsent changes.** Save it only in a private place you control; do not share or automatically upload it.
 
-## Make a backup on the phone
+This describes an unreleased candidate. Do not change the owner's installed app or try these steps on the owner's phone until architecture has approved a custody-signed in-place update.
 
-1. Open the cached account in Blocks. In the dashboard, open **Settings → Export backup**.
-2. Enter and confirm a passphrase of at least 12 characters. Keep it separately from the backup file: it cannot be recovered or reset.
-3. Choose a location and name in Android's document picker. Keep Blocks open until it reports **Verified current-account export**. Check the counts, time, app version and excluded-data warning shown there.
-4. Keep a second copy of the verified `.blocksbackup` file in a location you control. Do not share the file or passphrase in chat or issue trackers.
+## Back up the existing phone
 
-If the picker is cancelled, storage fails, or Blocks is interrupted, there is **no verified backup**. Blocks attempts to remove an incomplete document; if it cannot, delete that document yourself. The phone's original local data is not removed or replayed by export. Try again after the failure is resolved.
+1. Leave the existing account open. Do not sign out, switch accounts, uninstall Blocks, clear its storage or point it at another Service.
+2. On the dashboard, choose **Settings → Export backup**. Read the warning, then choose a private file location with Android's document picker.
+3. Keep Blocks open until it says **Verified current-account export**. Record the displayed counts, format, app version and time. A cancelled picker, failed storage, or interrupted write is **not** a verified backup. Blocks tries to remove an incomplete file; if it cannot, delete that incomplete file at the chosen location.
+4. Make a separate private copy of the verified `.blocksbackup` file. Do not discard the source phone's data.
 
-## What is in format 1
+Format 2 includes the open account's active and archived Projects, Notes, Links, Park history and tombstones, ordering, drafts, project identity mappings, local/server versions, sync cursor, pending and retired operations with original replay identities, every referenced cover variant, and full NFC/block records and pending operations including raw tag locators. It reads the tenant database in one consistent SQLite transaction including committed WAL pages, then captures related draft and cover stores after foreground work is quiescent. Missing required data fails export rather than being silently omitted. Google/Service credentials, session tokens and private keys are never included. Other locked accounts are not unlocked or included; do not switch to them during this incident.
 
-The authenticated-encrypted archive contains one open tenant's current Project database projection: active/archived Projects, Notes, Links, Park history and tombstones, ordering, local/server identity mappings, row versions, sync cursor, pending and retired operations with their original idempotency identities, UI preferences, drafts, accepted account identity binding, and decrypted cover media bytes with digests. A consistent read transaction includes committed SQLite WAL data. The UI stops its own background sync and waits for in-flight local work while capturing related draft/media stores.
+The archive has a version and SHA-256 checksum for its complete payload; each image has its own checksum. Checksums detect corruption, **not** forgery or ownership. Format 1 encrypted/passphrase archives from the earlier unshipped candidate are unsupported by this restore. The current format has a 128 MiB payload limit and fails clearly if exceeded.
 
-It does **not** contain a Google or Service credential, private key, Android Keystore ciphertext, or raw NFC tag token. The encrypted file does retain token-free metadata for protected local blocks and their pending operations: IDs, state, label, project association, operation/dependency IDs and a one-way token fingerprint. This can help identify and reconstruct associations after separate authorized recovery, but cannot program/resolve a physical tag or replay a token-dependent operation. The full protected rows and raw locators are excluded, with counts shown. Other retained accounts remain locked and excluded. **Do not switch accounts or sign out during this incident**; their partitions remain unprotected pending a separate safe plan. A partition no longer present in the accepted-account index might exist and cannot be enumerated safely by this export. If there is no verified current local database or a required cover cannot be read, export fails rather than omitting it. Format 1 has a 64 MiB plaintext limit.
+## Verify a copy on a trusted computer
 
-The archive is encrypted with PBKDF2-HMAC-SHA256 (600,000 iterations, per-file random salt) and AES-256-GCM (random nonce, authenticated header and content). Its decryption does not depend on the original phone's Keystore. The passphrase is not stored by Blocks.
-
-## Verify and read back on a separate trusted computer
-
-On a computer with Python 3 and the `cryptography` package, obtain this repository's `tools/verify_offline_backup.py` and run:
+With Python 3, run:
 
 ```sh
 python3 tools/verify_offline_backup.py /path/to/Blocks-backup.blocksbackup
 ```
 
-It prompts for the passphrase without putting it in shell history and reports verified format, counts and exclusions. For a **disposable private directory** containing the reconstructed JSON and cover bytes, add `--out /path/to/new-empty-directory`. The tool refuses an existing destination. Those readback files are plaintext; protect them and remove them when finished. No source-device key, network connection, Service credential, queue replay or app import is used.
+The reader reports format and counts without contacting Service. To reconstruct JSON and image bytes in a **new private disposable directory**, add `--out /path/to/new-empty-directory`. These files are unencrypted. Protect and remove test copies after verification.
 
-This release has **no in-app restore/import action**. On a replacement device, authenticate to the rightful Blocks account first. Do not feed the archive's tenant mapping or pending operations into a live app or Service without a separately reviewed restore procedure that verifies identity and replay safety. A verified file plus independent readback protects the information; it does not by itself resume the app on a new phone. Do not uninstall, clear storage, sign out, or replace the installed signed app while protecting unsynced work.
+## Restore on a different, empty installation
+
+On a separate fresh device or fresh disposable installation, open Blocks' sign-in screen and choose **Restore backup**. Select the verified file using Android's document picker, inspect the account/record counts and confirm. Restore is refused if that installation already contains retained Blocks account data; it never overwrites it. Do **not** clear or uninstall the original phone to make room.
+
+The restored account opens locally offline. Blocks recreates its local Keystore protection on the destination device. It does not import a Google credential, treat the archived identity as Service authorization, automatically sync/replay the pending queue, or program a physical tag. To resume cross-device sync later, explicitly sign in to the **same** Google account and let Service independently confirm the exact account and tenant. A mismatch locks the restored data without exposing it to the different account.
+
+You can make another current-account export from that locally restored account while offline; that does not grant it Service authority or start synchronization.
+
+A verified archive and a tested restore on a disposable installation are not proof that the owner's phone has been backed up. The owner must complete and verify their own export after a separately approved signed in-place update. Never test restore on the live source phone.

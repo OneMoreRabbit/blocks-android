@@ -1,5 +1,7 @@
 package dev.blocks.android.backup
 
+import com.google.gson.Gson
+import com.google.gson.JsonParser
 import dev.blocks.android.auth.AcceptedTenantContinuity
 import dev.blocks.android.mvp.AccountIdentity
 import dev.blocks.android.mvp.FormDrafts
@@ -11,54 +13,71 @@ import dev.blocks.android.state.SyncStateRowCodec
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.OutputStream
+import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PortableBackupCodecTest {
-    private val passphrase = "long-owner-passphrase".toCharArray()
-
     @Test
-    fun encryptedArchiveRoundTripsAllRowsWithoutPlaintextOrDeviceKey() {
+    fun unencryptedArchiveRoundTripsWithVersionAndChecksum() {
         val payload = payload()
-        val first = PortableBackupCodec.seal(payload, passphrase)
-        val second = PortableBackupCodec.seal(payload, passphrase)
-
-        assertFalse(first.contentEquals(second))
-        assertFalse(String(first, StandardCharsets.ISO_8859_1).contains("private project name"))
-        assertFalse(String(first, StandardCharsets.ISO_8859_1).contains("unsent draft"))
-        assertEquals(payload, PortableBackupCodec.open(first, passphrase))
-        assertEquals(payload, PortableBackupCodec.open(second, passphrase))
+        val bytes = PortableBackupCodec.encode(payload)
+        assertTrue(String(bytes, StandardCharsets.ISO_8859_1).contains("private project name"))
+        assertEquals(payload, PortableBackupCodec.decode(bytes))
         assertEquals(1, PortableBackupCodec.summary(payload).projects)
     }
 
     @Test
-    fun wrongPassphraseAndEveryArchiveSegmentTamperFailClosed() {
-        val original = PortableBackupCodec.seal(payload(), passphrase)
-        assertTrue(runCatching { PortableBackupCodec.open(original, "wrong passphrase".toCharArray()) }.isFailure)
-        assertTrue(runCatching { PortableBackupCodec.open(original.copyOf(original.size - 1), passphrase) }.isFailure)
-        listOf(12, 28, 40, original.lastIndex).forEach { offset ->
-            val changed = original.copyOf().also { it[offset] = (it[offset].toInt() xor 1).toByte() }
-            assertTrue("tamper at $offset", runCatching { PortableBackupCodec.open(changed, passphrase) }.isFailure)
-        }
+    fun truncationTamperAndOldFormatAreRejected() {
+        val original = PortableBackupCodec.encode(payload())
+        assertTrue(runCatching { PortableBackupCodec.decode(original.copyOf(original.size - 1)) }.isFailure)
+        val changed = original.copyOf().also { it[it.lastIndex] = (it.last().toInt() xor 1).toByte() }
+        assertTrue(runCatching { PortableBackupCodec.decode(changed) }.isFailure)
+        val old = original.copyOf().also { it[7] = '1'.code.toByte() }
+        assertTrue(runCatching { PortableBackupCodec.decode(old) }.isFailure)
     }
 
     @Test
-    fun shortPassphraseAndOversizedPayloadCannotBeWritten() {
-        assertTrue(runCatching { PortableBackupCodec.seal(payload(), "short".toCharArray()) }.isFailure)
-        val oversized = payload().copy(drafts = FormDrafts(projectName = "x".repeat(64 * 1024 * 1024)))
-        assertTrue(runCatching { PortableBackupCodec.seal(oversized, passphrase) }.isFailure)
+    fun recomputedChecksumCannotAuthorizeCrossTenantProject() {
+        val original = PortableBackupCodec.encode(payload())
+        val envelope = JsonParser.parseString(String(original, 44, original.size - 44, StandardCharsets.UTF_8))
+            .asJsonObject
+        envelope.getAsJsonObject("payload").getAsJsonObject("acceptedAccount")
+            .addProperty("tenantId", "20000000-0000-4000-8000-000000000001")
+        val payloadBytes = Gson().toJson(envelope.get("payload")).toByteArray(StandardCharsets.UTF_8)
+        envelope.getAsJsonObject("manifest").addProperty(
+            "payloadSha256", MessageDigest.getInstance("SHA-256").digest(payloadBytes)
+                .joinToString("") { "%02x".format(it.toInt() and 0xff) },
+        )
+        val changedPayload = Gson().toJson(envelope).toByteArray(StandardCharsets.UTF_8)
+        val changed = ByteBuffer.allocate(44 + changedPayload.size)
+            .put("BLOCKSB2".toByteArray()).putInt(changedPayload.size)
+            .put(MessageDigest.getInstance("SHA-256").digest(changedPayload)).put(changedPayload).array()
+        assertTrue(runCatching { PortableBackupCodec.decode(changed) }.isFailure)
+    }
+
+    @Test
+    fun duplicateJsonFieldIsRejectedEvenWithRecomputedOuterChecksum() {
+        val original = PortableBackupCodec.encode(payload())
+        val json = String(original, 44, original.size - 44, StandardCharsets.UTF_8)
+        val duplicate = json.replaceFirst("\"manifest\":{", "\"manifest\":{\"formatVersion\":2,")
+        val bytes = duplicate.toByteArray(StandardCharsets.UTF_8)
+        val changed = ByteBuffer.allocate(44 + bytes.size)
+            .put("BLOCKSB2".toByteArray()).putInt(bytes.size)
+            .put(MessageDigest.getInstance("SHA-256").digest(bytes)).put(bytes).array()
+        assertTrue(runCatching { PortableBackupCodec.decode(changed) }.isFailure)
     }
 
     @Test
     fun documentWriteOnlySucceedsAfterIndependentProviderReadback() {
         val payload = payload()
-        val archive = PortableBackupCodec.seal(payload, passphrase)
+        val archive = PortableBackupCodec.encode(payload)
         val stored = ByteArrayOutputStream()
         BackupArchiveWriter.writeAndVerify(
-            archive, passphrase, payload,
+            archive, payload,
             openWrite = { stored }, openRead = { ByteArrayInputStream(stored.toByteArray()) },
         )
         assertTrue(stored.toByteArray().contentEquals(archive))
@@ -67,10 +86,9 @@ class PortableBackupCodecTest {
     @Test
     fun unavailableInterruptedTruncatedAndModifiedDocumentsNeverVerify() {
         val payload = payload()
-        val archive = PortableBackupCodec.seal(payload, passphrase)
+        val archive = PortableBackupCodec.encode(payload)
         fun attempt(write: () -> OutputStream?, read: () -> ByteArrayInputStream?): Boolean =
-            runCatching { BackupArchiveWriter.writeAndVerify(archive, passphrase, payload, write, read) }.isFailure
-
+            runCatching { BackupArchiveWriter.writeAndVerify(archive, payload, write, read) }.isFailure
         assertTrue(attempt({ null }, { ByteArrayInputStream(archive) }))
         assertTrue(attempt({ ByteArrayOutputStream() }, { null }))
         assertTrue(attempt({ object : OutputStream() {
@@ -78,15 +96,13 @@ class PortableBackupCodecTest {
         } }, { ByteArrayInputStream(archive) }))
         assertTrue(attempt({ ByteArrayOutputStream() }, { ByteArrayInputStream(archive.copyOf(archive.size - 1)) }))
         assertTrue(attempt({ ByteArrayOutputStream() }, { ByteArrayInputStream(archive + 0.toByte()) }))
-        assertTrue(attempt({ ByteArrayOutputStream() }, { ByteArrayInputStream(archive.copyOf().also {
-            it[it.lastIndex] = (it.last().toInt() xor 1).toByte()
-        }) }))
     }
 
     private fun payload(): PortableBackupPayload {
+        val tenant = "10000000-0000-4000-8000-000000000001"
         val project = ProjectSummary(
-            id = "10000000-0000-4000-8000-000000000001",
-            tenantId = "tenant-a",
+            id = "20000000-0000-4000-8000-000000000001",
+            tenantId = tenant,
             name = "private project name",
             lifecycle = ProjectLifecycle.ACTIVE,
             rowVersion = 3,
@@ -94,19 +110,17 @@ class PortableBackupCodecTest {
             updatedAt = "2026-11-12T10:00:00Z",
         )
         return PortableBackupPayload(
-            formatVersion = 1,
+            formatVersion = 2,
             appVersion = "0.10.2",
             exportedAt = "2026-11-12T10:00:00Z",
             acceptedAccount = AcceptedTenantContinuity(
-                "tenant-a", AccountIdentity("https://accounts.google.com", "subject-a"),
+                tenant, AccountIdentity("https://accounts.google.com", "subject-a"),
             ),
             state = SyncStateRowCodec().encode(TenantSyncState(
                 projectCache = ProjectCacheState(activeProjects = listOf(project), activeProjectsLoaded = true),
             )),
             drafts = FormDrafts(projectName = "unsent draft"),
             coverMedia = emptyList(),
-            excludedProtectedBlockRecords = 0,
-            excludedProtectedBlockOperations = 0,
             excludedKnownOtherAccountPartitions = 1,
         )
     }

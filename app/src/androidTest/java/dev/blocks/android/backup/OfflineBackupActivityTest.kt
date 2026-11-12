@@ -2,8 +2,9 @@ package dev.blocks.android.backup
 
 import android.accessibilityservice.AccessibilityService
 import android.provider.DocumentsContract
+import android.net.Uri
+import android.graphics.Bitmap
 import android.view.accessibility.AccessibilityNodeInfo
-import android.widget.EditText
 import android.view.View
 import android.view.ViewGroup
 import androidx.test.core.app.ActivityScenario
@@ -26,6 +27,8 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import java.io.File
+import java.io.FileOutputStream
 
 /** Exercises the Activity's CreateDocument result, SAF streams, verification and cancellation. */
 @RunWith(AndroidJUnit4::class)
@@ -48,8 +51,66 @@ class OfflineBackupActivityTest {
     @After fun clean() {
         MainActivity.dependencyFactory = null
         SessionContinuityStore(context).shouldRestore = false
+        runCatching { RestoredLocalAccountStore(context).clear() }
         accepted.clear()
         store.clearSyncState(TENANT)
+    }
+
+    @Test fun restoreActivityConfirmsOfflineAndOpensLocalAccountWithoutServiceBinding() {
+        val payload = OfflineBackupExporter(
+            store, dev.blocks.android.state.AndroidEncryptedDraftStore(context),
+            accepted, dev.blocks.android.cover.AndroidEncryptedProjectCoverMediaStore(context),
+        ).capture(TENANT, "0.10.2")
+        val archive = File(requireNotNull(context.getExternalFilesDir(null)), "restore-activity-test.blocksbackup")
+        archive.writeBytes(PortableBackupCodec.encode(payload))
+        store.clearSyncState(TENANT)
+        accepted.clear()
+        SessionContinuityStore(context).shouldRestore = false
+        try {
+            ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                capture("backup-restore-entry.png")
+                scenario.onActivity { activity ->
+                    MainActivity::class.java.getDeclaredMethod(
+                        "handleBackupRestoreSource", Uri::class.java,
+                    ).apply { isAccessible = true }.invoke(activity, Uri.fromFile(archive))
+                }
+                waitForDialog(scenario, "Restore this account locally?")
+                capture("backup-restore-confirmation.png")
+                scenario.onActivity { requireNotNull(it.activeDialog).getButton(-1).performClick() }
+                waitForOpen(scenario)
+                assertEquals(RestoredLocalAccountStore.Phase.ACTIVE,
+                    RestoredLocalAccountStore(context).read()?.phase)
+                assertEquals(null, accepted.load())
+                assertEquals(1, store.loadSyncState(TENANT).projectCache.activeProjects.size)
+            }
+        } finally {
+            archive.delete()
+        }
+    }
+
+    @Test fun cancelledRestoreDocumentPickerLeavesEmptyDestinationUntouched() {
+        accepted.clear()
+        store.clearSyncState(TENANT)
+        SessionContinuityStore(context).shouldRestore = false
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            scenario.onActivity { activity ->
+                MainActivity::class.java.getDeclaredMethod("showRestoreBackup").apply {
+                    isAccessible = true
+                }.invoke(activity)
+                requireNotNull(activity.activeDialog).getButton(-1).performClick()
+            }
+            waitForPicker()
+            assertTrue(instrumentation.uiAutomation.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK))
+            waitUntil {
+                val appIsForeground = instrumentation.uiAutomation.rootInActiveWindow?.packageName?.toString() ==
+                    context.packageName
+                var login = false
+                scenario.onActivity { login = it.activeTenantForTest() == null }
+                appIsForeground && login
+            }
+            assertFalse(store.hasLocalState(TENANT))
+            assertEquals(null, RestoredLocalAccountStore(context).read())
+        }
     }
 
     @Test fun createDocumentWritesAndReadsBackFromActivityWithoutSync() {
@@ -64,7 +125,7 @@ class OfflineBackupActivityTest {
             val destination = requireNotNull(uri)
             try {
                 val bytes = requireNotNull(context.contentResolver.openInputStream(destination)).use { it.readBytes() }
-                val payload = PortableBackupCodec.open(bytes, PASSPHRASE.toCharArray())
+                val payload = PortableBackupCodec.decode(bytes)
                 assertEquals(TENANT, payload.acceptedAccount.tenantId)
                 assertTrue(payload.state.activeProjects.single().contains("SAF test"))
                 assertEquals(1, PortableBackupCodec.summary(payload).projects)
@@ -90,17 +151,16 @@ class OfflineBackupActivityTest {
         }
     }
 
-    @Test fun recreationWhilePickerIsOpenCannotReportVerifiedBackup() {
+    @Test fun recreationAfterCancelledPickerPreservesSource() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitForOpen(scenario)
             val before = store.loadSyncState(TENANT)
-            var oldActivity: MainActivity? = null
-            scenario.onActivity { oldActivity = it }
             startPicker(scenario)
             waitForPicker()
-            instrumentation.runOnMainSync { requireNotNull(oldActivity).recreate() }
-            clickPickerSave()
-            waitForDialog(scenario, "Backup not created")
+            assertTrue(instrumentation.uiAutomation.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK))
+            waitForDialog(scenario, "Backup cancelled")
+            scenario.recreate()
+            waitForOpen(scenario)
             assertEquals(before, store.loadSyncState(TENANT))
         }
     }
@@ -115,17 +175,8 @@ class OfflineBackupActivityTest {
         scenario.onActivity { activity ->
             val method = MainActivity::class.java.getDeclaredMethod("showExportBackup").apply { isAccessible = true }
             method.invoke(activity)
-            val fields = mutableListOf<EditText>()
-            collectEdits(requireNotNull(activity.activeDialog?.window?.decorView), fields)
-            assertEquals(2, fields.size)
-            fields.forEach { it.setText(PASSPHRASE) }
             requireNotNull(activity.activeDialog).getButton(-1).performClick()
         }
-    }
-
-    private fun collectEdits(view: View, output: MutableList<EditText>) {
-        if (view is EditText) output += view
-        if (view is ViewGroup) (0 until view.childCount).forEach { collectEdits(view.getChildAt(it), output) }
     }
 
     private fun waitForDialog(scenario: ActivityScenario<MainActivity>, title: String) {
@@ -190,10 +241,20 @@ class OfflineBackupActivityTest {
         assertFalse("Timed out waiting for backup Activity result", true)
     }
 
+    private fun capture(name: String) {
+        instrumentation.waitForIdleSync()
+        Thread.sleep(300)
+        val bitmap = requireNotNull(instrumentation.uiAutomation.takeScreenshot())
+        val destination = requireNotNull(context.getExternalFilesDir("review-0.10.2"))
+        FileOutputStream(File(destination, name)).use {
+            assertTrue(bitmap.compress(Bitmap.CompressFormat.PNG, 100, it))
+        }
+        bitmap.recycle()
+    }
+
     private companion object {
         const val TENANT = "91000000-0000-4000-8000-000000000001"
         const val PROJECT = "92000000-0000-4000-8000-000000000001"
         const val NOW = "2026-11-12T00:00:00Z"
-        const val PASSPHRASE = "disposable-saf-passphrase"
     }
 }

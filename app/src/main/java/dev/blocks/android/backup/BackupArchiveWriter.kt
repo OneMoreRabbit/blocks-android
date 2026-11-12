@@ -8,7 +8,6 @@ import java.io.OutputStream
 internal object BackupArchiveWriter {
     fun writeAndVerify(
         archive: ByteArray,
-        passphrase: CharArray,
         expected: PortableBackupPayload,
         openWrite: () -> OutputStream?,
         openRead: () -> InputStream?,
@@ -22,7 +21,7 @@ internal object BackupArchiveWriter {
         }
         try {
             check(readback.contentEquals(archive)) { "Written backup differs from the captured data" }
-            check(PortableBackupCodec.open(readback, passphrase) == expected) {
+            check(PortableBackupCodec.decode(readback) == expected) {
                 "Written backup did not reconstruct the captured data"
             }
         } finally {

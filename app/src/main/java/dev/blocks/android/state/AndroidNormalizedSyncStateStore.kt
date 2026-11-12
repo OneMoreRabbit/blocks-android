@@ -74,26 +74,60 @@ class AndroidSyncStateStore internal constructor(
                     arrayOf(META_AUTHORITATIVE), null, null, null,
                 ).use { cursor -> cursor.moveToFirst() && cursor.getString(0) == "true" }
                 check(authoritative) { "This account's local database is not a verified current copy" }
-                val rows = readRows(database, tenantId, includeProtected = false)
+                val rows = readRows(database, tenantId)
                 check(rows.schemaVersion == SyncStateRowCodec.CURRENT_SCHEMA_VERSION) {
                     "This account's local schema needs separate review before export"
                 }
                 validateTenant(tenantId, rowCodec.decode(rows))
-                // Read protected rows inside the same SQLite view. The exporter projects these
-                // into token-free recovery metadata; raw locators never enter the archive.
-                val protectedRows = readRows(database, tenantId)
-                val blocks = protectedRows.localBlocks.map { gson.fromJson(it, LocalBlockRecord::class.java) }
-                val blockOperations = protectedRows.localBlockOperations.map {
-                    gson.fromJson(it, LocalBlockOperation::class.java)
-                }
                 database.execSQL("COMMIT")
-                return ExportDatabaseSnapshot(rows, blocks, blockOperations)
+                return ExportDatabaseSnapshot(rows)
             } catch (error: Exception) {
                 runCatching { database.execSQL("ROLLBACK") }
                 throw error
             }
         }
     }
+
+    /** Writes a new inactive tenant database in one SQLite transaction. Activation is separate. */
+    @Synchronized
+    internal fun restoreEmptySnapshot(tenantId: String, rows: EncodedSyncRows) {
+        require(!databaseFile(tenantId).exists() && !releasedStateExists(tenantId)) {
+            "The destination already has local data"
+        }
+        validateTenant(tenantId, rowCodec.decode(rows))
+        try {
+            open(tenantId).use { helper ->
+                val database = helper.writableDatabase
+                database.beginTransaction()
+                try {
+                    writeDiff(database, tenantId, previous = null, rows = rows)
+                    upsertMetadata(database, META_AUTHORITATIVE, "true", previousKnown = false)
+                    database.setTransactionSuccessful()
+                } finally {
+                    database.endTransaction()
+                }
+                check(readRows(database, tenantId) == rows) { "Restored rows did not verify" }
+            }
+        } catch (error: Exception) {
+            runCatching { clearSyncState(tenantId) }
+            throw IllegalStateException("Could not restore the tenant database", error)
+        }
+    }
+
+    @Synchronized
+    internal fun hasLocalState(tenantId: String): Boolean =
+        databaseFile(tenantId).exists() || releasedStateExists(tenantId)
+
+    /** A restore requires an empty installation, including partitions for other accounts. */
+    @Synchronized
+    internal fun hasAnyLocalState(): Boolean = applicationContext.databaseList().any { name ->
+        name.startsWith(DATABASE_PREFIX) || name.startsWith("blocks_sync_")
+    } || File(applicationContext.applicationInfo.dataDir, "shared_prefs")
+        .listFiles().orEmpty().any { file ->
+            file.name.startsWith("encrypted_sync_state_v1_") && file.name.endsWith(".xml") &&
+                applicationContext.getSharedPreferences(file.name.removeSuffix(".xml"), Context.MODE_PRIVATE)
+                    .contains("state")
+        }
 
     // Retaining these adapters builds Gson's reflective metadata at store creation so the first
     // foreground interaction does not pay that one-off work inside its local-first commit.
@@ -1185,8 +1219,6 @@ class AndroidSyncStateStore internal constructor(
 
 internal data class ExportDatabaseSnapshot(
     val rows: EncodedSyncRows,
-    val localBlocks: List<LocalBlockRecord>,
-    val localBlockOperations: List<LocalBlockOperation>,
 )
 
 internal enum class MigrationCheckpoint {

@@ -32,6 +32,16 @@ class SessionContinuityStore(context: Context) : SessionContinuity {
 class AndroidEncryptedDraftStore(context: Context) : DraftStore {
     private val applicationContext = context.applicationContext
 
+    internal fun hasSavedDraft(tenantId: String): Boolean = preferences(tenantId).contains(CIPHERTEXT)
+
+    internal fun hasAnySavedDraft(): Boolean =
+        java.io.File(applicationContext.applicationInfo.dataDir, "shared_prefs")
+            .listFiles().orEmpty().any { file ->
+                file.name.startsWith(PREFERENCES_PREFIX) && file.name.endsWith(".xml") &&
+                    applicationContext.getSharedPreferences(file.name.removeSuffix(".xml"), Context.MODE_PRIVATE)
+                        .contains(CIPHERTEXT)
+            }
+
     init {
         // Version 1 used one app-global record. It cannot be assigned to a tenant safely, so remove it.
         applicationContext.getSharedPreferences(LEGACY_PREFERENCES, Context.MODE_PRIVATE)

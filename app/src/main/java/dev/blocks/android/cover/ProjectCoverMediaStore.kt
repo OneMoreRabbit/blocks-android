@@ -38,6 +38,24 @@ class AndroidEncryptedProjectCoverMediaStore(context: Context) : ProjectCoverMed
     private val applicationContext = context.applicationContext
     private val root = File(applicationContext.filesDir, ROOT_DIRECTORY)
 
+    /** Restore an immutable referenced variant without changing its retained identity. */
+    @Synchronized
+    internal fun restoreVariant(tenantId: String, cover: ProjectCover, variant: ProjectCoverVariant, bytes: ByteArray) {
+        require(cover.tenantId == tenantId)
+        val reference = if (variant == ProjectCoverVariant.DISPLAY) cover.displayContentRef else cover.thumbnailContentRef
+        val expectedDigest = if (variant == ProjectCoverVariant.DISPLAY) cover.displayDigest else cover.thumbnailDigest
+        val expectedSize = if (variant == ProjectCoverVariant.DISPLAY) cover.displayByteSize else cover.thumbnailByteSize
+        require(bytes.size.toLong() == expectedSize && digest(bytes) == expectedDigest)
+        val key = existingKey(keyAlias(tenantId)) ?: createKey(keyAlias(tenantId))
+        writeVerifiedObject(tenantId, reference, bytes, expectedDigest, key)
+        read(tenantId, cover, variant).fill(0)
+    }
+
+    @Synchronized
+    internal fun hasMedia(tenantId: String): Boolean = tenantDirectory(tenantId).listFiles()?.isNotEmpty() == true
+
+    internal fun hasAnyMedia(): Boolean = root.listFiles()?.any { it.listFiles()?.isNotEmpty() == true } == true
+
     @Synchronized
     override fun stage(
         tenantId: String,

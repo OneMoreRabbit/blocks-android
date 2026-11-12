@@ -1403,7 +1403,7 @@ class MainActivityPresentationTest {
     }
 
     @Test
-    fun offlineBackupSettingsAndPassphraseWarningAreVisibleWithoutServiceConfirmation() {
+    fun offlineBackupSettingsAndUnencryptedWarningAreVisibleWithoutServiceConfirmation() {
         val originalFactory = requireNotNull(MainActivity.dependencyFactory)
         MainActivity.dependencyFactory = { activity ->
             originalFactory(activity).copy(backupExporter = OfflineBackupExporter(
@@ -1426,9 +1426,9 @@ class MainActivityPresentationTest {
             scenario.onActivity { activity ->
                 val text = activity.dialogTexts().joinToString("\n")
                 assertTrue(text.contains("Other locked accounts"))
-                assertTrue(text.contains("raw NFC tag locators are excluded"))
+                assertTrue(text.contains("NFC tag locators"))
                 assertTrue(text.contains("Do not switch accounts or sign out"))
-                assertTrue(text.contains("backup cannot be read"))
+                assertTrue(text.contains("NOT encrypted"))
             }
             captureDeviceScreenshot(File(destination, "backup-warning.png"))
             assertEquals(0, sessionExchanges.get())

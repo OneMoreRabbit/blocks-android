@@ -50,6 +50,9 @@ class AndroidEncryptedAcceptedTenantContinuityStore(context: Context) : Accepted
     }
 
     @Synchronized
+    internal fun hasAnyBindings(): Boolean = loadState(migrateLegacy = false)?.bindings?.isNotEmpty() == true
+
+    @Synchronized
     override fun load(): AcceptedTenantContinuity? {
         val state = loadState() ?: return null
         return state.activeTenantId?.let { active -> state.bindings.firstOrNull { it.tenantId == active } }
