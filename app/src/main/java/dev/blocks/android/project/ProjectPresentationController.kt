@@ -56,6 +56,9 @@ data class ProjectPresentationState(
     val dashboardOrderMode: DashboardOrderMode = DashboardOrderMode.NAME,
     val archiveMode: Boolean = false,
     val pendingChanges: Boolean = false,
+    val pendingCloudChanges: Int = 0,
+    val pendingLocalTagChanges: Int = 0,
+    val syncDeferred: Boolean = false,
     val syncing: Boolean = false,
     val reconciliationRequired: Boolean = false,
     val conflict: ProjectConflict? = null,
@@ -871,6 +874,8 @@ class ProjectPresentationController(
         state = state.copy(
             syncing = false,
             authenticationRequired = error is ServiceException && error.status == 401,
+            syncDeferred = error is IOException || error is IncompatibleServiceApiException ||
+                error is ServiceException && error.status != 401,
             error = if (
                 error is IOException || error is IncompatibleServiceApiException || error is ServiceException
             ) {
@@ -930,6 +935,7 @@ class ProjectPresentationController(
             result.pendingItemOperations +
             result.pendingNavigationAliases +
             result.pendingInteractionOperations
+        val cloudPending = pending - result.pendingBlockOperations
         val preferences = workspace.uiPreferences(active)
         state = state.copy(
             activeProjects = result.cache.dashboardProjects(preferences.dashboardOrderMode),
@@ -946,6 +952,9 @@ class ProjectPresentationController(
             dashboardOrderMode = preferences.dashboardOrderMode,
             archiveMode = preferences.archiveMode,
             pendingChanges = pending > 0,
+            pendingCloudChanges = cloudPending,
+            pendingLocalTagChanges = result.pendingBlockOperations,
+            syncDeferred = result.syncDeferred,
             invalidField = null,
             syncing = false,
             reconciliationRequired = result.reconciliationRequired,

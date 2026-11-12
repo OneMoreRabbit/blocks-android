@@ -7,6 +7,7 @@ import dev.blocks.android.mvp.DraftStore
 import dev.blocks.android.mvp.FormDrafts
 import dev.blocks.android.mvp.ParkingDraft
 import dev.blocks.android.mvp.Session
+import java.io.IOException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -43,6 +44,40 @@ class ProjectPresentationControllerTest {
         assertEquals(ProjectScreen.PROJECT, controller.state.screen)
         assertTrue(controller.state.sessionConfirmationRequired)
         assertEquals(1, workspace.pageCalls)
+    }
+
+    @Test
+    fun deferredTransportKeepsQueuedCloudChangeVisibleUntilAcknowledged() {
+        val workspace = FakeWorkspace().apply { offline = true }
+        val controller = controller(workspace)
+        controller.login("identity-token")
+        controller.createProject("Offline project")
+
+        controller.synchronize()
+        assertTrue(controller.state.pendingChanges)
+        assertEquals(1, controller.state.pendingCloudChanges)
+        assertTrue(controller.state.syncDeferred)
+
+        workspace.offline = false
+        controller.synchronize()
+        assertFalse(controller.state.pendingChanges)
+        assertEquals(0, controller.state.pendingCloudChanges)
+        assertFalse(controller.state.syncDeferred)
+    }
+
+    @Test
+    fun surfacedTransportFailureDoesNotErasePendingIntentOrPretendSuccess() {
+        val workspace = FakeWorkspace().apply { offline = true }
+        val controller = controller(workspace)
+        controller.login("identity-token")
+        controller.createProject("Saved here")
+
+        controller.reportRepositoryError(IOException("synthetic network failure"))
+
+        assertTrue(controller.state.syncDeferred)
+        assertEquals(1, controller.state.pendingCloudChanges)
+        assertTrue(controller.state.pendingChanges)
+        assertEquals(null, controller.state.error)
     }
 
     @Test
@@ -418,7 +453,7 @@ class ProjectPresentationControllerTest {
             if (!offline && !conflict) {
                 cache.commands.toList().forEach(::acknowledge)
             }
-            return result()
+            return result().copy(syncDeferred = offline)
         }
 
         override fun queueCreateProject(

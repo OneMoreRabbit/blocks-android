@@ -313,6 +313,8 @@ data class BackgroundSyncResult(
     val pendingItemOperations: Int = 0,
     val pendingNavigationAliases: Int = 0,
     val pendingInteractionOperations: Int = 0,
+    /** True when a transport/API failure was contained and durable work remains queued. */
+    val syncDeferred: Boolean = false,
 )
 
 data class ProjectConflict(

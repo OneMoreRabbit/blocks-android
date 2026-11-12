@@ -945,6 +945,39 @@ class ProjectSyncRepositoryTest {
     }
 
     @Test
+    fun refusedProjectMutationKeepsItsIntentWhileIndependentItemAndLocalTagWorkSurvive() {
+        val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
+        val service = FakeProjectService().apply { projectConflict = true }
+        val first = repository(service, MemoryDrafts(), state)
+        val token = OpaqueTagToken.fromBytes(ByteArray(32) { (it + 19).toByte() })
+        first.activate(SESSION_A)
+        first.queueRenameProject(SESSION_A, PROJECT_ID, 1, "Local name", "refused-rename")
+        first.addNoteItem(
+            SESSION_A, PROJECT_ID, "Independent note", "independent-note",
+            "01000000-0000-4000-8000-000000000091",
+        )
+        first.beginTagProgramming(
+            SESSION_A, PROJECT_ID, "Local tag", "retained-block", token,
+            "local-register", "local-bind",
+        )
+        first.completeTagProgramming(SESSION_A, "retained-block", token, TagActivationMedium.NFC)
+
+        val result = first.backgroundSync(SESSION_A)
+
+        assertTrue(result.reconciliationRequired)
+        assertEquals(listOf("refused-rename"), result.cache.commands.map { it.operationId })
+        assertEquals(0, result.pendingItemOperations)
+        assertTrue("independent-note" in result.cache.retiredItemOperationIds)
+        assertEquals(2, result.pendingBlockOperations)
+        assertEquals(listOf("local-register", "local-bind"),
+            result.cache.localBlockOperations.map { it.operationId })
+        val restarted = repository(service, MemoryDrafts(), state)
+        restarted.activate(SESSION_A)
+        assertEquals(listOf("refused-rename"), restarted.snapshot(SESSION_A).cache.commands.map { it.operationId })
+        assertEquals(2, restarted.snapshot(SESSION_A).pendingBlockOperations)
+    }
+
+    @Test
     fun authenticatedUnknownLookupCachesTheAuthorizedResultBeforeOfflineReentry() {
         val drafts = MemoryDrafts()
         val state = MemoryState().apply { saveSyncState(TENANT_A, loadedState()) }
@@ -1376,6 +1409,7 @@ class ProjectSyncRepositoryTest {
             val deferred = repository.backgroundSync(SESSION_A)
 
             assertEquals(3, deferred.pendingProjectOperations)
+            assertTrue(deferred.syncDeferred)
             assertEquals("Locally useful $index", deferred.cache.activeProjects.single().name)
             assertEquals("Offline notes $index", repository.projectPage(SESSION_A, createId).notes.body)
             assertEquals("Shelf $index", repository.projectPage(SESSION_A, createId).newestParking?.location)
