@@ -4,10 +4,16 @@ import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import com.google.gson.Gson
+import dev.blocks.android.auth.AcceptedTenantContinuity
+import dev.blocks.android.auth.AndroidEncryptedAcceptedTenantContinuityStore
+import dev.blocks.android.backup.OfflineBackupExporter
+import dev.blocks.android.backup.PortableBackupCodec
 import dev.blocks.android.api.ApiError
 import dev.blocks.android.api.ApiErrorCode
 import dev.blocks.android.api.ServiceException
 import dev.blocks.android.mvp.FormDrafts
+import dev.blocks.android.mvp.AccountIdentity
 import dev.blocks.android.mvp.ChangePage
 import dev.blocks.android.mvp.NoteItemDraft
 import dev.blocks.android.mvp.NoOpDraftStore
@@ -19,6 +25,7 @@ import dev.blocks.android.project.ProjectCacheState
 import dev.blocks.android.project.AuthoritativeOrder
 import dev.blocks.android.project.InteractionAcknowledgement
 import dev.blocks.android.project.ProjectCover
+import dev.blocks.android.project.ProjectCoverContent
 import dev.blocks.android.project.DashboardOrderMode
 import dev.blocks.android.project.InteractionMutation
 import dev.blocks.android.project.InteractionMutationType
@@ -42,6 +49,7 @@ import dev.blocks.android.project.ProjectSummary
 import dev.blocks.android.project.ProjectService
 import dev.blocks.android.project.ProjectUiPreferences
 import dev.blocks.android.cover.InMemoryProjectCoverMediaStore
+import dev.blocks.android.cover.AndroidEncryptedProjectCoverMediaStore
 import dev.blocks.android.sync.NoOpLegacyQueueReplay
 import dev.blocks.android.sync.ProjectSyncRepository
 import dev.blocks.android.project.noteItemDraftKey
@@ -56,6 +64,7 @@ import dev.blocks.android.tag.ProjectLinkIdentity
 import dev.blocks.android.tag.TagActivationMedium
 import java.security.KeyStore
 import java.security.MessageDigest
+import java.io.File
 import java.lang.reflect.Proxy
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -76,6 +85,10 @@ class AndroidNormalizedSyncStateStoreTest {
     @After
     fun clear() {
         val tenants = mutableListOf(TENANT, FAILED_TENANT, OTHER_TENANT, BEFORE_MARKER_TENANT, AFTER_MARKER_TENANT)
+        if (InstrumentationRegistry.getArguments().getString("preserveBackupFixture") == "true") {
+            tenants.remove(TENANT)
+            tenants.remove(OTHER_TENANT)
+        }
         if (InstrumentationRegistry.getArguments().getString("preserveForceStopFixture") != "true") {
             tenants += FORCE_STOP_TENANT
         }
@@ -83,6 +96,148 @@ class AndroidNormalizedSyncStateStoreTest {
             store.clearSyncState(it)
         }
     }
+
+    @Test
+    fun seedRepresentativeBackupFixtureThroughReleasedStoreApis() {
+        seedRepresentativeBackupFixture()
+        assertEquals(2, store.loadSyncState(TENANT).projectCache.activeProjects.size)
+        assertEquals(1, store.loadSyncState(OTHER_TENANT).projectCache.activeProjects.size)
+        if (InstrumentationRegistry.getArguments().getString("preserveBackupFixture") != "true") {
+            AndroidEncryptedDraftStore(context).clear(TENANT)
+            AndroidEncryptedAcceptedTenantContinuityStore(context).clear()
+            AndroidEncryptedProjectCoverMediaStore(context).eraseTenant(TENANT)
+        }
+    }
+
+    @Test
+    fun representativeBackupFixtureSurvivesReleasedAppProcessRestart() {
+        val required = InstrumentationRegistry.getArguments().getString("requireFullRelease25Fixture") == "true"
+        if (!normalizedDatabase(TENANT).exists()) {
+            check(!required) { "The representative release-25 fixture is missing after restart" }
+            seedRepresentativeBackupFixture()
+        }
+        val restored = AndroidSyncStateStore(context).loadSyncState(TENANT).projectCache
+        assertEquals(2, restored.activeProjects.size)
+        assertEquals(1, restored.archivedProjects.size)
+        assertEquals(1, restored.noteItems.size)
+        assertEquals(1, restored.resourceLinks.size)
+        assertEquals(2, restored.parkingRecords.size)
+        assertEquals(1, restored.itemOperations.size)
+        assertEquals(1, restored.interactionOperations.size)
+        assertEquals(listOf(NOTE_ID), restored.noteOrders.single().orderedNoteIds)
+    }
+
+    @Test
+    fun representativeReleased25DataSurvivesUpgradeAndPortableExport() {
+        val required = InstrumentationRegistry.getArguments().getString("requireFullRelease25Fixture") == "true"
+        if (!normalizedDatabase(TENANT).exists()) {
+            check(!required) { "The representative release-25 fixture is missing after upgrade" }
+            seedRepresentativeBackupFixture()
+        }
+        val before = store.loadSyncState(TENANT)
+        val otherBefore = store.loadSyncState(OTHER_TENANT)
+        val payload = OfflineBackupExporter(
+            store, AndroidEncryptedDraftStore(context),
+            AndroidEncryptedAcceptedTenantContinuityStore(context),
+            AndroidEncryptedProjectCoverMediaStore(context),
+        ).capture(TENANT, "0.10.2")
+        val recovered = SyncStateRowCodec().decode(payload.state)
+        assertEquals(before.projectCache.activeProjects, recovered.projectCache.activeProjects)
+        assertEquals(before.projectCache.archivedProjects, recovered.projectCache.archivedProjects)
+        assertEquals(before.projectCache.noteItems, recovered.projectCache.noteItems)
+        assertEquals(before.projectCache.resourceLinks, recovered.projectCache.resourceLinks)
+        assertEquals(before.projectCache.parkingRecords, recovered.projectCache.parkingRecords)
+        assertEquals(before.projectCache.commands, recovered.projectCache.commands)
+        assertEquals(before.projectCache.itemOperations, recovered.projectCache.itemOperations)
+        assertEquals(before.projectCache.interactionOperations, recovered.projectCache.interactionOperations)
+        assertEquals(before.projectCache.projectOrder, recovered.projectCache.projectOrder)
+        assertEquals(before.projectCache.linkOrders, recovered.projectCache.linkOrders)
+        assertEquals(before.projectCache.noteOrders, recovered.projectCache.noteOrders)
+        assertEquals(before.projectCache.parkingTombstones, recovered.projectCache.parkingTombstones)
+        assertEquals(before.projectCache.retiredOperationIds, recovered.projectCache.retiredOperationIds)
+        assertEquals(before.projectCache.retiredItemOperationIds, recovered.projectCache.retiredItemOperationIds)
+        assertEquals(before.projectCache.retiredInteractionOperationIds, recovered.projectCache.retiredInteractionOperationIds)
+        assertEquals(before.projectCache.projectIdMappings, recovered.projectCache.projectIdMappings)
+        assertEquals(before.changeCursor, recovered.changeCursor)
+        assertEquals(2, payload.coverMedia.size)
+        assertEquals(1, payload.excludedProtectedBlockRecords)
+        assertEquals(2, payload.excludedProtectedBlockOperations)
+        assertEquals(1, payload.excludedKnownOtherAccountPartitions)
+        assertEquals("Release 25 draft", payload.drafts.projectName)
+        assertEquals(before, store.loadSyncState(TENANT))
+        assertEquals(otherBefore, store.loadSyncState(OTHER_TENANT))
+        val passphrase = "disposable-release25-passphrase".toCharArray()
+        val archive = PortableBackupCodec.seal(payload, passphrase)
+        assertEquals(payload, PortableBackupCodec.open(archive, passphrase))
+        val destination = requireNotNull(context.getExternalFilesDir(null))
+        File(destination, "release25-upgrade.blocksbackup").writeBytes(archive)
+        File(destination, "release25-upgrade-expected.json").writeText(Gson().toJson(payload))
+        archive.fill(0)
+        passphrase.fill('\u0000')
+        if (!required) {
+            AndroidEncryptedDraftStore(context).clear(TENANT)
+            AndroidEncryptedAcceptedTenantContinuityStore(context).clear()
+            AndroidEncryptedProjectCoverMediaStore(context).eraseTenant(TENANT)
+        }
+    }
+
+    private fun seedRepresentativeBackupFixture() {
+        store.clearSyncState(TENANT)
+        store.clearSyncState(OTHER_TENANT)
+        val coverStore = AndroidEncryptedProjectCoverMediaStore(context)
+        coverStore.eraseTenant(TENANT)
+        val display = "release25-display".toByteArray()
+        val thumbnail = "release25-thumbnail".toByteArray()
+        val coverContent = ProjectCoverContent(
+            PROJECT, display, thumbnail, 1200, 675, 480, 270,
+            digestBytes(display), digestBytes(thumbnail), digestBytes(display + thumbnail), NOW,
+        )
+        val cover = coverStore.stage(TENANT, PROJECT, coverContent, null)
+        coverContent.clear()
+        val fixture = state(TENANT).withCreatedProject().withAddedParking().withExistingItems().let { state ->
+            val parkingId = "$PROJECT-parking"
+            state.copy(projectCache = state.projectCache.copy(
+                projectCovers = listOf(cover),
+                itemOperations = listOf(ProjectItemMutation(
+                    operationId = "pending-note-edit",
+                    type = ProjectItemMutationType.EDIT_NOTE,
+                    targetId = NOTE_ID,
+                    projectId = PROJECT,
+                    ifMatch = 3,
+                    noteBody = "Updated locally",
+                    createdAt = NOW,
+                )),
+                projectOrder = ProjectOrderState(listOf(PROJECT, CREATED_PROJECT), 2, NOW),
+                linkOrders = listOf(LinkOrderState(PROJECT, listOf(LINK_ID), 2, NOW)),
+                noteOrders = listOf(NoteOrderState(PROJECT, listOf(NOTE_ID), 3, NOW)),
+                parkingTombstones = listOf(ParkingTombstone(parkingId, PROJECT, 2, NOW, "delete-parking")),
+                interactionOperations = listOf(InteractionMutation(
+                    operationId = "delete-parking",
+                    type = InteractionMutationType.DELETE_PARKING,
+                    aggregateId = parkingId,
+                    projectId = PROJECT,
+                    targetId = parkingId,
+                    baseVersion = 1,
+                    createdAt = NOW,
+                    preparedForDelivery = true,
+                )),
+                retiredOperationIds = listOf("acknowledged-project-operation"),
+                retiredItemOperationIds = listOf("acknowledged-item-operation"),
+                retiredInteractionOperationIds = listOf("acknowledged-order-operation"),
+            ))
+        }
+        store.saveSyncState(TENANT, fixture)
+        store.saveSyncState(OTHER_TENANT, state(OTHER_TENANT, OTHER_PROJECT))
+        AndroidEncryptedDraftStore(context).save(TENANT, FormDrafts(projectName = "Release 25 draft"))
+        AndroidEncryptedAcceptedTenantContinuityStore(context).apply {
+            clear()
+            save(AcceptedTenantContinuity(OTHER_TENANT, AccountIdentity("https://accounts.google.com", "other")))
+            save(AcceptedTenantContinuity(TENANT, AccountIdentity("https://accounts.google.com", "open")))
+        }
+    }
+
+    private fun digestBytes(bytes: ByteArray): String = MessageDigest.getInstance("SHA-256")
+        .digest(bytes).joinToString("") { "%02x".format(it.toInt() and 0xff) }
 
     @Test
     fun exportSnapshotReadsCommittedWalAndPendingStateWithoutDecryptingProtectedTokens() {
