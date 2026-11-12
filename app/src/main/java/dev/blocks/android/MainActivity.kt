@@ -284,6 +284,8 @@ class MainActivity : ComponentActivity() {
     private var activeCoverCrop: PreparedProjectCoverCrop? = null
     private var renderGeneration = 0L
     private val coverJobs = mutableListOf<Job>()
+    // Export must wait for an already-started import before reading DB rows and related media.
+    private val coverMutationJobs = mutableListOf<Job>()
     private val coverBitmaps = object : LruCache<String, Bitmap>(8 * 1024 * 1024) {
         override fun sizeOf(key: String, value: Bitmap): Int = value.allocationByteCount
     }
@@ -1081,6 +1083,7 @@ class MainActivity : ComponentActivity() {
             try {
                 syncJob?.cancelAndJoin()
                 coverJobs.toList().forEach { it.join() }
+                coverMutationJobs.toList().forEach { it.join() }
                 val payload = withContext(localStateDispatcher) {
                     require(controller.activeTenantId == tenantId) { "The open account changed" }
                     requireNotNull(dependencies.backupExporter).capture(tenantId, BuildConfig.VERSION_NAME)
@@ -2091,7 +2094,7 @@ class MainActivity : ComponentActivity() {
         prepared: PreparedProjectCoverCrop,
         selection: dev.blocks.android.cover.CoverCropSelection,
     ) {
-        uiScope.launch {
+        val job = uiScope.launch {
             var imported: dev.blocks.android.project.ProjectCoverContent? = null
             try {
                 imported = withContext(Dispatchers.IO) { coverCropper.confirm(projectId, prepared, selection) }
@@ -2112,12 +2115,14 @@ class MainActivity : ComponentActivity() {
             }
             render()
         }
+        coverMutationJobs += job
+        job.invokeOnCompletion { runOnUiThread { coverMutationJobs.remove(job) } }
     }
 
     internal fun importCover(projectId: String, uri: Uri) {
         val tenantId = controller.activeTenantId
         if (tenantId == null) return
-        uiScope.launch {
+        val job = uiScope.launch {
             var imported: dev.blocks.android.project.ProjectCoverContent? = null
             try {
                 imported = withContext(Dispatchers.IO) { coverImporter.importCover(projectId, uri) }
@@ -2135,6 +2140,8 @@ class MainActivity : ComponentActivity() {
             }
             render()
         }
+        coverMutationJobs += job
+        job.invokeOnCompletion { runOnUiThread { coverMutationJobs.remove(job) } }
     }
 
     private fun confirmRemoveCover() {
