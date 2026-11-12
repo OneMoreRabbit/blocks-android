@@ -85,6 +85,96 @@ class AndroidNormalizedSyncStateStoreTest {
     }
 
     @Test
+    fun exportSnapshotReadsCommittedWalAndPendingStateWithoutDecryptingProtectedTokens() {
+        val expected = state(TENANT).withCreatedProject().withAddedParking().withExistingItems()
+        val other = state(OTHER_TENANT, OTHER_PROJECT)
+        store.saveSyncState(TENANT, expected)
+        store.saveSyncState(OTHER_TENANT, other)
+        val databaseBefore = normalizedDatabase(TENANT).readBytes()
+        val otherBefore = store.loadSyncState(OTHER_TENANT)
+
+        val snapshot = AndroidSyncStateStore(context).exportSnapshot(TENANT)
+
+        val decoded = SyncStateRowCodec().decode(snapshot.rows)
+        assertEquals(expected.projectCache.activeProjects, decoded.projectCache.activeProjects)
+        assertEquals(expected.projectCache.noteItems, decoded.projectCache.noteItems)
+        assertEquals(expected.projectCache.resourceLinks, decoded.projectCache.resourceLinks)
+        assertEquals(expected.projectCache.parkingRecords, decoded.projectCache.parkingRecords)
+        assertEquals(expected.projectCache.commands, decoded.projectCache.commands)
+        assertEquals(expected.projectCache.projectIdMappings, decoded.projectCache.projectIdMappings)
+        assertEquals(expected.changeCursor, decoded.changeCursor)
+        assertTrue(snapshot.rows.localBlocks.isEmpty())
+        assertTrue(snapshot.rows.localBlockOperations.isEmpty())
+        assertEquals(1, snapshot.excludedBlockRecords)
+        assertEquals(2, snapshot.excludedBlockOperations)
+        assertEquals(otherBefore, store.loadSyncState(OTHER_TENANT))
+        assertEquals(expected, store.loadSyncState(TENANT))
+        assertTrue(databaseBefore.contentEquals(normalizedDatabase(TENANT).readBytes()))
+    }
+
+    @Test
+    fun exportSnapshotIncludesCommittedWalPageFromAnotherOpenConnection() {
+        store.saveSyncState(TENANT, state(TENANT).withoutCommands())
+        SQLiteDatabase.openDatabase(normalizedDatabase(TENANT).path, null, SQLiteDatabase.OPEN_READWRITE).use { writer ->
+            assertTrue(writer.enableWriteAheadLogging())
+            writer.execSQL(
+                "INSERT OR REPLACE INTO ${AndroidSyncStateStore.TABLE_METADATA} " +
+                    "(${AndroidSyncStateStore.COLUMN_ID}, ${AndroidSyncStateStore.COLUMN_VALUE}) VALUES (?, ?)",
+                arrayOf(AndroidSyncStateStore.META_NOTICE, "committed-wal-visible"),
+            )
+            val wal = java.io.File("${normalizedDatabase(TENANT).path}-wal")
+            assertTrue(wal.isFile && wal.length() > 0)
+
+            val snapshot = AndroidSyncStateStore(context).exportSnapshot(TENANT)
+
+            assertEquals("committed-wal-visible", snapshot.rows.notice)
+            assertTrue(wal.isFile && wal.length() > 0)
+            assertEquals("committed-wal-visible", store.loadSyncState(TENANT).notice)
+        }
+    }
+
+    @Test
+    fun exportDoesNotMigrateOrRetireReleasedSourceWhenCurrentDatabaseIsMissing() {
+        val released = state(FAILED_TENANT)
+        LegacyEncryptedSyncStateStore(context).saveSyncState(FAILED_TENANT, released)
+
+        assertTrue(runCatching { store.exportSnapshot(FAILED_TENANT) }.isFailure)
+        assertFalse(normalizedDatabase(FAILED_TENANT).exists())
+        assertTrue(releasedDatabase(FAILED_TENANT).isFile)
+        assertTrue(keyStore().containsAlias(releasedKeyAlias(FAILED_TENANT)))
+    }
+
+    @Test
+    fun release25PendingNoteOrderSurvivesInPlaceUpgradeAndExportsWithoutReplay() {
+        val requireReleasedFixture = InstrumentationRegistry.getArguments()
+            .getString("requireRelease25Fixture") == "true"
+        if (!normalizedDatabase(FORCE_STOP_TENANT).exists()) {
+            check(!requireReleasedFixture) { "The release-25 fixture is missing after upgrade" }
+            store.saveSyncState(FORCE_STOP_TENANT, forceStopNoteOrderState())
+            forceStopNoteOrderRepository(ForceStopNoteOrderFarEnd()).also { repository ->
+                repository.activate(FORCE_STOP_SESSION)
+                repository.moveNoteItem(FORCE_STOP_SESSION, FORCE_STOP_NOTE_B, -1, FORCE_STOP_OPERATION)
+                repository.deactivate(FORCE_STOP_SESSION)
+            }
+        }
+        val before = store.loadSyncState(FORCE_STOP_TENANT)
+        val pending = before.projectCache.interactionOperations.single {
+            it.operationId == FORCE_STOP_OPERATION
+        }
+        assertEquals(InteractionMutationType.REORDER_NOTES, pending.type)
+        assertFalse(pending.preparedForDelivery)
+
+        val snapshot = store.exportSnapshot(FORCE_STOP_TENANT)
+        val recovered = SyncStateRowCodec().decode(snapshot.rows)
+
+        assertEquals(before, recovered)
+        assertEquals(before, store.loadSyncState(FORCE_STOP_TENANT))
+        assertEquals(listOf(FORCE_STOP_NOTE_B, FORCE_STOP_NOTE_A), pending.orderedClientIds)
+        assertTrue(recovered.projectCache.noteItems.isNotEmpty())
+        assertTrue(recovered.projectCache.linkOrders.isNotEmpty())
+    }
+
+    @Test
     fun migratesReleasedEncryptedStateThenRetiresOnlyThatSnapshotAndKey() {
         val released = state(TENANT)
         val other = state(OTHER_TENANT, projectId = OTHER_PROJECT)

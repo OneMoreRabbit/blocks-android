@@ -60,6 +60,42 @@ class AndroidSyncStateStore internal constructor(
     private val rowCodec = SyncStateRowCodec()
     private val gson = Gson()
 
+    /** Read-only SQLite snapshot for an explicit owner export. Never opens a helper or migrates. */
+    @Synchronized
+    internal fun exportSnapshot(tenantId: String): ExportDatabaseSnapshot {
+        val file = databaseFile(tenantId)
+        require(file.isFile) { "This account has no current local database to export" }
+        SQLiteDatabase.openDatabase(file.path, null, SQLiteDatabase.OPEN_READONLY).use { database ->
+            // BEGIN creates one read view including committed WAL pages without copying live files.
+            database.execSQL("BEGIN")
+            try {
+                val authoritative = database.query(
+                    TABLE_METADATA, arrayOf(COLUMN_VALUE), "$COLUMN_ID = ?",
+                    arrayOf(META_AUTHORITATIVE), null, null, null,
+                ).use { cursor -> cursor.moveToFirst() && cursor.getString(0) == "true" }
+                check(authoritative) { "This account's local database is not a verified current copy" }
+                val rows = readRows(database, tenantId, includeProtected = false)
+                check(rows.schemaVersion == SyncStateRowCodec.CURRENT_SCHEMA_VERSION) {
+                    "This account's local schema needs separate review before export"
+                }
+                validateTenant(tenantId, rowCodec.decode(rows))
+                val excludedBlocks = countRows(database, TABLE_LOCAL_BLOCKS)
+                val excludedBlockOperations = countRows(database, TABLE_LOCAL_BLOCK_OPERATIONS)
+                database.execSQL("COMMIT")
+                return ExportDatabaseSnapshot(rows, excludedBlocks, excludedBlockOperations)
+            } catch (error: Exception) {
+                runCatching { database.execSQL("ROLLBACK") }
+                throw error
+            }
+        }
+    }
+
+    private fun countRows(database: SQLiteDatabase, table: String): Int =
+        database.rawQuery("SELECT COUNT(*) FROM $table", null).use { cursor ->
+            check(cursor.moveToFirst())
+            cursor.getInt(0)
+        }
+
     // Retaining these adapters builds Gson's reflective metadata at store creation so the first
     // foreground interaction does not pay that one-off work inside its local-first commit.
     @Suppress("unused")
@@ -656,7 +692,11 @@ class AndroidSyncStateStore internal constructor(
         validateProjectItemOperations(state.projectCache)
     }
 
-    private fun readRows(database: SQLiteDatabase, tenantId: String): EncodedSyncRows {
+    private fun readRows(
+        database: SQLiteDatabase,
+        tenantId: String,
+        includeProtected: Boolean = true,
+    ): EncodedSyncRows {
         fun metadata(name: String, default: String? = null): String? = database.query(
             TABLE_METADATA,
             arrayOf(COLUMN_VALUE),
@@ -667,19 +707,22 @@ class AndroidSyncStateStore internal constructor(
             null,
         ).use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else default }
 
-        fun rows(table: String): List<String> = database.query(
-            table,
-            arrayOf(COLUMN_PAYLOAD),
-            null,
-            null,
-            null,
-            null,
-            "$COLUMN_POSITION ASC, $COLUMN_ID ASC",
-        ).use { cursor ->
-            buildList {
-                while (cursor.moveToNext()) {
-                    val packed = cursor.getBlob(0)
-                    add(if (table in SECRET_TABLES) decryptSecret(tenantId, table, packed) else packed.toString(Charsets.UTF_8))
+        fun rows(table: String): List<String> {
+            if (!includeProtected && table in SECRET_TABLES) return emptyList()
+            return database.query(
+                table,
+                arrayOf(COLUMN_PAYLOAD),
+                null,
+                null,
+                null,
+                null,
+                "$COLUMN_POSITION ASC, $COLUMN_ID ASC",
+            ).use { cursor ->
+                buildList {
+                    while (cursor.moveToNext()) {
+                        val packed = cursor.getBlob(0)
+                        add(if (table in SECRET_TABLES) decryptSecret(tenantId, table, packed) else packed.toString(Charsets.UTF_8))
+                    }
                 }
             }
         }
@@ -1140,6 +1183,12 @@ class AndroidSyncStateStore internal constructor(
         )
     }
 }
+
+internal data class ExportDatabaseSnapshot(
+    val rows: EncodedSyncRows,
+    val excludedBlockRecords: Int,
+    val excludedBlockOperations: Int,
+)
 
 internal enum class MigrationCheckpoint {
     NORMALIZED_COMMITTED,

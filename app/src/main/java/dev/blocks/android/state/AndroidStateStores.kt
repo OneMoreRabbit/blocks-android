@@ -48,7 +48,9 @@ class AndroidEncryptedDraftStore(context: Context) : DraftStore {
             val iv = packed.copyOfRange(1, 1 + ivLength)
             val ciphertext = packed.copyOfRange(1 + ivLength, packed.size)
             val cipher = Cipher.getInstance(TRANSFORMATION).apply {
-                init(Cipher.DECRYPT_MODE, key(tenantId), GCMParameterSpec(128, iv))
+                init(Cipher.DECRYPT_MODE, requireNotNull(existingKey(tenantId)) {
+                    "Encrypted draft key is unavailable"
+                }, GCMParameterSpec(128, iv))
                 updateAAD(tenantId.toByteArray(Charsets.UTF_8))
             }
             decode(String(cipher.doFinal(ciphertext), Charsets.UTF_8))
@@ -115,6 +117,10 @@ class AndroidEncryptedDraftStore(context: Context) : DraftStore {
             generateKey()
         }
     }
+
+    private fun existingKey(tenantId: String): SecretKey? =
+        KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+            .getKey(keyAlias(tenantId), null) as? SecretKey
 
     private fun keyAlias(tenantId: String) = "$KEY_ALIAS_PREFIX${tenantDigest(tenantId)}"
 

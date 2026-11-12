@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.res.ColorStateList
 import android.content.Intent
 import android.content.ClipData
+import android.provider.DocumentsContract
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
@@ -51,6 +52,9 @@ import dev.blocks.android.auth.AcceptedTenantContinuityStore
 import dev.blocks.android.auth.AndroidEncryptedAcceptedTenantContinuityStore
 import dev.blocks.android.auth.GoogleIdentityClient
 import dev.blocks.android.auth.IdentityProvider
+import dev.blocks.android.backup.OfflineBackupExporter
+import dev.blocks.android.backup.PortableBackupCodec
+import dev.blocks.android.backup.BackupArchiveWriter
 import dev.blocks.android.cover.AndroidProjectCoverImporter
 import dev.blocks.android.cover.AndroidProjectCoverCropper
 import dev.blocks.android.cover.AndroidEncryptedProjectCoverMediaStore
@@ -100,11 +104,13 @@ import java.net.URI
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.Arrays
 import java.util.Locale
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
@@ -125,6 +131,7 @@ internal data class ProjectAppDependencies(
     val coverCropper: ProjectCoverCropper? = null,
     val coverSourceActions: CoverSourceActions? = null,
     val resourceLinkLauncher: ((String) -> Boolean)? = null,
+    val backupExporter: OfflineBackupExporter? = null,
 )
 
 internal interface CoverSourceActions {
@@ -257,6 +264,9 @@ class MainActivity : ComponentActivity() {
     private lateinit var topNavigation: LinearLayout
     private lateinit var bottomActions: LinearLayout
     private var syncJob: Job? = null
+    @Volatile
+    private var backupExportInProgress = false
+    private var pendingBackupPassphrase: CharArray? = null
     private var credentialJob: Job? = null
     private var restoreProjectId: String? = null
     private var dashboardSearchQuery: String = ""
@@ -288,6 +298,9 @@ class MainActivity : ComponentActivity() {
     private val coverPickerLauncher = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         handleCoverPickerResult(uri)
     }
+    private val backupPickerLauncher = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("application/octet-stream"),
+    ) { uri -> handleBackupDestination(uri) }
 
     override fun attachBaseContext(newBase: Context) {
         super.attachBaseContext(AppearancePreferences.themedContext(newBase))
@@ -394,7 +407,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         startNfcReader()
-        if (controller.canSynchronize) synchronizeAutomatically()
+        if (!backupExportInProgress && controller.canSynchronize) synchronizeAutomatically()
     }
 
     override fun onPause() {
@@ -435,6 +448,8 @@ class MainActivity : ComponentActivity() {
     private fun productionDependencies(): ProjectAppDependencies {
         val draftStore = AndroidEncryptedDraftStore(this)
         val syncStore = AndroidSyncStateStore(this)
+        val coverStore = AndroidEncryptedProjectCoverMediaStore(this)
+        val acceptedStore = AndroidEncryptedAcceptedTenantContinuityStore(this)
         val baseUri = URI(BuildConfig.BLOCKS_API_BASE_URL)
         val sessionClient = BlocksApiClient(baseUri, BuildConfig.BLOCKS_SERVICE_API_VERSION)
         val sessionAuthenticator = ServiceSessionAuthenticator(sessionClient::exchangeSession)
@@ -444,14 +459,15 @@ class MainActivity : ComponentActivity() {
             LegacyOperationReplayer(legacyService, draftStore, syncStore),
             draftStore,
             syncStore,
-            coverMediaStore = AndroidEncryptedProjectCoverMediaStore(this),
+            coverMediaStore = coverStore,
         )
         return ProjectAppDependencies(
             controller = ProjectPresentationController(sessionAuthenticator, workspace),
             identity = GoogleIdentityClient(BuildConfig.BLOCKS_GOOGLE_SERVER_CLIENT_ID),
             continuity = SessionContinuityStore(this),
-            acceptedTenantStore = AndroidEncryptedAcceptedTenantContinuityStore(this),
+            acceptedTenantStore = acceptedStore,
             nfcTagPlatform = AndroidNfcTagPlatform(this),
+            backupExporter = OfflineBackupExporter(syncStore, draftStore, acceptedStore, coverStore),
         )
     }
 
@@ -913,6 +929,7 @@ class MainActivity : ComponentActivity() {
         val items = buildList {
             add("Appearance")
             add("About")
+            if (controller.activeTenantId != null && dependencies.backupExporter != null) add("Export backup")
             if (controller.state.authenticationRequired || controller.state.sessionConfirmationRequired) {
                 add("Reconnect Google account")
             }
@@ -925,6 +942,7 @@ class MainActivity : ComponentActivity() {
                 when (items[which]) {
                     "Appearance" -> showAppearanceSettings()
                     "About" -> showAbout()
+                    "Export backup" -> showExportBackup()
                     "Reconnect Google account" -> reauthenticate()
                     "Switch account" -> switchAccount()
                     "Sign out" -> signOut()
@@ -966,6 +984,146 @@ class MainActivity : ComponentActivity() {
                 .setPositiveButton("Done", null)
                 .create(),
         )
+    }
+
+    private fun showExportBackup() {
+        if (backupExportInProgress || credentialJob?.isActive == true || controller.activeTenantId == null) return
+        val first = EditText(this).apply {
+            hint = "Passphrase"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
+        val second = EditText(this).apply {
+            hint = "Repeat passphrase"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
+        val fields = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), 0)
+            addView(first)
+            addView(second)
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Export offline backup")
+            .setMessage(
+                "This exports the open account only, including pending changes. Other locked accounts " +
+                    "and private NFC tag tokens are excluded. Choose a safe file location. " +
+                    "Keep your passphrase separately: without it, the backup cannot be read.",
+            )
+            .setView(fields)
+            .setPositiveButton("Choose file", null)
+            .setNegativeButton("Cancel", null)
+            .create()
+        showManagedDialog(dialog)
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+            val passphrase = CharArray(first.length()) { index -> first.text[index] }
+            val confirmation = CharArray(second.length()) { index -> second.text[index] }
+            first.setText("")
+            second.setText("")
+            val valid = passphrase.size >= 12 && Arrays.equals(passphrase, confirmation)
+            Arrays.fill(confirmation, '\u0000')
+            if (!valid) {
+                Arrays.fill(passphrase, '\u0000')
+                first.error = "Use matching passphrases of at least 12 characters"
+                return@setOnClickListener
+            }
+            pendingBackupPassphrase = passphrase
+            backupExportInProgress = true
+            dialog.dismiss()
+            try {
+                val date = Instant.now().toString().take(10)
+                backupPickerLauncher.launch("Blocks-backup-$date.blocksbackup")
+            } catch (_: Exception) {
+                Arrays.fill(passphrase, '\u0000')
+                pendingBackupPassphrase = null
+                backupExportInProgress = false
+                showMessage("Backup not started", "Blocks could not open the document picker. No local data changed.")
+            }
+        }
+    }
+
+    private fun handleBackupDestination(uri: Uri?) {
+        val passphrase = pendingBackupPassphrase ?: run {
+            // The picker can return after Activity recreation; the in-memory passphrase is gone.
+            // Never leave its newly created empty document looking like a completed backup.
+            if (uri != null) {
+                val removed = runCatching { DocumentsContract.deleteDocument(contentResolver, uri) }.getOrDefault(false)
+                showMessage(
+                    "Backup not created",
+                    if (removed) "The picker returned after Blocks restarted. Try again."
+                    else "The picker returned after Blocks restarted. Delete its incomplete document and try again.",
+                )
+            }
+            return
+        }
+        pendingBackupPassphrase = null
+        if (uri == null) {
+            Arrays.fill(passphrase, '\u0000')
+            backupExportInProgress = false
+            showMessage("Backup cancelled", "No backup was created. Your local data is unchanged.")
+            return
+        }
+        val tenantId = controller.activeTenantId
+        if (tenantId == null || dependencies.backupExporter == null) {
+            Arrays.fill(passphrase, '\u0000')
+            backupExportInProgress = false
+            showMessage("Backup not created", "The open account changed. Your local data is unchanged.")
+            return
+        }
+        val progress = AlertDialog.Builder(this)
+            .setTitle("Exporting backup")
+            .setMessage("Preparing and verifying the encrypted file. Keep Blocks open.")
+            .setCancelable(false)
+            .create()
+        showManagedDialog(progress)
+        uiScope.launch {
+            var archive: ByteArray? = null
+            var destinationCreated = true
+            try {
+                syncJob?.cancelAndJoin()
+                coverJobs.toList().forEach { it.join() }
+                val payload = withContext(localStateDispatcher) {
+                    require(controller.activeTenantId == tenantId) { "The open account changed" }
+                    requireNotNull(dependencies.backupExporter).capture(tenantId, BuildConfig.VERSION_NAME)
+                }
+                archive = withContext(Dispatchers.Default) { PortableBackupCodec.seal(payload, passphrase) }
+                withContext(Dispatchers.IO) {
+                    BackupArchiveWriter.writeAndVerify(
+                        requireNotNull(archive), passphrase, payload,
+                        openWrite = { contentResolver.openOutputStream(uri, "wt") },
+                        openRead = { contentResolver.openInputStream(uri) },
+                    )
+                }
+                destinationCreated = false
+                val summary = PortableBackupCodec.summary(payload)
+                progress.dismiss()
+                showMessage(
+                    "Backup verified",
+                    "${summary.projects} projects, ${summary.notes} notes, ${summary.links} links, " +
+                        "${summary.parking} park records and ${summary.pendingOperations} pending changes. " +
+                        "${summary.covers} covers. ${summary.excludedProtectedBlockRecords} private tag records, " +
+                        "${summary.excludedProtectedBlockOperations} tag operations and " +
+                        "${summary.excludedKnownOtherAccountPartitions} known locked accounts were NOT included. " +
+                        "Format 1 from ${summary.appVersion}, ${summary.exportedAt}. " +
+                        "Keep the file and passphrase separately. A new device must sign in and verify account access before recovery.",
+                )
+            } catch (_: CancellationException) {
+                runCatching { DocumentsContract.deleteDocument(contentResolver, uri) }
+            } catch (_: Exception) {
+                val removed = if (destinationCreated) {
+                    runCatching { DocumentsContract.deleteDocument(contentResolver, uri) }.getOrDefault(false)
+                } else true
+                progress.dismiss()
+                showMessage(
+                    "Backup failed",
+                    "No backup was verified. Your Blocks data is unchanged. " +
+                        if (removed) "The incomplete document was removed." else "An incomplete document may remain at the chosen location; delete it there.",
+                )
+            } finally {
+                archive?.fill(0)
+                Arrays.fill(passphrase, '\u0000')
+                backupExportInProgress = false
+            }
+        }
     }
 
     private fun confirmRemoveLocalData() {
@@ -2897,7 +3055,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun synchronizeAutomatically() {
-        if (!controller.canSynchronize || syncJob?.isActive == true) return
+        if (backupExportInProgress || !controller.canSynchronize || syncJob?.isActive == true) return
         syncJob = uiScope.launch {
             try {
                 withContext(Dispatchers.IO) {
@@ -2920,6 +3078,7 @@ class MainActivity : ComponentActivity() {
         renderCommitted: (() -> Boolean)? = null,
         action: () -> Unit,
     ) {
+        if (backupExportInProgress) return
         source?.let {
             it.isEnabled = false
             it.alpha = 0.55f
@@ -2967,7 +3126,7 @@ class MainActivity : ComponentActivity() {
         val manager = getSystemService(ConnectivityManager::class.java)
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                if (controller.canSynchronize) synchronizeAutomatically()
+                if (!backupExportInProgress && controller.canSynchronize) synchronizeAutomatically()
             }
         }
         runCatching { manager.registerDefaultNetworkCallback(callback) }
@@ -3074,6 +3233,8 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        pendingBackupPassphrase?.let { Arrays.fill(it, '\u0000') }
+        pendingBackupPassphrase = null
         nfcTagPlatform.stopReader()
         coverJobs.forEach { it.cancel() }
         coverJobs.clear()
