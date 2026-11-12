@@ -1,8 +1,8 @@
-# Offline backup and restore (Android 0.10.2 candidate)
+# Offline backup and restore (Android 0.10.2)
 
 Blocks can export the currently open account without a network connection or fresh Google sign-in. This is not sync and does not send anything to Blocks Service. **The backup is not encrypted. Anyone holding the file can read its projects, notes, images, NFC tag locators and unsent changes.** Save it only in a private place you control; do not share or automatically upload it.
 
-This describes an unreleased candidate. Do not change the owner's installed app or try these steps on the owner's phone until architecture has approved a custody-signed in-place update.
+These steps apply only after the custody-signed 0.10.2 APK is published and its in-place installation is approved. Until then, keep the owner's installed app and data unchanged. Do not use a test or unsigned APK on the owner's phone.
 
 ## Back up the existing phone
 
