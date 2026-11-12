@@ -38,8 +38,41 @@ internal class OfflineBackupExporter(
             state = snapshot.rows,
             drafts = draftStore.load(activeTenantId),
             coverMedia = media,
-            excludedProtectedBlockRecords = snapshot.excludedBlockRecords,
-            excludedProtectedBlockOperations = snapshot.excludedBlockOperations,
+            protectedBlockMetadata = snapshot.localBlocks.map { block ->
+                PortableBlockMetadata(
+                    clientBlockId = block.clientBlockId,
+                    tokenFingerprint = block.token.fingerprint(),
+                    label = block.label,
+                    state = block.state.name,
+                    intendedProjectId = block.intendedProjectId,
+                    boundProjectId = block.boundProjectId,
+                    registrationOperationId = block.registrationOperationId,
+                    initialBindingOperationId = block.initialBindingOperationId,
+                    createdAt = block.createdAt,
+                    verifiedAt = block.verifiedAt,
+                    activationMedium = block.activationMedium?.name,
+                    replacementTokenFingerprint = block.replacementTokenFingerprint,
+                    failure = block.failure?.name,
+                    serverBlockId = block.serverBlockId,
+                )
+            },
+            protectedBlockOperationMetadata = snapshot.localBlockOperations.map { operation ->
+                PortableBlockOperationMetadata(
+                    operationId = operation.operationId,
+                    type = operation.type.name,
+                    clientBlockId = operation.clientBlockId,
+                    tokenFingerprint = operation.token?.fingerprint(),
+                    label = operation.label,
+                    projectId = operation.projectId,
+                    dependsOnOperationId = operation.dependsOnOperationId,
+                    createdAt = operation.createdAt,
+                    contractVersion = operation.contractVersion,
+                )
+            },
+            // Raw locators are intentionally excluded: the encrypted archive preserves
+            // association evidence, but cannot program, resolve or replay legacy tags.
+            excludedProtectedBlockRecords = snapshot.localBlocks.size,
+            excludedProtectedBlockOperations = snapshot.localBlockOperations.size,
             excludedKnownOtherAccountPartitions = account.excludedKnownOtherPartitions,
         )
     }

@@ -1426,7 +1426,8 @@ class MainActivityPresentationTest {
             scenario.onActivity { activity ->
                 val text = activity.dialogTexts().joinToString("\n")
                 assertTrue(text.contains("Other locked accounts"))
-                assertTrue(text.contains("private NFC tag tokens"))
+                assertTrue(text.contains("raw NFC tag locators are excluded"))
+                assertTrue(text.contains("Do not switch accounts or sign out"))
                 assertTrue(text.contains("backup cannot be read"))
             }
             captureDeviceScreenshot(File(destination, "backup-warning.png"))

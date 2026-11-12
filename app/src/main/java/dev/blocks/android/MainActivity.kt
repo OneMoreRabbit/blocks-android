@@ -264,9 +264,11 @@ class MainActivity : ComponentActivity() {
     private lateinit var topNavigation: LinearLayout
     private lateinit var bottomActions: LinearLayout
     private var syncJob: Job? = null
+    private val foregroundMutationJobs = java.util.Collections.synchronizedSet(mutableSetOf<Job>())
     @Volatile
     private var backupExportInProgress = false
     private var pendingBackupPassphrase: CharArray? = null
+    internal var lastBackupDestinationForTest: Uri? = null
     private var credentialJob: Job? = null
     private var restoreProjectId: String? = null
     private var dashboardSearchQuery: String = ""
@@ -1008,7 +1010,8 @@ class MainActivity : ComponentActivity() {
             .setTitle("Export offline backup")
             .setMessage(
                 "This exports the open account only, including pending changes. Other locked accounts " +
-                    "and private NFC tag tokens are excluded. Choose a safe file location. " +
+                    "and raw NFC tag locators are excluded; token-free tag association details are included. " +
+                    "Do not switch accounts or sign out during this incident. Choose a safe file location. " +
                     "Keep your passphrase separately: without it, the backup cannot be read.",
             )
             .setView(fields)
@@ -1044,6 +1047,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleBackupDestination(uri: Uri?) {
+        lastBackupDestinationForTest = uri
         val passphrase = pendingBackupPassphrase ?: run {
             // The picker can return after Activity recreation; the in-memory passphrase is gone.
             // Never leave its newly created empty document looking like a completed backup.
@@ -1082,6 +1086,9 @@ class MainActivity : ComponentActivity() {
             var destinationCreated = true
             try {
                 syncJob?.cancelAndJoin()
+                // Existing local-first commits may already have started when the owner opened
+                // Export. Wait for them before capturing the database, drafts and cover media.
+                foregroundMutationJobs.toList().forEach { it.join() }
                 coverJobs.toList().forEach { it.join() }
                 coverMutationJobs.toList().forEach { it.join() }
                 val payload = withContext(localStateDispatcher) {
@@ -1100,13 +1107,15 @@ class MainActivity : ComponentActivity() {
                 val summary = PortableBackupCodec.summary(payload)
                 progress.dismiss()
                 showMessage(
-                    "Backup verified",
+                    "Verified current-account export",
                     "${summary.projects} projects, ${summary.notes} notes, ${summary.links} links, " +
                         "${summary.parking} park records and ${summary.pendingOperations} pending changes. " +
-                        "${summary.covers} covers. ${summary.excludedProtectedBlockRecords} private tag records, " +
-                        "${summary.excludedProtectedBlockOperations} tag operations and " +
+                        "${summary.covers} covers. Token-free details for " +
+                        "${summary.excludedProtectedBlockRecords} tag records and " +
+                        "${summary.excludedProtectedBlockOperations} tag operations are included; their raw locators are NOT. " +
                         "${summary.excludedKnownOtherAccountPartitions} known locked accounts were NOT included. " +
                         "Format 1 from ${summary.appVersion}, ${summary.exportedAt}. " +
+                        "This is not complete app recovery. Do not switch accounts or sign out. " +
                         "Keep the file and passphrase separately. A new device must sign in and verify account access before recovery.",
                 )
             } catch (_: CancellationException) {
@@ -2840,6 +2849,7 @@ class MainActivity : ComponentActivity() {
     }
 
     internal fun coverCacheKeysForTest(): Set<String> = coverBitmaps.snapshot().keys
+    internal fun activeTenantForTest(): String? = controller.activeTenantId
 
     private fun label(text: String, size: Float, color: Int = brandColor(R.color.blocks_ink)) = TextView(this).apply {
         this.text = text
@@ -3090,7 +3100,7 @@ class MainActivity : ComponentActivity() {
             it.isEnabled = false
             it.alpha = 0.55f
         }
-        uiScope.launch {
+        val job = uiScope.launch {
             var committed = false
             try {
                 withContext(NonCancellable + localStateDispatcher) { action() }
@@ -3102,6 +3112,8 @@ class MainActivity : ComponentActivity() {
             complete?.invoke()
             if (syncAfter) synchronizeAutomatically()
         }
+        foregroundMutationJobs += job
+        job.invokeOnCompletion { foregroundMutationJobs.remove(job) }
     }
 
     /** Adds one committed create result without rebuilding every existing dashboard row. */

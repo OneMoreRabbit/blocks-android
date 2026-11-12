@@ -79,22 +79,21 @@ class AndroidSyncStateStore internal constructor(
                     "This account's local schema needs separate review before export"
                 }
                 validateTenant(tenantId, rowCodec.decode(rows))
-                val excludedBlocks = countRows(database, TABLE_LOCAL_BLOCKS)
-                val excludedBlockOperations = countRows(database, TABLE_LOCAL_BLOCK_OPERATIONS)
+                // Read protected rows inside the same SQLite view. The exporter projects these
+                // into token-free recovery metadata; raw locators never enter the archive.
+                val protectedRows = readRows(database, tenantId)
+                val blocks = protectedRows.localBlocks.map { gson.fromJson(it, LocalBlockRecord::class.java) }
+                val blockOperations = protectedRows.localBlockOperations.map {
+                    gson.fromJson(it, LocalBlockOperation::class.java)
+                }
                 database.execSQL("COMMIT")
-                return ExportDatabaseSnapshot(rows, excludedBlocks, excludedBlockOperations)
+                return ExportDatabaseSnapshot(rows, blocks, blockOperations)
             } catch (error: Exception) {
                 runCatching { database.execSQL("ROLLBACK") }
                 throw error
             }
         }
     }
-
-    private fun countRows(database: SQLiteDatabase, table: String): Int =
-        database.rawQuery("SELECT COUNT(*) FROM $table", null).use { cursor ->
-            check(cursor.moveToFirst())
-            cursor.getInt(0)
-        }
 
     // Retaining these adapters builds Gson's reflective metadata at store creation so the first
     // foreground interaction does not pay that one-off work inside its local-first commit.
@@ -1186,8 +1185,8 @@ class AndroidSyncStateStore internal constructor(
 
 internal data class ExportDatabaseSnapshot(
     val rows: EncodedSyncRows,
-    val excludedBlockRecords: Int,
-    val excludedBlockOperations: Int,
+    val localBlocks: List<LocalBlockRecord>,
+    val localBlockOperations: List<LocalBlockOperation>,
 )
 
 internal enum class MigrationCheckpoint {

@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import struct
 import sys
 
@@ -44,6 +45,31 @@ def read_archive(path: Path, passphrase: str) -> dict:
         raise ValueError("invalid backup payload")
     if payload.get("state", {}).get("localBlocks") or payload.get("state", {}).get("localBlockOperations"):
         raise ValueError("protected tag tokens must not be in a portable backup")
+    block_metadata = payload.get("protectedBlockMetadata", [])
+    operation_metadata = payload.get("protectedBlockOperationMetadata", [])
+    if (len(block_metadata) != payload.get("excludedProtectedBlockRecords") or
+            len(operation_metadata) != payload.get("excludedProtectedBlockOperations")):
+        raise ValueError("protected tag metadata count does not match exclusions")
+    block_fields = {
+        "clientBlockId", "tokenFingerprint", "label", "state", "intendedProjectId",
+        "boundProjectId", "registrationOperationId", "initialBindingOperationId",
+        "createdAt", "verifiedAt", "activationMedium", "replacementTokenFingerprint",
+        "failure", "serverBlockId",
+    }
+    operation_fields = {
+        "operationId", "type", "clientBlockId", "tokenFingerprint", "label",
+        "projectId", "dependsOnOperationId", "createdAt", "contractVersion",
+    }
+    for item, fields in [(item, block_fields) for item in block_metadata] + [
+        (item, operation_fields) for item in operation_metadata
+    ]:
+        if not set(item) <= fields:
+            raise ValueError("protected tag metadata has an unexpected field")
+        if "clientBlockId" not in item:
+            raise ValueError("protected tag metadata is incomplete")
+        fingerprint = item.get("tokenFingerprint")
+        if fingerprint is not None and not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+            raise ValueError("protected tag fingerprint is invalid")
     covers = payload.get("coverMedia", [])
     references = set()
     for item in covers:
@@ -80,8 +106,11 @@ def main() -> int:
               f"notes={len(state['projectNoteItems'])} links={len(state['projectResourceLinks'])} "
               f"parking={len(state['parkingRecords'])} pending={pending} "
               f"covers={len(state['projectCovers'])}")
-        print(f"EXCLUDED protected_blocks={payload['excludedProtectedBlockRecords']} "
-              f"protected_block_operations={payload['excludedProtectedBlockOperations']} "
+        print(f"TOKEN-FREE TAG METADATA blocks={len(payload['protectedBlockMetadata'])} "
+              f"operations={len(payload['protectedBlockOperationMetadata'])}; "
+              "raw locators and replayable protected rows excluded")
+        print(f"EXCLUDED raw_protected_blocks={payload['excludedProtectedBlockRecords']} "
+              f"raw_protected_block_operations={payload['excludedProtectedBlockOperations']} "
               f"known_other_accounts={payload['excludedKnownOtherAccountPartitions']}; "
               "unbound partitions may also exist")
         if args.out:

@@ -23,6 +23,11 @@ import dev.blocks.android.project.ProjectResourceLink
 import dev.blocks.android.project.ProjectSummary
 import dev.blocks.android.state.AndroidEncryptedDraftStore
 import dev.blocks.android.state.AndroidSyncStateStore
+import dev.blocks.android.tag.LocalBlockOperation
+import dev.blocks.android.tag.LocalBlockOperationType
+import dev.blocks.android.tag.LocalBlockRecord
+import dev.blocks.android.tag.LocalBlockState
+import dev.blocks.android.tag.OpaqueTagToken
 import java.io.File
 import java.security.MessageDigest
 import org.junit.After
@@ -74,6 +79,16 @@ class OfflineBackupExporterTest {
             parking = ParkingDraft(parking.location, parking.nextAction, parking.mustNotForget),
             localCreatedAt = NOW,
         )
+        val tagToken = OpaqueTagToken.fromBytes(ByteArray(32) { it.toByte() })
+        val localBlock = LocalBlockRecord(
+            clientBlockId = BLOCK, token = tagToken, label = "Workshop tag",
+            state = LocalBlockState.ACTIVE, intendedProjectId = PROJECT,
+            boundProjectId = PROJECT, createdAt = NOW,
+        )
+        val tagOperation = LocalBlockOperation(
+            operationId = BLOCK_OPERATION, type = LocalBlockOperationType.REGISTER_BLOCK,
+            clientBlockId = BLOCK, token = tagToken, label = "Workshop tag", createdAt = NOW,
+        )
         state.saveSyncState(TENANT_A, TenantSyncState(
             projectCache = ProjectCacheState(
                 activeProjects = listOf(project), activeProjectsLoaded = true,
@@ -82,6 +97,7 @@ class OfflineBackupExporterTest {
                 noteItems = listOf(ProjectNoteItem(NOTE, PROJECT, "Offline note", false, "author", NOW, NOW)),
                 resourceLinks = listOf(ProjectResourceLink(LINK, PROJECT, "Plans", "https://example.invalid", NOW, NOW)),
                 projectCovers = listOf(cover), commands = listOf(pending),
+                localBlocks = listOf(localBlock), localBlockOperations = listOf(tagOperation),
             ),
             changeCursor = "cursor-17",
         ))
@@ -107,6 +123,12 @@ class OfflineBackupExporterTest {
         assertTrue(restored.state.projectCommands.single().contains(OPERATION))
         assertEquals(2, restored.coverMedia.size)
         assertEquals(1, restored.excludedKnownOtherAccountPartitions)
+        assertEquals(1, restored.protectedBlockMetadata.size)
+        assertEquals(PROJECT, restored.protectedBlockMetadata.single().boundProjectId)
+        assertEquals(tagToken.fingerprint(), restored.protectedBlockMetadata.single().tokenFingerprint)
+        assertEquals(BLOCK_OPERATION, restored.protectedBlockOperationMetadata.single().operationId)
+        assertEquals(tagToken.fingerprint(), restored.protectedBlockOperationMetadata.single().tokenFingerprint)
+        assertFalse(Gson().toJson(restored).contains(tagToken.encoded))
         assertFalse(String(archive, Charsets.ISO_8859_1).contains("Private workshop"))
         assertFalse(String(archive, Charsets.ISO_8859_1).contains("Unsent name"))
         assertTrue(runCatching { OfflineBackupExporter(state, drafts, accepted, media).capture(TENANT_B, "0.10.2") }.isFailure)
@@ -127,6 +149,8 @@ class OfflineBackupExporterTest {
         const val NOTE = "41000000-0000-4000-8000-000000000001"
         const val LINK = "51000000-0000-4000-8000-000000000001"
         const val OPERATION = "61000000-0000-4000-8000-000000000001"
+        const val BLOCK = "71000000-0000-4000-8000-000000000001"
+        const val BLOCK_OPERATION = "81000000-0000-4000-8000-000000000001"
         const val NOW = "2026-11-12T10:00:00Z"
     }
 }

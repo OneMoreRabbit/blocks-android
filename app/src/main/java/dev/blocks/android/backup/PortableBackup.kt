@@ -26,10 +26,42 @@ internal data class PortableBackupPayload(
     val state: EncodedSyncRows,
     val drafts: FormDrafts,
     val coverMedia: List<PortableCoverMedia>,
+    /** Token-free evidence of protected legacy tag associations; not replayable tag state. */
+    val protectedBlockMetadata: List<PortableBlockMetadata> = emptyList(),
+    val protectedBlockOperationMetadata: List<PortableBlockOperationMetadata> = emptyList(),
     val excludedProtectedBlockRecords: Int,
     val excludedProtectedBlockOperations: Int,
     val excludedKnownOtherAccountPartitions: Int,
     val otherUnboundPartitionsMayExist: Boolean = true,
+)
+
+internal data class PortableBlockMetadata(
+    val clientBlockId: String,
+    val tokenFingerprint: String,
+    val label: String,
+    val state: String,
+    val intendedProjectId: String?,
+    val boundProjectId: String?,
+    val registrationOperationId: String?,
+    val initialBindingOperationId: String?,
+    val createdAt: String,
+    val verifiedAt: String?,
+    val activationMedium: String?,
+    val replacementTokenFingerprint: String?,
+    val failure: String?,
+    val serverBlockId: String?,
+)
+
+internal data class PortableBlockOperationMetadata(
+    val operationId: String,
+    val type: String,
+    val clientBlockId: String,
+    val tokenFingerprint: String?,
+    val label: String?,
+    val projectId: String?,
+    val dependsOnOperationId: String?,
+    val createdAt: String,
+    val contractVersion: String,
 )
 
 internal data class PortableCoverMedia(
@@ -66,6 +98,13 @@ internal object PortableBackupCodec {
     fun seal(payload: PortableBackupPayload, passphrase: CharArray, random: SecureRandom = SecureRandom()): ByteArray {
         require(passphrase.size >= 12) { "Use a passphrase of at least 12 characters" }
         require(payload.formatVersion == 1 && payload.acceptedAccount.tenantId.isNotBlank())
+        require(payload.state.localBlocks.isEmpty() && payload.state.localBlockOperations.isEmpty()) {
+            "Raw NFC locators cannot enter a portable backup"
+        }
+        require(payload.protectedBlockMetadata.size == payload.excludedProtectedBlockRecords &&
+            payload.protectedBlockOperationMetadata.size == payload.excludedProtectedBlockOperations) {
+            "Protected tag metadata must account for every excluded raw row"
+        }
         val plaintext = gson.toJson(payload).toByteArray(StandardCharsets.UTF_8)
         try {
             require(plaintext.size <= maxPlaintextBytes) { "Backup is too large for this export version" }

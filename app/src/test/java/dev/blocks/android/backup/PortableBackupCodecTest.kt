@@ -105,8 +105,8 @@ class PortableBackupCodecTest {
             )),
             drafts = FormDrafts(projectName = "unsent draft"),
             coverMedia = emptyList(),
-            excludedProtectedBlockRecords = 2,
-            excludedProtectedBlockOperations = 1,
+            excludedProtectedBlockRecords = 0,
+            excludedProtectedBlockOperations = 0,
             excludedKnownOtherAccountPartitions = 1,
         )
     }
