@@ -8,7 +8,9 @@ import android.content.ClipData
 import android.provider.DocumentsContract
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -731,12 +733,16 @@ class MainActivity : ComponentActivity() {
             !state.sessionConfirmationRequired && !state.authenticationRequired &&
             !state.reconciliationRequired) return null
         val description = syncStatusDescription()
-        return TextView(this).apply {
+        val dotColor = brandColor(R.color.blocks_muted)
+        return object : View(this) {
+            private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = dotColor }
+
+            override fun onDraw(canvas: Canvas) {
+                super.onDraw(canvas)
+                canvas.drawCircle(width / 2f, height / 2f, dp(3).toFloat(), dotPaint)
+            }
+        }.apply {
             id = ProjectUiIds.SYNC_STATUS
-            text = "•"
-            textSize = 22f
-            gravity = Gravity.CENTER
-            setTextColor(brandColor(R.color.blocks_muted))
             contentDescription = description
             setOnClickListener {
                 AlertDialog.Builder(this@MainActivity)
