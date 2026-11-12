@@ -147,6 +147,16 @@ class AndroidEncryptedDraftStoreTest {
         assertTrue(keyStore().containsAlias(keyAlias(OTHER_TENANT_ID)))
     }
 
+    @Test
+    fun readingCiphertextWithMissingKeyFailsWithoutCreatingReplacementKey() {
+        store.save(TENANT_ID, FormDrafts(projectName = "Unsent draft"))
+        keyStore().deleteEntry(keyAlias(TENANT_ID))
+
+        assertTrue(runCatching { store.load(TENANT_ID) }.isFailure)
+        assertFalse(keyStore().containsAlias(keyAlias(TENANT_ID)))
+        assertTrue(preferences(TENANT_ID).contains("drafts"))
+    }
+
     private fun preferences(tenantId: String = TENANT_ID) = context.getSharedPreferences(
         "encrypted_form_drafts_v2_${tenantDigest(tenantId)}",
         Context.MODE_PRIVATE,

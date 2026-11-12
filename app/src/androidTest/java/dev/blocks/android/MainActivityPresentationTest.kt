@@ -32,6 +32,7 @@ import dev.blocks.android.api.ServiceException
 import dev.blocks.android.auth.AcceptedTenantContinuity
 import dev.blocks.android.auth.AcceptedTenantContinuityStore
 import dev.blocks.android.auth.AndroidEncryptedAcceptedTenantContinuityStore
+import dev.blocks.android.backup.OfflineBackupExporter
 import dev.blocks.android.auth.IdentityProvider
 import dev.blocks.android.cover.ProjectCoverImporter
 import dev.blocks.android.cover.CoverCropSelection
@@ -103,6 +104,8 @@ import dev.blocks.android.tag.TagLocator
 import dev.blocks.android.tag.TagProgrammingFailure
 import java.util.concurrent.atomic.AtomicInteger
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
 import java.security.MessageDigest
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -1389,7 +1392,7 @@ class MainActivityPresentationTest {
                 activity.selectDialogItem("About")
                 val about = activity.dialogTexts().joinToString("\n")
                 assertTrue(about.contains("Blocks Android"))
-                assertTrue(about.contains("Version 0.10.1 (25)"))
+                assertTrue(about.contains("Version 0.10.2 (26)"))
                 assertTrue(about.contains("dev.blocks.android/debug"))
                 assertFalse(about.contains("tenant", ignoreCase = true))
                 assertFalse(about.contains("token", ignoreCase = true))
@@ -1397,6 +1400,49 @@ class MainActivityPresentationTest {
                 assertFalse(about.contains("sync", ignoreCase = true))
             }
         }
+    }
+
+    @Test
+    fun offlineBackupSettingsAndUnencryptedWarningAreVisibleWithoutServiceConfirmation() {
+        val originalFactory = requireNotNull(MainActivity.dependencyFactory)
+        MainActivity.dependencyFactory = { activity ->
+            originalFactory(activity).copy(backupExporter = OfflineBackupExporter(
+                AndroidSyncStateStore(activity),
+                AndroidEncryptedDraftStore(activity),
+                AndroidEncryptedAcceptedTenantContinuityStore(activity),
+                AndroidEncryptedProjectCoverMediaStore(activity),
+            ))
+        }
+        val destination = requireNotNull(context.getExternalFilesDir("review-0.10.2"))
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            assertEquals(0, sessionExchanges.get())
+            scenario.onActivity { it.findViewById<Button>(ProjectUiIds.SETTINGS).performClick() }
+            scenario.onActivity { activity ->
+                assertTrue(activity.dialogTexts().any { it.contains("Export backup") })
+            }
+            captureDeviceScreenshot(File(destination, "backup-settings.png"))
+            scenario.onActivity { it.selectDialogItem("Export backup") }
+            scenario.onActivity { activity ->
+                val text = activity.dialogTexts().joinToString("\n")
+                assertTrue(text.contains("Other locked accounts"))
+                assertTrue(text.contains("NFC tag locators"))
+                assertTrue(text.contains("Do not switch accounts or sign out"))
+                assertTrue(text.contains("NOT encrypted"))
+            }
+            captureDeviceScreenshot(File(destination, "backup-warning.png"))
+            assertEquals(0, sessionExchanges.get())
+            assertEquals(0, workspace.syncCalls)
+        }
+    }
+
+    private fun captureDeviceScreenshot(file: File) {
+        InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+        Thread.sleep(300) // Allow the Dialog window surface to reach the compositor.
+        val bitmap = requireNotNull(InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot())
+        FileOutputStream(file).use { stream -> assertTrue(bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)) }
+        bitmap.recycle()
+        assertTrue(file.isFile && file.length() > 0)
     }
 
     @Test

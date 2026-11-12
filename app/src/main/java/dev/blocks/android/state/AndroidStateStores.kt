@@ -32,6 +32,16 @@ class SessionContinuityStore(context: Context) : SessionContinuity {
 class AndroidEncryptedDraftStore(context: Context) : DraftStore {
     private val applicationContext = context.applicationContext
 
+    internal fun hasSavedDraft(tenantId: String): Boolean = preferences(tenantId).contains(CIPHERTEXT)
+
+    internal fun hasAnySavedDraft(): Boolean =
+        java.io.File(applicationContext.applicationInfo.dataDir, "shared_prefs")
+            .listFiles().orEmpty().any { file ->
+                file.name.startsWith(PREFERENCES_PREFIX) && file.name.endsWith(".xml") &&
+                    applicationContext.getSharedPreferences(file.name.removeSuffix(".xml"), Context.MODE_PRIVATE)
+                        .contains(CIPHERTEXT)
+            }
+
     init {
         // Version 1 used one app-global record. It cannot be assigned to a tenant safely, so remove it.
         applicationContext.getSharedPreferences(LEGACY_PREFERENCES, Context.MODE_PRIVATE)
@@ -48,7 +58,9 @@ class AndroidEncryptedDraftStore(context: Context) : DraftStore {
             val iv = packed.copyOfRange(1, 1 + ivLength)
             val ciphertext = packed.copyOfRange(1 + ivLength, packed.size)
             val cipher = Cipher.getInstance(TRANSFORMATION).apply {
-                init(Cipher.DECRYPT_MODE, key(tenantId), GCMParameterSpec(128, iv))
+                init(Cipher.DECRYPT_MODE, requireNotNull(existingKey(tenantId)) {
+                    "Encrypted draft key is unavailable"
+                }, GCMParameterSpec(128, iv))
                 updateAAD(tenantId.toByteArray(Charsets.UTF_8))
             }
             decode(String(cipher.doFinal(ciphertext), Charsets.UTF_8))
@@ -115,6 +127,10 @@ class AndroidEncryptedDraftStore(context: Context) : DraftStore {
             generateKey()
         }
     }
+
+    private fun existingKey(tenantId: String): SecretKey? =
+        KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+            .getKey(keyAlias(tenantId), null) as? SecretKey
 
     private fun keyAlias(tenantId: String) = "$KEY_ALIAS_PREFIX${tenantDigest(tenantId)}"
 

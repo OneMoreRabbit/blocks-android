@@ -40,6 +40,18 @@ class AndroidEncryptedAcceptedTenantContinuityStore(context: Context) : Accepted
     private val applicationContext = context.applicationContext
     private val preferences = applicationContext.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
 
+    /** Export only the currently unlocked binding; never unlock or migrate another partition. */
+    @Synchronized
+    internal fun snapshotForExport(): ExportAccountBinding {
+        val state = requireNotNull(loadState(migrateLegacy = false)) { "No accepted account is saved" }
+        val active = requireNotNull(state.activeTenantId) { "Sign in to the account whose data you want to export" }
+        val binding = state.bindings.single { it.tenantId == active }
+        return ExportAccountBinding(binding, state.bindings.size - 1)
+    }
+
+    @Synchronized
+    internal fun hasAnyBindings(): Boolean = loadState(migrateLegacy = false)?.bindings?.isNotEmpty() == true
+
     @Synchronized
     override fun load(): AcceptedTenantContinuity? {
         val state = loadState() ?: return null
@@ -102,7 +114,7 @@ class AndroidEncryptedAcceptedTenantContinuityStore(context: Context) : Accepted
         }
     }
 
-    private fun loadState(): ContinuityState? {
+    private fun loadState(migrateLegacy: Boolean = true): ContinuityState? {
         val encoded = preferences.getString(CIPHERTEXT, null) ?: return null
         return runCatching {
             val packed = Base64.decode(encoded, Base64.NO_WRAP)
@@ -120,7 +132,7 @@ class AndroidEncryptedAcceptedTenantContinuityStore(context: Context) : Accepted
                 LEGACY_SCHEMA_VERSION -> ContinuityState(
                     activeTenantId = json.getString("tenant_id"),
                     bindings = listOf(AcceptedTenantContinuity(json.getString("tenant_id"))),
-                ).also(::writeState)
+                ).also { if (migrateLegacy) writeState(it) }
                 SCHEMA_VERSION -> decodeState(json)
                 else -> error("Accepted tenant continuity schema $schemaVersion is unsupported")
             }
@@ -242,3 +254,8 @@ class AndroidEncryptedAcceptedTenantContinuityStore(context: Context) : Accepted
         val bindings: List<AcceptedTenantContinuity>,
     )
 }
+
+internal data class ExportAccountBinding(
+    val active: AcceptedTenantContinuity,
+    val excludedKnownOtherPartitions: Int,
+)

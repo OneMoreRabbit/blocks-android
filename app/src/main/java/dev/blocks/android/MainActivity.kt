@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.res.ColorStateList
 import android.content.Intent
 import android.content.ClipData
+import android.provider.DocumentsContract
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
@@ -51,6 +52,12 @@ import dev.blocks.android.auth.AcceptedTenantContinuityStore
 import dev.blocks.android.auth.AndroidEncryptedAcceptedTenantContinuityStore
 import dev.blocks.android.auth.GoogleIdentityClient
 import dev.blocks.android.auth.IdentityProvider
+import dev.blocks.android.backup.OfflineBackupExporter
+import dev.blocks.android.backup.OfflineBackupRestorer
+import dev.blocks.android.backup.PortableBackupCodec
+import dev.blocks.android.backup.BackupArchiveWriter
+import dev.blocks.android.backup.PortableBackupPayload
+import dev.blocks.android.backup.RestoredLocalAccountStore
 import dev.blocks.android.cover.AndroidProjectCoverImporter
 import dev.blocks.android.cover.AndroidProjectCoverCropper
 import dev.blocks.android.cover.AndroidEncryptedProjectCoverMediaStore
@@ -83,6 +90,7 @@ import dev.blocks.android.sync.ProjectSyncRepository
 import dev.blocks.android.tag.AndroidNfcTagPlatform
 import dev.blocks.android.tag.BlocksNavigationAddress
 import dev.blocks.android.tag.LocalTagResolution
+import dev.blocks.android.tag.OpaqueTagToken
 import dev.blocks.android.tag.NfcClearResult
 import dev.blocks.android.tag.NfcIoCancellation
 import dev.blocks.android.tag.NfcPresentationCorrelation
@@ -100,11 +108,13 @@ import java.net.URI
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.Arrays
 import java.util.Locale
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
@@ -125,6 +135,9 @@ internal data class ProjectAppDependencies(
     val coverCropper: ProjectCoverCropper? = null,
     val coverSourceActions: CoverSourceActions? = null,
     val resourceLinkLauncher: ((String) -> Boolean)? = null,
+    val backupExporter: OfflineBackupExporter? = null,
+    val backupRestorer: OfflineBackupRestorer? = null,
+    val restoredLocalStore: RestoredLocalAccountStore? = null,
 )
 
 internal interface CoverSourceActions {
@@ -257,6 +270,12 @@ class MainActivity : ComponentActivity() {
     private lateinit var topNavigation: LinearLayout
     private lateinit var bottomActions: LinearLayout
     private var syncJob: Job? = null
+    private val foregroundMutationJobs = java.util.Collections.synchronizedSet(mutableSetOf<Job>())
+    @Volatile
+    private var backupExportInProgress = false
+    private var backupPickerPending = false
+    private var backupRestoreInProgress = false
+    internal var lastBackupDestinationForTest: Uri? = null
     private var credentialJob: Job? = null
     private var restoreProjectId: String? = null
     private var dashboardSearchQuery: String = ""
@@ -274,6 +293,8 @@ class MainActivity : ComponentActivity() {
     private var activeCoverCrop: PreparedProjectCoverCrop? = null
     private var renderGeneration = 0L
     private val coverJobs = mutableListOf<Job>()
+    // Export must wait for an already-started import before reading DB rows and related media.
+    private val coverMutationJobs = mutableListOf<Job>()
     private val coverBitmaps = object : LruCache<String, Bitmap>(8 * 1024 * 1024) {
         override fun sizeOf(key: String, value: Bitmap): Int = value.allocationByteCount
     }
@@ -288,6 +309,12 @@ class MainActivity : ComponentActivity() {
     private val coverPickerLauncher = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         handleCoverPickerResult(uri)
     }
+    private val backupPickerLauncher = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("application/octet-stream"),
+    ) { uri -> handleBackupDestination(uri) }
+    private val backupRestoreLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri -> handleBackupRestoreSource(uri) }
 
     override fun attachBaseContext(newBase: Context) {
         super.attachBaseContext(AppearancePreferences.themedContext(newBase))
@@ -295,6 +322,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        backupPickerPending = savedInstanceState?.getBoolean("backup_picker_pending") == true
         consumeTagIntent(intent, clearActivityIntent = true)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
@@ -383,7 +411,7 @@ class MainActivity : ComponentActivity() {
             },
         )
         render()
-        if (continuity.shouldRestore) restoreSignIn()
+        if (continuity.shouldRestore || dependencies.restoredLocalStore != null) restoreSignIn()
     }
 
     override fun onStart() {
@@ -394,7 +422,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         startNfcReader()
-        if (controller.canSynchronize) synchronizeAutomatically()
+        if (!backupExportInProgress && controller.canSynchronize) synchronizeAutomatically()
     }
 
     override fun onPause() {
@@ -429,12 +457,16 @@ class MainActivity : ComponentActivity() {
             controller.state.editingLinkId?.let { outState.putString(STATE_EDITING_LINK_ID, it) }
         }
         pendingCoverProjectId?.let { outState.putString(STATE_COVER_PROJECT_ID, it) }
+        outState.putBoolean("backup_picker_pending", backupPickerPending)
         super.onSaveInstanceState(outState)
     }
 
     private fun productionDependencies(): ProjectAppDependencies {
         val draftStore = AndroidEncryptedDraftStore(this)
         val syncStore = AndroidSyncStateStore(this)
+        val coverStore = AndroidEncryptedProjectCoverMediaStore(this)
+        val acceptedStore = AndroidEncryptedAcceptedTenantContinuityStore(this)
+        val restoredStore = RestoredLocalAccountStore(this)
         val baseUri = URI(BuildConfig.BLOCKS_API_BASE_URL)
         val sessionClient = BlocksApiClient(baseUri, BuildConfig.BLOCKS_SERVICE_API_VERSION)
         val sessionAuthenticator = ServiceSessionAuthenticator(sessionClient::exchangeSession)
@@ -444,14 +476,17 @@ class MainActivity : ComponentActivity() {
             LegacyOperationReplayer(legacyService, draftStore, syncStore),
             draftStore,
             syncStore,
-            coverMediaStore = AndroidEncryptedProjectCoverMediaStore(this),
+            coverMediaStore = coverStore,
         )
         return ProjectAppDependencies(
             controller = ProjectPresentationController(sessionAuthenticator, workspace),
             identity = GoogleIdentityClient(BuildConfig.BLOCKS_GOOGLE_SERVER_CLIENT_ID),
             continuity = SessionContinuityStore(this),
-            acceptedTenantStore = AndroidEncryptedAcceptedTenantContinuityStore(this),
+            acceptedTenantStore = acceptedStore,
             nfcTagPlatform = AndroidNfcTagPlatform(this),
+            backupExporter = OfflineBackupExporter(syncStore, draftStore, acceptedStore, coverStore, restoredStore),
+            backupRestorer = OfflineBackupRestorer(syncStore, draftStore, acceptedStore, coverStore, restoredStore),
+            restoredLocalStore = restoredStore,
         )
     }
 
@@ -540,6 +575,9 @@ class MainActivity : ComponentActivity() {
         content.tag = ProjectUiIds.SCREEN_LOGIN
         content.addView(label("Sign in to see your projects", 20f))
         content.addView(button("Sign in with Google") { signIn() })
+        if (dependencies.backupRestorer != null) {
+            content.addView(button("Restore backup") { showRestoreBackup() })
+        }
         content.addView(label("Google proves your identity; Blocks controls project access.", 12f))
     }
 
@@ -913,6 +951,7 @@ class MainActivity : ComponentActivity() {
         val items = buildList {
             add("Appearance")
             add("About")
+            if (controller.activeTenantId != null && dependencies.backupExporter != null) add("Export backup")
             if (controller.state.authenticationRequired || controller.state.sessionConfirmationRequired) {
                 add("Reconnect Google account")
             }
@@ -925,6 +964,7 @@ class MainActivity : ComponentActivity() {
                 when (items[which]) {
                     "Appearance" -> showAppearanceSettings()
                     "About" -> showAbout()
+                    "Export backup" -> showExportBackup()
                     "Reconnect Google account" -> reauthenticate()
                     "Switch account" -> switchAccount()
                     "Sign out" -> signOut()
@@ -966,6 +1006,196 @@ class MainActivity : ComponentActivity() {
                 .setPositiveButton("Done", null)
                 .create(),
         )
+    }
+
+    private fun showExportBackup() {
+        if (backupExportInProgress || credentialJob?.isActive == true || controller.activeTenantId == null) return
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Export offline backup")
+            .setMessage(
+                "This includes all saved data for the open account: projects, notes, links, park history, " +
+                    "images, NFC tag locators and unsent changes. Other locked accounts are not included. " +
+                    "The file is NOT encrypted: anyone holding it can read your data. Choose a private " +
+                    "location and do not share or automatically upload it. Do not switch accounts or sign out.",
+            )
+            .setPositiveButton("Choose file", null)
+            .setNegativeButton("Cancel", null)
+            .create()
+        showManagedDialog(dialog)
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+            backupExportInProgress = true
+            backupPickerPending = true
+            dialog.dismiss()
+            try {
+                val date = Instant.now().toString().take(10)
+                backupPickerLauncher.launch("Blocks-backup-$date.blocksbackup")
+            } catch (_: Exception) {
+                backupPickerPending = false
+                backupExportInProgress = false
+                showMessage("Backup not started", "Blocks could not open the document picker. No local data changed.")
+            }
+        }
+    }
+
+    private fun handleBackupDestination(uri: Uri?) {
+        lastBackupDestinationForTest = uri
+        if (!backupPickerPending) {
+            if (uri != null) {
+                val removed = runCatching { DocumentsContract.deleteDocument(contentResolver, uri) }.getOrDefault(false)
+                showMessage(
+                    "Backup not created",
+                    if (removed) "The picker returned without a pending export. Try again."
+                    else "Delete the incomplete document at the chosen location and try again.",
+                )
+            }
+            return
+        }
+        backupPickerPending = false
+        if (uri == null) {
+            backupExportInProgress = false
+            showMessage("Backup cancelled", "No backup was created. Your local data is unchanged.")
+            return
+        }
+        val tenantId = controller.activeTenantId
+        if (tenantId == null || dependencies.backupExporter == null) {
+            backupExportInProgress = false
+            showMessage("Backup not created", "The open account changed. Your local data is unchanged.")
+            return
+        }
+        val progress = AlertDialog.Builder(this)
+            .setTitle("Exporting backup")
+            .setMessage("Preparing and verifying the unencrypted file. Keep Blocks open.")
+            .setCancelable(false)
+            .create()
+        showManagedDialog(progress)
+        uiScope.launch {
+            var archive: ByteArray? = null
+            var destinationCreated = true
+            try {
+                syncJob?.cancelAndJoin()
+                // Existing local-first commits may already have started when the owner opened
+                // Export. Wait for them before capturing the database, drafts and cover media.
+                foregroundMutationJobs.toList().forEach { it.join() }
+                coverJobs.toList().forEach { it.join() }
+                coverMutationJobs.toList().forEach { it.join() }
+                val payload = withContext(localStateDispatcher) {
+                    require(controller.activeTenantId == tenantId) { "The open account changed" }
+                    requireNotNull(dependencies.backupExporter).capture(tenantId, BuildConfig.VERSION_NAME)
+                }
+                archive = withContext(Dispatchers.Default) { PortableBackupCodec.encode(payload) }
+                withContext(Dispatchers.IO) {
+                    BackupArchiveWriter.writeAndVerify(
+                        requireNotNull(archive), payload,
+                        openWrite = { contentResolver.openOutputStream(uri, "wt") },
+                        openRead = { contentResolver.openInputStream(uri) },
+                    )
+                }
+                destinationCreated = false
+                val summary = PortableBackupCodec.summary(payload)
+                progress.dismiss()
+                showMessage(
+                    "Verified current-account export",
+                    "${summary.projects} projects, ${summary.notes} notes, ${summary.links} links, " +
+                        "${summary.parking} park records and ${summary.pendingOperations} pending changes. " +
+                        "${summary.covers} covers, ${summary.blocks} NFC records and " +
+                        "${summary.blockOperations} NFC operations, including raw locators. " +
+                        "${summary.excludedKnownOtherAccountPartitions} known locked accounts were NOT included. " +
+                        "Format 2 from ${summary.appVersion}, ${summary.exportedAt}. " +
+                        "The file is unencrypted; anyone holding it can read it. Keep it private. " +
+                        "A restored device must independently confirm Google and Service access before syncing.",
+                )
+            } catch (_: CancellationException) {
+                runCatching { DocumentsContract.deleteDocument(contentResolver, uri) }
+            } catch (_: Exception) {
+                val removed = if (destinationCreated) {
+                    runCatching { DocumentsContract.deleteDocument(contentResolver, uri) }.getOrDefault(false)
+                } else true
+                progress.dismiss()
+                showMessage(
+                    "Backup failed",
+                    "No backup was verified. Your Blocks data is unchanged. " +
+                        if (removed) "The incomplete document was removed." else "An incomplete document may remain at the chosen location; delete it there.",
+                )
+            } finally {
+                archive?.fill(0)
+                backupExportInProgress = false
+            }
+        }
+    }
+
+    private fun showRestoreBackup() {
+        if (backupRestoreInProgress || controller.activeTenantId != null || dependencies.backupRestorer == null) return
+        showManagedDialog(
+            AlertDialog.Builder(this)
+                .setTitle("Restore offline backup")
+                .setMessage(
+                    "Use only a backup you trust. It is unencrypted and anyone holding it can read it. " +
+                        "Restore is allowed only on an empty installation. It works offline and will not " +
+                        "sign you in, sync changes or write an NFC tag.",
+                )
+                .setPositiveButton("Choose backup") { _, _ ->
+                    backupRestoreInProgress = true
+                    runCatching { backupRestoreLauncher.launch(arrayOf("application/octet-stream", "*/*")) }
+                        .onFailure {
+                            backupRestoreInProgress = false
+                            showMessage("Restore not started", "The document picker could not open.")
+                        }
+                }
+                .setNegativeButton("Cancel", null)
+                .create(),
+        )
+    }
+
+    private fun handleBackupRestoreSource(uri: Uri?) {
+        if (uri == null) {
+            backupRestoreInProgress = false
+            return
+        }
+        val restorer = dependencies.backupRestorer ?: return
+        uiScope.launch {
+            val payload = runCatching {
+                withContext(Dispatchers.IO) {
+                    requireNotNull(contentResolver.openInputStream(uri)).use(restorer::readAndValidate)
+                }
+            }.getOrElse {
+                backupRestoreInProgress = false
+                showMessage("Backup rejected", "The file is unsupported, damaged or unsafe. No local data changed.")
+                return@launch
+            }
+            val summary = PortableBackupCodec.summary(payload)
+            val message = "${summary.projects} projects, ${summary.notes} notes, ${summary.links} links, " +
+                "${summary.parking} park records, ${summary.covers} covers, ${summary.blocks} NFC records " +
+                "and ${summary.pendingOperations + summary.blockOperations} pending operations. " +
+                "Format 2, exported ${summary.exportedAt} by ${summary.appVersion}. " +
+                "Other locked accounts are not included. Restore only to an empty installation. " +
+                "The archive checksum is not proof of ownership. Continue?"
+            showManagedDialog(
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("Restore this account locally?")
+                    .setMessage(message)
+                    .setPositiveButton("Restore") { _, _ ->
+                        uiScope.launch {
+                            try {
+                                withContext(localStateDispatcher) {
+                                    restorer.restore(payload)
+                                    controller.restoreCached(payload.acceptedAccount.tenantId)
+                                }
+                                continuity.shouldRestore = true
+                                render()
+                            } catch (_: Exception) {
+                                showMessage(
+                                    "Restore failed",
+                                    "Nothing was activated. Existing data was not replaced. Try a fresh empty installation.",
+                                )
+                            } finally {
+                                backupRestoreInProgress = false
+                            }
+                        }
+                    }
+                    .setNegativeButton("Cancel") { _, _ -> backupRestoreInProgress = false }
+                    .create(),
+            )
+        }
     }
 
     private fun confirmRemoveLocalData() {
@@ -1933,7 +2163,7 @@ class MainActivity : ComponentActivity() {
         prepared: PreparedProjectCoverCrop,
         selection: dev.blocks.android.cover.CoverCropSelection,
     ) {
-        uiScope.launch {
+        val job = uiScope.launch {
             var imported: dev.blocks.android.project.ProjectCoverContent? = null
             try {
                 imported = withContext(Dispatchers.IO) { coverCropper.confirm(projectId, prepared, selection) }
@@ -1954,12 +2184,14 @@ class MainActivity : ComponentActivity() {
             }
             render()
         }
+        coverMutationJobs += job
+        job.invokeOnCompletion { runOnUiThread { coverMutationJobs.remove(job) } }
     }
 
     internal fun importCover(projectId: String, uri: Uri) {
         val tenantId = controller.activeTenantId
         if (tenantId == null) return
-        uiScope.launch {
+        val job = uiScope.launch {
             var imported: dev.blocks.android.project.ProjectCoverContent? = null
             try {
                 imported = withContext(Dispatchers.IO) { coverImporter.importCover(projectId, uri) }
@@ -1977,6 +2209,8 @@ class MainActivity : ComponentActivity() {
             }
             render()
         }
+        coverMutationJobs += job
+        job.invokeOnCompletion { runOnUiThread { coverMutationJobs.remove(job) } }
     }
 
     private fun confirmRemoveCover() {
@@ -2675,6 +2909,9 @@ class MainActivity : ComponentActivity() {
     }
 
     internal fun coverCacheKeysForTest(): Set<String> = coverBitmaps.snapshot().keys
+    internal fun activeTenantForTest(): String? = controller.activeTenantId
+    internal fun canSynchronizeForTest(): Boolean = controller.canSynchronize
+    internal fun resolveTagLocallyForTest(token: OpaqueTagToken): LocalTagResolution = controller.resolveTagLocally(token)
 
     private fun label(text: String, size: Float, color: Int = brandColor(R.color.blocks_ink)) = TextView(this).apply {
         this.text = text
@@ -2735,15 +2972,21 @@ class MainActivity : ComponentActivity() {
     private fun restoreSignIn() {
         uiScope.launch {
             try {
+                withContext(localStateDispatcher) { dependencies.backupRestorer?.recoverInterruptedRestore() }
                 val acceptedTenant = withContext(localStateDispatcher) { acceptedTenantStore.load() }
-                if (acceptedTenant == null) {
+                val restoredTenant = if (acceptedTenant == null) {
+                    withContext(localStateDispatcher) { dependencies.restoredLocalStore?.read() }
+                        ?.takeIf { it.phase == RestoredLocalAccountStore.Phase.ACTIVE }?.account
+                } else null
+                val localTenant = acceptedTenant ?: restoredTenant
+                if (localTenant == null) {
                     continuity.shouldRestore = false
                     controller.lock()
                     render()
                     return@launch
                 } else {
                     withContext(localStateDispatcher) {
-                        controller.restoreCached(acceptedTenant.tenantId)
+                        controller.restoreCached(localTenant.tenantId)
                         restoreProjectId?.let { projectId ->
                             controller.openProject(projectId)
                             restoreProjectId = null
@@ -2801,10 +3044,16 @@ class MainActivity : ComponentActivity() {
         val accountIdentity = requireNotNull(authenticated.accountIdentity) {
             "Service accepted a session without a stable account identity"
         }
+        val restored = withContext(localStateDispatcher) { dependencies.restoredLocalStore?.read() }
+        if (restored != null && (restored.account.tenantId != authenticated.tenantId ||
+                restored.account.accountIdentity != accountIdentity)) {
+            throw AcceptedAccountBindingException()
+        }
         if (priorTenantId != null && priorTenantId != authenticated.tenantId) clearCoverMemory()
         withContext(localStateDispatcher) {
             acceptedTenantStore.save(AcceptedTenantContinuity(authenticated.tenantId, accountIdentity))
             controller.activateAuthenticated(authenticated)
+            if (restored != null) dependencies.restoredLocalStore?.clear()
             if (priorTenantId == authenticated.tenantId) {
                 restoreProjectId?.let(controller::openProject)
             }
@@ -2825,6 +3074,7 @@ class MainActivity : ComponentActivity() {
             withContext(localStateDispatcher) {
                 controller.lock()
                 acceptedTenantStore.lock()
+                dependencies.restoredLocalStore?.lock()
             }
         }
         controller.reportError(
@@ -2852,6 +3102,7 @@ class MainActivity : ComponentActivity() {
                 withContext(localStateDispatcher) {
                     controller.lock()
                     acceptedTenantStore.lock()
+                    dependencies.restoredLocalStore?.lock()
                 }
             }
             val credentialCleared = runCatching { identity.clear(this@MainActivity) }
@@ -2886,6 +3137,7 @@ class MainActivity : ComponentActivity() {
                 withContext(localStateDispatcher) {
                     controller.eraseAcceptedTenantCache(tenantId)
                     acceptedTenantStore.remove(tenantId)
+                    dependencies.restoredLocalStore?.takeIf { it.read()?.account?.tenantId == tenantId }?.clear()
                 }
             }
             runCatching { identity.clear(this@MainActivity) }
@@ -2897,7 +3149,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun synchronizeAutomatically() {
-        if (!controller.canSynchronize || syncJob?.isActive == true) return
+        if (backupExportInProgress || !controller.canSynchronize || syncJob?.isActive == true) return
         syncJob = uiScope.launch {
             try {
                 withContext(Dispatchers.IO) {
@@ -2920,11 +3172,12 @@ class MainActivity : ComponentActivity() {
         renderCommitted: (() -> Boolean)? = null,
         action: () -> Unit,
     ) {
+        if (backupExportInProgress) return
         source?.let {
             it.isEnabled = false
             it.alpha = 0.55f
         }
-        uiScope.launch {
+        val job = uiScope.launch {
             var committed = false
             try {
                 withContext(NonCancellable + localStateDispatcher) { action() }
@@ -2936,6 +3189,8 @@ class MainActivity : ComponentActivity() {
             complete?.invoke()
             if (syncAfter) synchronizeAutomatically()
         }
+        foregroundMutationJobs += job
+        job.invokeOnCompletion { foregroundMutationJobs.remove(job) }
     }
 
     /** Adds one committed create result without rebuilding every existing dashboard row. */
@@ -2967,7 +3222,7 @@ class MainActivity : ComponentActivity() {
         val manager = getSystemService(ConnectivityManager::class.java)
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                if (controller.canSynchronize) synchronizeAutomatically()
+                if (!backupExportInProgress && controller.canSynchronize) synchronizeAutomatically()
             }
         }
         runCatching { manager.registerDefaultNetworkCallback(callback) }
