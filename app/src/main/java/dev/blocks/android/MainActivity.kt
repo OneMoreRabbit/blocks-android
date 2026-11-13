@@ -8,7 +8,9 @@ import android.content.ClipData
 import android.provider.DocumentsContract
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -205,6 +207,7 @@ internal object ProjectUiIds {
     const val PARK = 1033
     const val PROJECT_SETTINGS = 1034
     const val PENDING_CHANGES = 1035
+    const val SYNC_STATUS = 1103
     const val ARCHIVE_MAIN = 1036
     const val PROJECT_LIST = 1037
     const val PROJECT_TILES = 1038
@@ -564,6 +567,7 @@ class MainActivity : ComponentActivity() {
         }
         if (controller.state.screen == ProjectScreen.PROJECT) {
             bar.addView(View(this), LinearLayout.LayoutParams(0, 0, 1f))
+            syncStatusIndicator()?.let { bar.addView(it, LinearLayout.LayoutParams(dp(36), dp(48))) }
             bar.addView(iconOnlyButton(R.drawable.ic_settings, "Settings") { showProjectSettings() }.apply {
                 id = ProjectUiIds.PROJECT_SETTINGS
             }, LinearLayout.LayoutParams(dp(48), dp(48)))
@@ -716,10 +720,55 @@ class MainActivity : ComponentActivity() {
                 marginEnd = dp(4)
             },
         )
+        syncStatusIndicator()?.let { controls.addView(it, LinearLayout.LayoutParams(dp(36), dp(48))) }
         controls.addView(iconOnlyButton(R.drawable.ic_settings, "Settings") { showSettings() }.apply {
             id = ProjectUiIds.SETTINGS
         }, LinearLayout.LayoutParams(dp(48), dp(48)))
         return controls
+    }
+
+    private fun syncStatusIndicator(): View? {
+        val state = controller.state
+        if (!state.pendingChanges && !state.syncing && !state.syncDeferred &&
+            !state.sessionConfirmationRequired && !state.authenticationRequired &&
+            !state.reconciliationRequired) return null
+        val description = syncStatusDescription()
+        val dotColor = brandColor(R.color.blocks_muted)
+        return object : View(this) {
+            private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = dotColor }
+
+            override fun onDraw(canvas: Canvas) {
+                super.onDraw(canvas)
+                canvas.drawCircle(width / 2f, height / 2f, dp(3).toFloat(), dotPaint)
+            }
+        }.apply {
+            id = ProjectUiIds.SYNC_STATUS
+            contentDescription = description
+            setOnClickListener {
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("Sync status")
+                    .setMessage(syncStatusDescription())
+                    .setPositiveButton("OK", null)
+                    .show()
+            }
+        }
+    }
+
+    private fun syncStatusDescription(): String {
+        val state = controller.state
+        return buildList {
+            if (state.syncing) add("Checking saved changes with Blocks Service.")
+            if (state.authenticationRequired || state.sessionConfirmationRequired) {
+                add("Cloud sync is paused. Reconnect this Google account in Settings; saved work remains on this device.")
+            } else if (state.syncDeferred) {
+                add("Cloud sync could not finish. Saved work remains on this device.")
+            }
+            if (state.pendingCloudChanges == 1) add("1 cloud change is still pending.")
+            if (state.pendingCloudChanges > 1) add("${state.pendingCloudChanges} cloud changes are still pending.")
+            if (state.pendingLocalTagChanges == 1) add("1 NFC change stays on this device; it is not cloud-synced.")
+            if (state.pendingLocalTagChanges > 1) add("${state.pendingLocalTagChanges} NFC changes stay on this device; they are not cloud-synced.")
+            if (state.reconciliationRequired) add("A saved change needs review in this project.")
+        }.joinToString("\n")
     }
 
     private fun populateDashboardCollection(
@@ -3014,10 +3063,17 @@ class MainActivity : ComponentActivity() {
         if (credentialJob?.isActive == true) return
         credentialJob = uiScope.launch {
             try {
+                val expected = withContext(localStateDispatcher) {
+                    acceptedTenantStore.load() ?: dependencies.restoredLocalStore?.read()
+                        ?.takeIf { it.phase == RestoredLocalAccountStore.Phase.ACTIVE }?.account
+                }
+                    ?: throw AcceptedAccountBindingException()
                 runCatching { identity.clear(this@MainActivity) }
-                authenticate(identity.signIn(this@MainActivity))
+                authenticate(identity.signIn(this@MainActivity), expected)
             } catch (_: CancellationException) {
                 return@launch
+            } catch (_: AcceptedAccountBindingException) {
+                failClosedAccountBinding()
             } catch (error: Exception) {
                 handleRepositoryError(error)
                 render()
@@ -3027,9 +3083,9 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private suspend fun authenticate(token: String) {
+    private suspend fun authenticate(token: String, expected: AcceptedTenantContinuity? = null) {
         try {
-            acceptServiceValidatedToken(token)
+            acceptServiceValidatedToken(token, expected)
             render()
             resolvePendingTagLocator()
             synchronizeAutomatically()
@@ -3038,11 +3094,18 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private suspend fun acceptServiceValidatedToken(token: String): Session {
+    private suspend fun acceptServiceValidatedToken(
+        token: String,
+        expected: AcceptedTenantContinuity? = null,
+    ): Session {
         val priorTenantId = controller.activeTenantId
         val authenticated = withContext(Dispatchers.IO) { controller.authenticate(token) }
         val accountIdentity = requireNotNull(authenticated.accountIdentity) {
             "Service accepted a session without a stable account identity"
+        }
+        if (expected != null && (expected.tenantId != authenticated.tenantId ||
+                expected.accountIdentity != accountIdentity)) {
+            throw AcceptedAccountBindingException()
         }
         val restored = withContext(localStateDispatcher) { dependencies.restoredLocalStore?.read() }
         if (restored != null && (restored.account.tenantId != authenticated.tenantId ||
@@ -3092,6 +3155,8 @@ class MainActivity : ComponentActivity() {
     private fun switchAccount() = clearAccount(switch = true)
 
     private fun clearAccount(switch: Boolean) {
+        credentialJob?.cancel()
+        credentialJob = null
         uiScope.launch {
             syncJob?.cancel()
             syncJob = null

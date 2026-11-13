@@ -3521,6 +3521,7 @@ class ProjectSyncRepository(
             pendingItemOperations = projectCache.itemOperations.size,
             pendingNavigationAliases = pendingAliases,
             pendingInteractionOperations = projectCache.interactionOperations.size,
+            syncDeferred = backgroundSaveContext.get()?.deferred == true,
         )
     }
 
@@ -3892,23 +3893,28 @@ class ProjectSyncRepository(
         throw revoked
     }
 
-    private fun Exception.isDeferredSync() = this is IOException ||
+    private fun Exception.isDeferredSync() = deferredOutcome(this is IOException ||
         this is IncompatibleServiceApiException ||
-        this is ServiceException && (status >= 500 || status in setOf(404, 405, 426))
+        this is ServiceException && (status >= 500 || status in setOf(404, 405, 426)))
 
-    private fun Exception.isDeferredItemSync() = this is IOException ||
-        this is IncompatibleServiceApiException ||
-        this is UnsupportedOperationException ||
-        this is ServiceException && (status >= 500 || status in setOf(405, 426))
-
-    private fun Exception.isDeferredInteractionSync() = this is IOException ||
+    private fun Exception.isDeferredItemSync() = deferredOutcome(this is IOException ||
         this is IncompatibleServiceApiException ||
         this is UnsupportedOperationException ||
-        this is ServiceException && (status >= 500 || status in setOf(404, 405, 426))
+        this is ServiceException && (status >= 500 || status in setOf(405, 426)))
 
-    private fun Exception.isRecognizedOlderApi(command: ProjectMutation) =
+    private fun Exception.isDeferredInteractionSync() = deferredOutcome(this is IOException ||
+        this is IncompatibleServiceApiException ||
+        this is UnsupportedOperationException ||
+        this is ServiceException && (status >= 500 || status in setOf(404, 405, 426)))
+
+    private fun Exception.isRecognizedOlderApi(command: ProjectMutation) = deferredOutcome(
         this is ServiceException && status == 422 && command.contractVersion == "0.4" &&
-            command.type in setOf(ProjectMutationType.CREATE_PROJECT, ProjectMutationType.ADD_PARKING)
+            command.type in setOf(ProjectMutationType.CREATE_PROJECT, ProjectMutationType.ADD_PARKING))
+
+    private fun deferredOutcome(value: Boolean): Boolean {
+        if (value) backgroundSaveContext.get()?.deferred = true
+        return value
+    }
 
     private fun <T> List<T>.upsert(value: T, id: (T) -> String): List<T> = filterNot { id(it) == id(value) } + value
 
@@ -3993,7 +3999,7 @@ class ProjectSyncRepository(
         val page: ProjectPage?,
     )
 
-    private data class BackgroundSaveContext(var baseline: TenantSyncState)
+    private data class BackgroundSaveContext(var baseline: TenantSyncState, var deferred: Boolean = false)
 
     private data class PreparedInteraction(
         val state: TenantSyncState,

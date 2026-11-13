@@ -196,7 +196,7 @@ class MainActivityPresentationTest {
     }
 
     @Test
-    fun authorizedRestartSilentlyOpensCachedDashboardWithoutProviderOrServiceCalls() {
+    fun authorizedRestartShowsHonestReconnectStatusWithoutProviderOrServiceCalls() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { activity -> activity.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
 
@@ -216,6 +216,55 @@ class MainActivityPresentationTest {
             assertEquals(0, workspace.syncCalls)
             assertEquals(0, sessionExchanges.get())
             assertEquals(0, identity.signInCalls)
+            scenario.onActivity { activity ->
+                assertTrue(activity.findViewById<View>(ProjectUiIds.SYNC_STATUS)
+                    .contentDescription.toString().contains("Cloud sync is paused"))
+            }
+            scenario.recreate()
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            assertEquals(0, identity.signInCalls)
+            assertEquals(0, workspace.syncCalls)
+        }
+    }
+
+    @Test
+    fun deferredSyncShowsPendingCloudWorkWithoutClaimingDelivery() {
+        workspace.offline = true
+        workspace.cache = workspace.cache.copy(commands = listOf(
+            ProjectMutation("pending-cloud", ProjectMutationType.RENAME_PROJECT, PROJECT_ID, projectName = "Saved locally"),
+        ))
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                activity.selectDialogItem("Reconnect Google account")
+            }
+            waitUntil { workspace.syncCalls > 0 && presentationController.state.syncDeferred }
+            scenario.onActivity { activity ->
+                val description = activity.findViewById<View>(ProjectUiIds.SYNC_STATUS)
+                    .contentDescription.toString()
+                assertTrue(description.contains("could not finish"))
+                assertTrue(description.contains("1 cloud change is still pending"))
+            }
+            assertEquals(1, presentationController.state.pendingCloudChanges)
+        }
+    }
+
+    @Test
+    fun reconnectWithDifferentServiceAccountLocksCacheWithoutErasingSavedWork() {
+        authenticatedTenant = OTHER_TENANT_ID
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { activity ->
+                activity.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                activity.selectDialogItem("Reconnect Google account")
+            }
+            waitUntil { sessionExchanges.get() == 1 }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_LOGIN && !continuity.shouldRestore }
+            assertEquals(null, presentationController.activeTenantId)
+            assertEquals(AcceptedTenantContinuity(TENANT_ID, ACCOUNT_A), acceptedTenant.find(ACCOUNT_A))
+            assertTrue(workspace.clearedTenants.isEmpty())
+            assertEquals(0, workspace.syncCalls)
         }
     }
 
@@ -1392,7 +1441,7 @@ class MainActivityPresentationTest {
                 activity.selectDialogItem("About")
                 val about = activity.dialogTexts().joinToString("\n")
                 assertTrue(about.contains("Blocks Android"))
-                assertTrue(about.contains("Version 0.10.2 (26)"))
+                assertTrue(about.contains("Version 0.10.3 (27)"))
                 assertTrue(about.contains("dev.blocks.android/debug"))
                 assertFalse(about.contains("tenant", ignoreCase = true))
                 assertFalse(about.contains("token", ignoreCase = true))
@@ -3697,7 +3746,7 @@ class MainActivityPresentationTest {
                     retiredOperationIds = cache.retiredOperationIds + retired,
                 )
             }
-            return result()
+            return result().copy(syncDeferred = offline)
         }
         override fun queueCreateProject(
             session: Session,
