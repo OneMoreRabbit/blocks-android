@@ -41,6 +41,12 @@ import dev.blocks.android.cover.CoverImportFiles
 import dev.blocks.android.cover.PreparedProjectCoverCrop
 import dev.blocks.android.cover.ProjectCoverCropper
 import dev.blocks.android.follow.FollowAutoSettings
+import dev.blocks.android.follow.AndroidEncryptedFollowLocalStateStore
+import dev.blocks.android.follow.FollowAccount
+import dev.blocks.android.follow.FollowLocalState
+import dev.blocks.android.follow.FollowCandidate
+import dev.blocks.android.follow.FollowKind
+import dev.blocks.android.follow.FollowDispatchClass
 import dev.blocks.android.follow.FollowSelectionSink
 import dev.blocks.android.cover.ProjectCoverCropView
 import dev.blocks.android.mvp.AccountIdentity
@@ -193,6 +199,8 @@ class MainActivityPresentationTest {
         MainActivity.dependencyFactory = null
         AndroidEncryptedDraftStore(context).clear(TENANT_ID)
         AndroidSyncStateStore(context).clearSyncState(TENANT_ID)
+        AndroidEncryptedFollowLocalStateStore(context).eraseTenant(TENANT_ID)
+        AndroidEncryptedFollowLocalStateStore(context).eraseTenant(OTHER_TENANT_ID)
         AndroidEncryptedAcceptedTenantContinuityStore(context).clear()
         AppearancePreferences(context).write(AppearanceMode.FOLLOW_PHONE)
     }
@@ -389,6 +397,29 @@ class MainActivityPresentationTest {
             scenario.recreate()
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
             assertEquals(listOf("button:$PROJECT_ID", "nfc:$PROJECT_ID"), events.toList())
+        }
+    }
+
+    @Test
+    fun cachedStartupDiscardsUncertainFollowCandidateButKeepsSourceAndSequence() {
+        val store = AndroidEncryptedFollowLocalStateStore(context)
+        val account = FollowAccount(TENANT_ID, ACCOUNT_A)
+        val candidate = FollowCandidate("retained-source", 4, PROJECT_ID, FollowKind.EXPLICIT_BUTTON,
+            FollowDispatchClass.IMMEDIATE, null, 100, "prior-process")
+        store.save(account, FollowLocalState("retained-source", 5, candidate))
+        val original = requireNotNull(MainActivity.dependencyFactory)
+        MainActivity.dependencyFactory = { activity ->
+            original(activity).copy(followLocalStateStore = AndroidEncryptedFollowLocalStateStore(activity))
+        }
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            val restored = requireNotNull(store.load(account))
+            assertEquals("retained-source", restored.sourceId)
+            assertEquals(5L, restored.nextSequence)
+            assertEquals(null, restored.candidate)
+            assertEquals(0, identity.signInCalls)
+            assertEquals(0, sessionExchanges.get())
         }
     }
 
@@ -2083,6 +2114,13 @@ class MainActivityPresentationTest {
         acceptedTenant.save(AcceptedTenantContinuity(TENANT_ID, ACCOUNT_A))
         workspace.cache = workspace.cache.copy(projectCovers = listOf(coverImporter.metadata(PROJECT_ID)))
         workspace.membershipRevoked = true
+        val follow = AndroidEncryptedFollowLocalStateStore(context)
+        follow.save(FollowAccount(TENANT_ID, ACCOUNT_A), FollowLocalState("source-a", 2, null))
+        follow.save(FollowAccount(OTHER_TENANT_ID, ACCOUNT_B), FollowLocalState("source-b", 3, null))
+        val original = requireNotNull(MainActivity.dependencyFactory)
+        MainActivity.dependencyFactory = { activity ->
+            original(activity).copy(followLocalStateStore = AndroidEncryptedFollowLocalStateStore(activity))
+        }
 
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
@@ -2098,6 +2136,8 @@ class MainActivityPresentationTest {
             assertEquals(listOf(TENANT_ID), workspace.clearedTenants)
             assertTrue(workspace.cacheFor(TENANT_ID).projectCovers.isEmpty())
             assertFalse(continuity.shouldRestore)
+            assertEquals(null, follow.load(FollowAccount(TENANT_ID, ACCOUNT_A)))
+            assertEquals("source-b", follow.load(FollowAccount(OTHER_TENANT_ID, ACCOUNT_B))?.sourceId)
         }
     }
 
@@ -2106,6 +2146,13 @@ class MainActivityPresentationTest {
         acceptedTenant.save(AcceptedTenantContinuity(OTHER_TENANT_ID, ACCOUNT_B))
         acceptedTenant.save(AcceptedTenantContinuity(TENANT_ID, ACCOUNT_A))
         workspace.cache = workspace.cache.copy(projectCovers = listOf(coverImporter.metadata(PROJECT_ID)))
+        val follow = AndroidEncryptedFollowLocalStateStore(context)
+        follow.save(FollowAccount(TENANT_ID, ACCOUNT_A), FollowLocalState("source-a", 2, null))
+        follow.save(FollowAccount(OTHER_TENANT_ID, ACCOUNT_B), FollowLocalState("source-b", 3, null))
+        val original = requireNotNull(MainActivity.dependencyFactory)
+        MainActivity.dependencyFactory = { activity ->
+            original(activity).copy(followLocalStateStore = AndroidEncryptedFollowLocalStateStore(activity))
+        }
 
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
@@ -2121,6 +2168,8 @@ class MainActivityPresentationTest {
             assertEquals(AcceptedTenantContinuity(OTHER_TENANT_ID, ACCOUNT_B), acceptedTenant.find(ACCOUNT_B))
             assertEquals(listOf(TENANT_ID), workspace.clearedTenants)
             assertTrue(workspace.cacheFor(TENANT_ID).projectCovers.isEmpty())
+            assertEquals(null, follow.load(FollowAccount(TENANT_ID, ACCOUNT_A)))
+            assertEquals("source-b", follow.load(FollowAccount(OTHER_TENANT_ID, ACCOUNT_B))?.sourceId)
         }
     }
 

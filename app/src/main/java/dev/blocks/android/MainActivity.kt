@@ -69,8 +69,11 @@ import dev.blocks.android.cover.ProjectCoverCropper
 import dev.blocks.android.cover.ProjectCoverCropView
 import dev.blocks.android.cover.ProjectCoverImporter
 import dev.blocks.android.follow.FollowAutoSettings
+import dev.blocks.android.follow.FollowAccount
 import dev.blocks.android.follow.FollowOpenOrigin
 import dev.blocks.android.follow.FollowSelectionSink
+import dev.blocks.android.follow.FollowLocalStateStore
+import dev.blocks.android.follow.AndroidEncryptedFollowLocalStateStore
 import dev.blocks.android.follow.FollowTriggerPolicy
 import dev.blocks.android.mvp.FormDrafts
 import dev.blocks.android.mvp.ParkingDraft
@@ -147,6 +150,7 @@ internal data class ProjectAppDependencies(
     val restoredLocalStore: RestoredLocalAccountStore? = null,
     val followSelectionSink: FollowSelectionSink? = null,
     val followAutoSettings: FollowAutoSettings? = null,
+    val followLocalStateStore: FollowLocalStateStore? = null,
 )
 
 internal interface CoverSourceActions {
@@ -499,6 +503,7 @@ class MainActivity : ComponentActivity() {
             backupExporter = OfflineBackupExporter(syncStore, draftStore, acceptedStore, coverStore, restoredStore),
             backupRestorer = OfflineBackupRestorer(syncStore, draftStore, acceptedStore, coverStore, restoredStore),
             restoredLocalStore = restoredStore,
+            followLocalStateStore = AndroidEncryptedFollowLocalStateStore(this),
         )
     }
 
@@ -3100,6 +3105,7 @@ class MainActivity : ComponentActivity() {
                     return@launch
                 } else {
                     withContext(localStateDispatcher) {
+                        acceptedTenant?.let(::discardUncertainFollowCandidate)
                         controller.restoreCached(localTenant.tenantId)
                         restoreProjectId?.let { projectId ->
                             controller.openProject(projectId)
@@ -3180,6 +3186,7 @@ class MainActivity : ComponentActivity() {
         if (priorTenantId != null && priorTenantId != authenticated.tenantId) clearCoverMemory()
         withContext(localStateDispatcher) {
             acceptedTenantStore.save(AcceptedTenantContinuity(authenticated.tenantId, accountIdentity))
+            discardUncertainFollowCandidate(AcceptedTenantContinuity(authenticated.tenantId, accountIdentity))
             controller.activateAuthenticated(authenticated)
             if (restored != null) dependencies.restoredLocalStore?.clear()
             if (priorTenantId == authenticated.tenantId) {
@@ -3265,8 +3272,15 @@ class MainActivity : ComponentActivity() {
             clearCoverMemory()
             val removed = runCatching {
                 withContext(localStateDispatcher) {
-                    controller.eraseAcceptedTenantCache(tenantId)
-                    acceptedTenantStore.remove(tenantId)
+                    val workspaceRemoval = runCatching { controller.eraseAcceptedTenantCache(tenantId) }
+                    val followRemoval = runCatching { dependencies.followLocalStateStore?.eraseTenant(tenantId) }
+                    if (workspaceRemoval.isSuccess && followRemoval.isSuccess) {
+                        acceptedTenantStore.remove(tenantId)
+                    } else {
+                        acceptedTenantStore.lock()
+                        val failure = workspaceRemoval.exceptionOrNull() ?: followRemoval.exceptionOrNull()
+                        throw IllegalStateException("Could not erase all local tenant data", failure)
+                    }
                     dependencies.restoredLocalStore?.takeIf { it.read()?.account?.tenantId == tenantId }?.clear()
                 }
             }
@@ -3450,12 +3464,26 @@ class MainActivity : ComponentActivity() {
             restoreProjectId = null
             clearCoverMemory()
             withContext(NonCancellable) {
-                runCatching {
-                    withContext(localStateDispatcher) { acceptedTenantStore.remove(revokedTenantId) }
+                val removals = withContext(localStateDispatcher) {
+                    listOf(
+                        runCatching { dependencies.followLocalStateStore?.eraseTenant(revokedTenantId) },
+                        runCatching { acceptedTenantStore.remove(revokedTenantId) },
+                    )
                 }
+                if (removals.any { it.isFailure }) controller.reportError(
+                    "Blocks could not safely remove revoked account data. Sign-in remains blocked.",
+                )
                 runCatching { identity.clear(this@MainActivity) }
             }
         }
+    }
+
+    private fun discardUncertainFollowCandidate(accepted: AcceptedTenantContinuity) {
+        val identity = accepted.accountIdentity ?: return
+        val account = FollowAccount(accepted.tenantId, identity)
+        val store = dependencies.followLocalStateStore ?: return
+        val state = store.load(account) ?: return
+        if (state.candidate != null) store.save(account, state.copy(candidate = null))
     }
 
     override fun onDestroy() {
