@@ -28,6 +28,7 @@ class AndroidEncryptedFollowLocalStateStoreTest {
     fun clearFixtures() {
         store.eraseTenant(accountA.tenantId)
         store.eraseTenant(accountB.tenantId)
+        AndroidFollowAutoSettings(context).setEnabled(false)
     }
 
     @Test
@@ -65,6 +66,14 @@ class AndroidEncryptedFollowLocalStateStoreTest {
         store.eraseTenant(accountA.tenantId)
         assertNull(store.load(accountA))
         assertEquals("source-b", store.load(accountB)!!.sourceId)
+    }
+
+    @Test
+    fun automaticNfcSettingDefaultsOffAndPersistsOptIn() {
+        val setting = AndroidFollowAutoSettings(context)
+        assertFalse(setting.enabled())
+        setting.setEnabled(true)
+        assertTrue(AndroidFollowAutoSettings(context).enabled())
     }
 
     private fun digest(value: String): String = MessageDigest.getInstance("SHA-256")

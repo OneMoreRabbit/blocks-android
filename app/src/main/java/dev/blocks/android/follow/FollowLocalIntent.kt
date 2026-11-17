@@ -23,6 +23,17 @@ internal object FollowTriggerPolicy {
         serviceAcceptedBindingAvailable
 }
 
+/** UI boundary; the active application has no Follow transport to attach yet. */
+internal interface FollowSelectionSink {
+    fun explicitButton(projectId: String)
+    fun freshNfc(projectId: String)
+}
+
+internal interface FollowAutoSettings {
+    fun enabled(): Boolean
+    fun setEnabled(value: Boolean)
+}
+
 internal data class FollowCandidate(
     val sourceId: String,
     val sequence: Long,

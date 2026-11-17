@@ -17,6 +17,7 @@ import android.graphics.drawable.GradientDrawable
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.Uri
+import android.nfc.NfcAdapter
 import android.os.Bundle
 import android.text.Editable
 import android.text.InputType
@@ -67,6 +68,10 @@ import dev.blocks.android.cover.PreparedProjectCoverCrop
 import dev.blocks.android.cover.ProjectCoverCropper
 import dev.blocks.android.cover.ProjectCoverCropView
 import dev.blocks.android.cover.ProjectCoverImporter
+import dev.blocks.android.follow.FollowAutoSettings
+import dev.blocks.android.follow.FollowOpenOrigin
+import dev.blocks.android.follow.FollowSelectionSink
+import dev.blocks.android.follow.FollowTriggerPolicy
 import dev.blocks.android.mvp.FormDrafts
 import dev.blocks.android.mvp.ParkingDraft
 import dev.blocks.android.mvp.Session
@@ -140,6 +145,8 @@ internal data class ProjectAppDependencies(
     val backupExporter: OfflineBackupExporter? = null,
     val backupRestorer: OfflineBackupRestorer? = null,
     val restoredLocalStore: RestoredLocalAccountStore? = null,
+    val followSelectionSink: FollowSelectionSink? = null,
+    val followAutoSettings: FollowAutoSettings? = null,
 )
 
 internal interface CoverSourceActions {
@@ -246,6 +253,7 @@ internal object ProjectUiIds {
     const val PROJECT_LINKS = 1091
     const val LOAD_MORE_LINKS = 1092
     const val PROJECT_TITLE = 1093
+    const val OPEN_ON_WEB = 1104
     const val NEWEST_PARKING = 1094
     const val LINKS_SECTION = 1095
     const val DASHBOARD_ORDER = 1098
@@ -302,6 +310,7 @@ class MainActivity : ComponentActivity() {
         override fun sizeOf(key: String, value: Bitmap): Int = value.allocationByteCount
     }
     private var pendingNavigationAddress: BlocksNavigationAddress? = null
+    private var pendingNavigationOrigin: FollowOpenOrigin? = null
     private var pendingInvalidTagIntent = false
     private val tagAttemptLock = Any()
     @Volatile
@@ -999,6 +1008,9 @@ class MainActivity : ComponentActivity() {
     private fun showSettings() {
         val items = buildList {
             add("Appearance")
+            if (dependencies.followSelectionSink != null) dependencies.followAutoSettings?.let { settings ->
+                add("Follow NFC on Web: ${if (settings.enabled()) "On" else "Off"}")
+            }
             add("About")
             if (controller.activeTenantId != null && dependencies.backupExporter != null) add("Export backup")
             if (controller.state.authenticationRequired || controller.state.sessionConfirmationRequired) {
@@ -1012,6 +1024,10 @@ class MainActivity : ComponentActivity() {
             .setItems(items.toTypedArray()) { _, which ->
                 when (items[which]) {
                     "Appearance" -> showAppearanceSettings()
+                    "Follow NFC on Web: On", "Follow NFC on Web: Off" -> {
+                        val settings = requireNotNull(dependencies.followAutoSettings)
+                        settings.setEnabled(!settings.enabled())
+                    }
                     "About" -> showAbout()
                     "Export backup" -> showExportBackup()
                     "Reconnect Google account" -> reauthenticate()
@@ -1274,6 +1290,21 @@ class MainActivity : ComponentActivity() {
             id = ProjectUiIds.PROJECT_TITLE
             setPadding(0, dp(2), 0, dp(6))
         })
+
+        if (!archived && dependencies.followSelectionSink != null) {
+            content.addView(LinearLayout(this).apply {
+                gravity = Gravity.END
+                addView(button("Open on Web") {
+                    val projectId = controller.state.projectPage?.project?.id ?: return@button
+                    uiScope.launch {
+                        withContext(localStateDispatcher) {
+                            dependencies.followSelectionSink?.explicitButton(projectId)
+                        }
+                    }
+                }.apply { id = ProjectUiIds.OPEN_ON_WEB })
+            }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT))
+        }
 
         val coverFrame = FrameLayout(this).apply {
             id = ProjectUiIds.PROJECT_COVER
@@ -2575,16 +2606,28 @@ class MainActivity : ComponentActivity() {
         val address = dev.blocks.android.tag.BlocksNavigationAddressParser.parse(value)
         if (address == null) {
             pendingInvalidTagIntent = true
+            pendingNavigationOrigin = null
         } else {
             pendingNavigationAddress = address
+            pendingNavigationOrigin = FollowOpenOrigin.QR
         }
         resolvePendingTagLocator()
     }
 
     private fun consumeTagIntent(source: Intent?, clearActivityIntent: Boolean) {
         when (val parsed = TagLaunchIntent.parse(source)) {
-            is TagLaunchIntent.Valid -> pendingNavigationAddress = parsed.address
-            TagLaunchIntent.Invalid -> pendingInvalidTagIntent = true
+            is TagLaunchIntent.Valid -> {
+                pendingNavigationAddress = parsed.address
+                pendingNavigationOrigin = when {
+                    clearActivityIntent -> FollowOpenOrigin.RESTORE
+                    source?.action == NfcAdapter.ACTION_NDEF_DISCOVERED -> FollowOpenOrigin.FRESH_NFC
+                    else -> FollowOpenOrigin.APP_LINK
+                }
+            }
+            TagLaunchIntent.Invalid -> {
+                pendingInvalidTagIntent = true
+                pendingNavigationOrigin = null
+            }
             TagLaunchIntent.None -> return
         }
         if (clearActivityIntent) setIntent(Intent(this, MainActivity::class.java))
@@ -2599,7 +2642,9 @@ class MainActivity : ComponentActivity() {
             return
         }
         val address = pendingNavigationAddress ?: return
+        val origin = pendingNavigationOrigin
         pendingNavigationAddress = null
+        pendingNavigationOrigin = null
         uiScope.launch {
             val projectId = try {
                 withContext(localStateDispatcher) {
@@ -2622,6 +2667,26 @@ class MainActivity : ComponentActivity() {
             if (projectId != null) {
                 withContext(localStateDispatcher) { controller.openProject(projectId) }
                 render()
+                if (origin == FollowOpenOrigin.FRESH_NFC && dependencies.followSelectionSink != null) {
+                    val settingOn = dependencies.followAutoSettings?.enabled() == true
+                    val hasBinding = runCatching {
+                        withContext(localStateDispatcher) {
+                            acceptedTenantStore.load()?.let { accepted ->
+                                accepted.tenantId == controller.activeTenantId && accepted.accountIdentity != null
+                            } == true
+                        }
+                    }.getOrDefault(false)
+                    if (FollowTriggerPolicy.automaticSelectionAllowed(
+                            origin, settingOn, resolvedLocally = true,
+                            serviceAcceptedBindingAvailable = hasBinding,
+                        )) {
+                        runCatching {
+                            withContext(localStateDispatcher) {
+                                dependencies.followSelectionSink?.freshNfc(projectId)
+                            }
+                        }
+                    }
+                }
             } else {
                 render()
                 showMessage(
