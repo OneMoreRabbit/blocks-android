@@ -11,6 +11,13 @@ import dev.blocks.android.auth.AcceptedTenantContinuity
 import dev.blocks.android.auth.AndroidEncryptedAcceptedTenantContinuityStore
 import dev.blocks.android.cover.AndroidEncryptedProjectCoverMediaStore
 import dev.blocks.android.cover.ProjectCoverVariant
+import dev.blocks.android.follow.AndroidEncryptedFollowLocalStateStore
+import dev.blocks.android.follow.FollowAccount
+import dev.blocks.android.follow.FollowDispatchClass
+import dev.blocks.android.follow.FollowKind
+import dev.blocks.android.follow.FollowLocalIntentRecorder
+import dev.blocks.android.follow.FollowLocalState
+import dev.blocks.android.follow.FollowCandidate
 import dev.blocks.android.mvp.AccountIdentity
 import dev.blocks.android.mvp.FormDrafts
 import dev.blocks.android.mvp.ParkingDraft
@@ -58,6 +65,7 @@ class OfflineBackupRestorerTest {
     private val accepted by lazy { AndroidEncryptedAcceptedTenantContinuityStore(context) }
     private val media by lazy { AndroidEncryptedProjectCoverMediaStore(context) }
     private val marker by lazy { RestoredLocalAccountStore(context) }
+    private val follow by lazy { AndroidEncryptedFollowLocalStateStore(context) }
     private val restorer by lazy { OfflineBackupRestorer(state, drafts, accepted, media, marker) }
 
     private val crossDevicePhase get() = InstrumentationRegistry.getArguments().getString("crossDevicePhase")
@@ -78,6 +86,7 @@ class OfflineBackupRestorerTest {
         runCatching { media.eraseTenant(TENANT) }
         runCatching { drafts.clear(TENANT) }
         runCatching { state.clearSyncState(TENANT) }
+        runCatching { follow.eraseTenant(TENANT) }
         runCatching { accepted.clear() }
         importedTenantId?.takeIf { it != TENANT }?.let { tenant ->
             runCatching { media.eraseTenant(tenant) }
@@ -119,16 +128,23 @@ class OfflineBackupRestorerTest {
         state.saveSyncState(TENANT, source)
         drafts.save(TENANT, FormDrafts(projectName = "unfinished"))
         accepted.save(AcceptedTenantContinuity(TENANT, AccountIdentity("https://accounts.google.com", "subject")))
+        val followAccount = FollowAccount(TENANT, AccountIdentity("https://accounts.google.com", "subject"))
+        follow.save(followAccount, FollowLocalState("source-before-export", 2,
+            FollowCandidate("source-before-export", 1, PROJECT, FollowKind.EXPLICIT_BUTTON,
+                FollowDispatchClass.IMMEDIATE, null, 100, "old-installation")))
         val payload = OfflineBackupExporter(state, drafts, accepted, media).capture(TENANT, "0.10.2")
         val archive = PortableBackupCodec.encode(payload)
+        assertFalse(String(archive, Charsets.UTF_8).contains("source-before-export"))
         val before = state.loadSyncState(TENANT)
 
         // Simulates a different installation: remove source stores and their Keystore aliases.
         media.eraseTenant(TENANT)
         drafts.clear(TENANT)
         state.clearSyncState(TENANT)
+        follow.eraseTenant(TENANT)
         accepted.clear()
         restorer.restore(restorer.readAndValidate(ByteArrayInputStream(archive)))
+        assertEquals(null, follow.load(followAccount))
 
         assertEquals(before, state.loadSyncState(TENANT))
         val reopened = state.loadSyncState(TENANT)
@@ -172,6 +188,13 @@ class OfflineBackupRestorerTest {
         assertEquals(before.projectCache.commands, afterReopen.projectCache.commands)
         assertEquals(before.projectCache.projectCovers, afterReopen.projectCache.projectCovers)
         assertEquals(before.changeCursor, afterReopen.changeCursor)
+        accepted.save(AcceptedTenantContinuity(TENANT, followAccount.identity))
+        val newSource = FollowLocalIntentRecorder(follow, { accepted.load() }, { "source-after-restore" })
+            .record(followAccount, PROJECT, FollowKind.EXPLICIT_BUTTON,
+                promptTransportAvailable = true, lastObservedRevision = null,
+                elapsedMs = 200, bootIdentity = "new-installation")
+        assertEquals("source-after-restore", newSource?.sourceId)
+        assertEquals(1L, newSource?.sequence)
     }
 
     @Test fun preparingRestoreIsErasedOnNextStartAndNeverActive() {

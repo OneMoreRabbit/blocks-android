@@ -40,6 +40,14 @@ import dev.blocks.android.cover.AndroidEncryptedProjectCoverMediaStore
 import dev.blocks.android.cover.CoverImportFiles
 import dev.blocks.android.cover.PreparedProjectCoverCrop
 import dev.blocks.android.cover.ProjectCoverCropper
+import dev.blocks.android.follow.FollowAutoSettings
+import dev.blocks.android.follow.AndroidEncryptedFollowLocalStateStore
+import dev.blocks.android.follow.FollowAccount
+import dev.blocks.android.follow.FollowLocalState
+import dev.blocks.android.follow.FollowCandidate
+import dev.blocks.android.follow.FollowKind
+import dev.blocks.android.follow.FollowDispatchClass
+import dev.blocks.android.follow.FollowSelectionSink
 import dev.blocks.android.cover.ProjectCoverCropView
 import dev.blocks.android.mvp.AccountIdentity
 import dev.blocks.android.mvp.ChangePage
@@ -191,6 +199,8 @@ class MainActivityPresentationTest {
         MainActivity.dependencyFactory = null
         AndroidEncryptedDraftStore(context).clear(TENANT_ID)
         AndroidSyncStateStore(context).clearSyncState(TENANT_ID)
+        AndroidEncryptedFollowLocalStateStore(context).eraseTenant(TENANT_ID)
+        AndroidEncryptedFollowLocalStateStore(context).eraseTenant(OTHER_TENANT_ID)
         AndroidEncryptedAcceptedTenantContinuityStore(context).clear()
         AppearancePreferences(context).write(AppearanceMode.FOLLOW_PHONE)
     }
@@ -316,6 +326,101 @@ class MainActivityPresentationTest {
         assertEquals(0, sessionExchanges.get())
         assertEquals(0, workspace.syncCalls)
         assertEquals(projectsBeforeInvalid, workspace.cache.activeProjects)
+    }
+
+    @Test
+    fun followCandidateTriggersOnlyFromExplicitButtonOrEnabledFreshNfc() {
+        val events = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val sink = object : FollowSelectionSink {
+            override fun explicitButton(projectId: String) { events += "button:$projectId" }
+            override fun freshNfc(projectId: String) { events += "nfc:$projectId" }
+        }
+        val setting = object : FollowAutoSettings {
+            var value = false
+            override fun enabled() = value
+            override fun setEnabled(value: Boolean) { this.value = value }
+        }
+        val original = requireNotNull(MainActivity.dependencyFactory)
+        MainActivity.dependencyFactory = { activity ->
+            original(activity).copy(followSelectionSink = sink, followAutoSettings = setting)
+        }
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            scenario.onActivity { it.button("Active project").performClick() }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            assertTrue(events.isEmpty())
+            scenario.onActivity { it.findViewById<Button>(ProjectUiIds.OPEN_ON_WEB).performClick() }
+            waitUntil { events == listOf("button:$PROJECT_ID") }
+            scenario.onActivity { it.findViewById<Button>(ProjectUiIds.MAIN).performClick() }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+
+            scenario.onActivity {
+                it.handleIncomingTagIntent(Intent(Intent.ACTION_VIEW, Uri.parse(PROJECT_LINK.encoded)))
+            }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            assertEquals(listOf("button:$PROJECT_ID"), events.toList())
+            scenario.onActivity { it.findViewById<Button>(ProjectUiIds.MAIN).performClick() }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+
+            val nfcIntent = Intent(NfcAdapter.ACTION_NDEF_DISCOVERED, Uri.parse(PROJECT_LINK.encoded)).apply {
+                putExtra(NfcAdapter.EXTRA_NDEF_MESSAGES, arrayOf(NdefLocatorCodec.message(PROJECT_LINK)))
+            }
+            scenario.onActivity { it.handleIncomingTagIntent(nfcIntent) }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            assertEquals(listOf("button:$PROJECT_ID"), events.toList())
+            scenario.onActivity { it.findViewById<Button>(ProjectUiIds.MAIN).performClick() }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+
+            scenario.onActivity {
+                it.findViewById<Button>(ProjectUiIds.SETTINGS).performClick()
+                it.selectDialogItem("Follow NFC on Web: Off")
+            }
+            assertTrue(setting.enabled())
+            scenario.onActivity {
+                it.handleIncomingTagIntent(Intent(Intent.ACTION_VIEW, Uri.parse(PROJECT_LINK.encoded)))
+            }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            assertEquals(listOf("button:$PROJECT_ID"), events.toList())
+            scenario.onActivity { it.findViewById<Button>(ProjectUiIds.MAIN).performClick() }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+
+            scenario.onActivity { it.handleQrText(PROJECT_LINK.encoded) }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            assertEquals(listOf("button:$PROJECT_ID"), events.toList())
+            scenario.onActivity { it.findViewById<Button>(ProjectUiIds.MAIN).performClick() }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+
+            scenario.onActivity { it.handleIncomingTagIntent(nfcIntent) }
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            waitUntil { events == listOf("button:$PROJECT_ID", "nfc:$PROJECT_ID") }
+            scenario.recreate()
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_PROJECT }
+            assertEquals(listOf("button:$PROJECT_ID", "nfc:$PROJECT_ID"), events.toList())
+        }
+    }
+
+    @Test
+    fun cachedStartupDiscardsUncertainFollowCandidateButKeepsSourceAndSequence() {
+        val store = AndroidEncryptedFollowLocalStateStore(context)
+        val account = FollowAccount(TENANT_ID, ACCOUNT_A)
+        val candidate = FollowCandidate("retained-source", 4, PROJECT_ID, FollowKind.EXPLICIT_BUTTON,
+            FollowDispatchClass.IMMEDIATE, null, 100, "prior-process")
+        store.save(account, FollowLocalState("retained-source", 5, candidate))
+        val original = requireNotNull(MainActivity.dependencyFactory)
+        MainActivity.dependencyFactory = { activity ->
+            original(activity).copy(followLocalStateStore = AndroidEncryptedFollowLocalStateStore(activity))
+        }
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
+            val restored = requireNotNull(store.load(account))
+            assertEquals("retained-source", restored.sourceId)
+            assertEquals(5L, restored.nextSequence)
+            assertEquals(null, restored.candidate)
+            assertEquals(0, identity.signInCalls)
+            assertEquals(0, sessionExchanges.get())
+        }
     }
 
     @Test
@@ -2009,6 +2114,13 @@ class MainActivityPresentationTest {
         acceptedTenant.save(AcceptedTenantContinuity(TENANT_ID, ACCOUNT_A))
         workspace.cache = workspace.cache.copy(projectCovers = listOf(coverImporter.metadata(PROJECT_ID)))
         workspace.membershipRevoked = true
+        val follow = AndroidEncryptedFollowLocalStateStore(context)
+        follow.save(FollowAccount(TENANT_ID, ACCOUNT_A), FollowLocalState("source-a", 2, null))
+        follow.save(FollowAccount(OTHER_TENANT_ID, ACCOUNT_B), FollowLocalState("source-b", 3, null))
+        val original = requireNotNull(MainActivity.dependencyFactory)
+        MainActivity.dependencyFactory = { activity ->
+            original(activity).copy(followLocalStateStore = AndroidEncryptedFollowLocalStateStore(activity))
+        }
 
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
@@ -2024,6 +2136,8 @@ class MainActivityPresentationTest {
             assertEquals(listOf(TENANT_ID), workspace.clearedTenants)
             assertTrue(workspace.cacheFor(TENANT_ID).projectCovers.isEmpty())
             assertFalse(continuity.shouldRestore)
+            assertEquals(null, follow.load(FollowAccount(TENANT_ID, ACCOUNT_A)))
+            assertEquals("source-b", follow.load(FollowAccount(OTHER_TENANT_ID, ACCOUNT_B))?.sourceId)
         }
     }
 
@@ -2032,6 +2146,13 @@ class MainActivityPresentationTest {
         acceptedTenant.save(AcceptedTenantContinuity(OTHER_TENANT_ID, ACCOUNT_B))
         acceptedTenant.save(AcceptedTenantContinuity(TENANT_ID, ACCOUNT_A))
         workspace.cache = workspace.cache.copy(projectCovers = listOf(coverImporter.metadata(PROJECT_ID)))
+        val follow = AndroidEncryptedFollowLocalStateStore(context)
+        follow.save(FollowAccount(TENANT_ID, ACCOUNT_A), FollowLocalState("source-a", 2, null))
+        follow.save(FollowAccount(OTHER_TENANT_ID, ACCOUNT_B), FollowLocalState("source-b", 3, null))
+        val original = requireNotNull(MainActivity.dependencyFactory)
+        MainActivity.dependencyFactory = { activity ->
+            original(activity).copy(followLocalStateStore = AndroidEncryptedFollowLocalStateStore(activity))
+        }
 
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             waitFor(scenario) { it.screenTag() == ProjectUiIds.SCREEN_DASHBOARD }
@@ -2047,6 +2168,8 @@ class MainActivityPresentationTest {
             assertEquals(AcceptedTenantContinuity(OTHER_TENANT_ID, ACCOUNT_B), acceptedTenant.find(ACCOUNT_B))
             assertEquals(listOf(TENANT_ID), workspace.clearedTenants)
             assertTrue(workspace.cacheFor(TENANT_ID).projectCovers.isEmpty())
+            assertEquals(null, follow.load(FollowAccount(TENANT_ID, ACCOUNT_A)))
+            assertEquals("source-b", follow.load(FollowAccount(OTHER_TENANT_ID, ACCOUNT_B))?.sourceId)
         }
     }
 
