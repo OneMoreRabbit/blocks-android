@@ -1,12 +1,16 @@
 ---
 title: Release notes — blocks-android
 status: active
-updated: 2026-11-13
+updated: 2026-11-27
 owner: blocks.component.blocks-android
 about: Android release changes and operator action
 ---
 
 # Release notes — blocks-android
+
+As checked on 2026-11-27, `v0.10.3` is the latest Android source tag. These notes describe
+release behavior and historical installation instructions; they do not establish the owner's
+installation, backup or synchronization status.
 
 ## v0.10.3 — 2026-11-13
 
