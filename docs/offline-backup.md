@@ -2,7 +2,7 @@
 
 Blocks can export the currently open account without a network connection or fresh Google sign-in. This is not sync and does not send anything to Blocks Service. **The backup is not encrypted. Anyone holding the file can read its projects, notes, images, NFC tag locators and unsent changes.** Save it only in a private place you control; do not share or automatically upload it.
 
-These steps apply only after the custody-signed 0.10.2 APK is published and its in-place installation is approved. Until then, keep the owner's installed app and data unchanged. Do not use a test or unsigned APK on the owner's phone.
+These instructions describe the backup introduced in 0.10.2 and retained in 0.10.3. A source tag does not establish that a custody-signed APK was installed or that the owner's backup exists. Before an in-place update, confirm the approved APK and signing certificate; do not use a test or unsigned APK on the owner's phone.
 
 ## Back up the existing phone
 
